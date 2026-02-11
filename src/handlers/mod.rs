@@ -12,9 +12,12 @@ use std::time::Duration;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::DrmNode;
 use smithay::backend::input::{InputEvent, TabletToolDescriptor};
+use smithay::desktop::utils::bbox_from_surface_tree;
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::dnd::{self, DnDGrab, DndGrabHandler, DndTarget};
-use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus, PointerHandle};
+use smithay::input::pointer::{
+    CursorIcon, CursorImageStatus, CursorImageSurfaceData, Focus, PointerHandle,
+};
 use smithay::input::{keyboard, Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::reexports::rustix::fs::{fcntl_setfl, OFlags};
@@ -22,7 +25,7 @@ use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_scre
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
-use smithay::utils::{Logical, Point, Rectangle, Serial};
+use smithay::utils::{Logical, Point, Rectangle, Serial, Size};
 use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_lease::{
@@ -211,8 +214,36 @@ impl PointerConstraintsHandler for State {
 
         // Redraw to update the cursor position if it's visible.
         if self.niri.pointer_visibility.is_visible() {
-            // FIXME: redraw only outputs overlapping the cursor.
-            self.niri.queue_redraw_all();
+            let pointer_loc = pointer.current_location();
+            let mut cursor_geo = Rectangle::new(pointer_loc.to_i32_round(), Size::from((1, 1)));
+            if let CursorImageStatus::Surface(surface) = self.niri.cursor_manager.cursor_image() {
+                let hotspot = with_states(surface, |states| {
+                    states
+                        .data_map
+                        .get::<CursorImageSurfaceData>()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .hotspot
+                });
+                let surface_pos = pointer_loc.to_i32_round() - hotspot;
+                cursor_geo = bbox_from_surface_tree(surface, surface_pos);
+            }
+
+            let outputs_to_redraw: Vec<_> = self
+                .niri
+                .global_space
+                .outputs()
+                .filter(|output| {
+                    let output_geo = self.niri.global_space.output_geometry(output).unwrap();
+                    output_geo.overlaps(cursor_geo)
+                })
+                .cloned()
+                .collect();
+
+            for output in outputs_to_redraw {
+                self.niri.queue_redraw(&output);
+            }
         }
     }
 }
