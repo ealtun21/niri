@@ -843,6 +843,8 @@ impl State {
     }
 
     pub fn move_cursor(&mut self, location: Point<f64, Logical>) {
+        let old_output = self.niri.pointer_contents.output.clone();
+
         let mut under = match self.niri.pointer_visibility {
             PointerVisibility::Disabled => PointContents::default(),
             _ => self.niri.contents_under(location),
@@ -876,8 +878,41 @@ impl State {
 
         // We do not show the pointer on programmatic or keyboard movement.
 
-        // FIXME: granular
-        self.niri.queue_redraw_all();
+        if let Some(output) = old_output {
+            self.niri.queue_redraw(&output);
+        }
+
+        // The cursor might overlap multiple outputs, so we need to queue a redraw for all of them.
+        // This is especially important when the cursor is straddling the boundary between two outputs.
+        let mut cursor_geo = Rectangle::new(location.to_i32_round(), Size::from((1, 1)));
+        if let CursorImageStatus::Surface(surface) = self.niri.cursor_manager.cursor_image() {
+            let hotspot = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<CursorImageSurfaceData>()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .hotspot
+            });
+            let surface_pos = location.to_i32_round() - hotspot;
+            cursor_geo = bbox_from_surface_tree(surface, surface_pos);
+        }
+
+        let outputs_to_redraw: Vec<_> = self
+            .niri
+            .global_space
+            .outputs()
+            .filter(|output| {
+                let output_geo = self.niri.global_space.output_geometry(output).unwrap();
+                output_geo.overlaps(cursor_geo)
+            })
+            .cloned()
+            .collect();
+
+        for output in outputs_to_redraw {
+            self.niri.queue_redraw(&output);
+        }
     }
 
     /// Moves cursor within the specified rectangle, only adjusting coordinates if needed.
@@ -1036,6 +1071,8 @@ impl State {
             }
         }
 
+        let old_output = self.niri.pointer_contents.output.clone();
+
         if !self.update_pointer_contents() {
             return;
         }
@@ -1045,8 +1082,12 @@ impl State {
         // Pointer motion from a surface to nothing triggers a cursor change to default, which
         // means we may need to redraw.
 
-        // FIXME: granular
-        self.niri.queue_redraw_all();
+        if let Some(output) = old_output {
+            self.niri.queue_redraw(&output);
+        }
+        if let Some(output) = self.niri.pointer_contents.output.clone() {
+            self.niri.queue_redraw(&output);
+        }
     }
 
     pub fn update_pointer_contents(&mut self) -> bool {

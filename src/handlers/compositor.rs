@@ -426,7 +426,7 @@ impl CompositorHandler for State {
                 });
             }
 
-            // FIXME: granular redraws for cursors.
+            self.niri.refresh_pointer_outputs();
             self.niri.queue_redraw_all();
             return;
         }
@@ -450,7 +450,7 @@ impl CompositorHandler for State {
                 });
             }
 
-            // FIXME: granular redraws for cursors.
+            self.niri.refresh_pointer_outputs();
             self.niri.queue_redraw_all();
             return;
         }
