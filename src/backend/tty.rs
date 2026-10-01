@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, ensure, Context};
 use bytemuck::cast_slice_mut;
 use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
-use niri_config::output::Modeline;
+use niri_config::output::{Gamma, Modeline};
 use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -376,6 +376,8 @@ struct Surface {
     connector: connector::Handle,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
+    /// Configured `gamma` of this output, used whenever no client sets a gamma ramp.
+    gamma: Option<Gamma>,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
     /// Tracy frame that goes from vblank to vblank.
@@ -700,6 +702,15 @@ impl Tty {
                         } else if let Some(gamma_props) = &surface.gamma_props {
                             if let Err(err) = gamma_props.restore_gamma(&device.drm) {
                                 warn!("error restoring gamma: {err:?}");
+                            }
+                        } else if surface.gamma.is_some() {
+                            // ponytail: legacy gamma has no saved state, so a client ramp set
+                            // before the VT switch comes back as the configured gamma.
+                            let ramp = config_gamma_ramp(&device.drm, *crtc, None, surface.gamma);
+                            if let Err(err) =
+                                set_gamma_for_crtc(&device.drm, *crtc, ramp.as_deref())
+                            {
+                                warn!("error restoring configured gamma: {err:?}");
                             }
                         }
                     }
@@ -1322,11 +1333,12 @@ impl Tty {
             .map_err(|err| debug!("couldn't get gamma properties: {err:?}"))
             .ok();
 
-        // Reset gamma in case it was set before.
+        // Reset gamma in case it was set before, to the configured one if any.
+        let ramp = config_gamma_ramp(&device.drm, crtc, gamma_props.as_ref(), config.gamma);
         let res = if let Some(gamma_props) = &mut gamma_props {
-            gamma_props.set_gamma(&device.drm, None)
+            gamma_props.set_gamma(&device.drm, ramp.as_deref())
         } else {
-            set_gamma_for_crtc(&device.drm, crtc, None)
+            set_gamma_for_crtc(&device.drm, crtc, ramp.as_deref())
         };
         if let Err(err) = res {
             debug!("couldn't reset gamma: {err:?}");
@@ -1531,6 +1543,7 @@ impl Tty {
             compositor,
             dmabuf_feedback,
             gamma_props,
+            gamma: config.gamma,
             pending_gamma_change: None,
             vblank_frame: None,
             vblank_frame_name,
@@ -2092,6 +2105,16 @@ impl Tty {
             .context("missing device")?;
         let surface = device.surfaces.get_mut(&crtc).context("missing surface")?;
 
+        // "Reset" means back to the configured gamma, not to linear.
+        let ramp = ramp.or_else(|| {
+            config_gamma_ramp(
+                &device.drm,
+                crtc,
+                surface.gamma_props.as_ref(),
+                surface.gamma,
+            )
+        });
+
         // Cannot change properties while the device is inactive.
         if !self.session.is_active() {
             surface.pending_gamma_change = Some(ramp);
@@ -2388,6 +2411,29 @@ impl Tty {
                 if config.off || should_disable(&surface.name.connector) {
                     to_disconnect.push((node, crtc));
                     continue;
+                }
+
+                // ponytail: overrides an active gamma-control client (night light) until it
+                // sends its next ramp; only happens when the configured gamma itself changes.
+                if surface.gamma != config.gamma {
+                    surface.gamma = config.gamma;
+                    let ramp = config_gamma_ramp(
+                        &device.drm,
+                        crtc,
+                        surface.gamma_props.as_ref(),
+                        surface.gamma,
+                    );
+                    let res = if let Some(gamma_props) = &mut surface.gamma_props {
+                        gamma_props.set_gamma(&device.drm, ramp.as_deref())
+                    } else {
+                        set_gamma_for_crtc(&device.drm, crtc, ramp.as_deref())
+                    };
+                    if let Err(err) = res {
+                        warn!(
+                            "output {:?}: error setting gamma: {err:?}",
+                            surface.name.connector
+                        );
+                    }
                 }
 
                 // Check if we need to change the mode.
@@ -3316,6 +3362,33 @@ fn get_panel_orientation(props: &ConnectorProperties) -> anyhow::Result<Transfor
     }
 }
 
+/// Ramp for the configured `gamma` (None = linear), sized for this CRTC.
+fn config_gamma_ramp(
+    device: &DrmDevice,
+    crtc: crtc::Handle,
+    gamma_props: Option<&GammaProps>,
+    gamma: Option<Gamma>,
+) -> Option<Vec<u16>> {
+    let gamma = gamma?;
+    let size = match gamma_props {
+        Some(props) => props.gamma_size(device).ok()?,
+        None => device.get_crtc(crtc).ok()?.gamma_length(),
+    };
+    (size > 0).then(|| gamma_ramp(size as usize, &gamma))
+}
+
+/// Gamma ramp in wlr-gamma-control layout (all red, then green, then blue),
+/// xgamma convention: out = in^(1/gamma).
+fn gamma_ramp(size: usize, gamma: &Gamma) -> Vec<u16> {
+    let denom = size.saturating_sub(1).max(1) as f64;
+    let mut ramp = Vec::with_capacity(size * 3);
+    for g in [gamma.r.0, gamma.g.0, gamma.b.0] {
+        let exp = 1. / g.max(0.01);
+        ramp.extend((0..size).map(|i| ((i as f64 / denom).powf(exp) * 65535.).round() as u16));
+    }
+    ramp
+}
+
 pub fn set_gamma_for_crtc(
     device: &DrmDevice,
     crtc: crtc::Handle,
@@ -3435,7 +3508,31 @@ mod tests {
     use niri_config::output::Modeline;
     use niri_ipc::{HSyncPolarity, VSyncPolarity};
 
-    use crate::backend::tty::{calculate_drm_mode_from_modeline, calculate_mode_cvt};
+    use crate::backend::tty::{calculate_drm_mode_from_modeline, calculate_mode_cvt, gamma_ramp};
+
+    #[test]
+    fn test_gamma_ramp() {
+        use niri_config::output::Gamma;
+        use niri_config::FloatOrInt;
+
+        let gamma = Gamma {
+            r: FloatOrInt(0.95),
+            g: FloatOrInt(1.),
+            b: FloatOrInt(2.),
+        };
+        let ramp = gamma_ramp(256, &gamma);
+        assert_eq!(ramp.len(), 256 * 3);
+        let (r, rest) = ramp.split_at(256);
+        let (g, b) = rest.split_at(256);
+        // Endpoints are fixed for every gamma.
+        for ch in [r, g, b] {
+            assert_eq!((ch[0], ch[255]), (0, 65535));
+        }
+        // 1.0 is linear; < 1 darkens, > 1 brightens (xgamma: out = in^(1/gamma)).
+        assert_eq!(g[128], (128. / 255. * 65535f64).round() as u16);
+        assert!(r[128] < g[128] && g[128] < b[128]);
+        assert_eq!(b[64], ((64f64 / 255.).powf(0.5) * 65535.).round() as u16);
+    }
 
     #[test]
     fn test_calculate_drmmode_from_modeline() {

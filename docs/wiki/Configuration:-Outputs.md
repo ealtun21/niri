@@ -13,6 +13,7 @@ output "eDP-1" {
     transform "90"
     position x=1280 y=0
     variable-refresh-rate // on-demand=true
+    gamma r=0.95 g=0.95 b=1.0
     focus-at-startup
     backdrop-color "#001100"
 
@@ -222,6 +223,20 @@ This is helpful to avoid various issues with VRR, since it can be disabled most 
 ```kdl
 output "HDMI-A-1" {
     variable-refresh-rate on-demand=true
+}
+```
+
+### `gamma`
+
+Per-channel gamma correction, set on the output's hardware gamma table (xgamma convention: output = input^(1/gamma)).
+Values below 1 darken a channel, above 1 brighten it; omitted channels stay at 1.
+
+niri applies it at startup, after switching back from another VT, and whenever a gamma-control client (night light tools) lets go of the output.
+While such a client is active, its ramp replaces this one.
+
+```kdl
+output "eDP-1" {
+    gamma r=0.95 g=0.95 b=1.0
 }
 ```
 

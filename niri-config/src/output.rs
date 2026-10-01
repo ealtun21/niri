@@ -76,6 +76,8 @@ pub struct Output {
     pub hot_corners: Option<HotCorners>,
     #[knuffel(child)]
     pub layout: Option<LayoutPart>,
+    #[knuffel(child)]
+    pub gamma: Option<Gamma>,
 }
 
 impl Output {
@@ -108,6 +110,7 @@ impl Default for Output {
             backdrop_color: None,
             hot_corners: None,
             layout: None,
+            gamma: None,
         }
     }
 }
@@ -126,6 +129,17 @@ pub struct Position {
     pub x: i32,
     #[knuffel(property)]
     pub y: i32,
+}
+
+/// Per-channel gamma, xgamma convention: out = in^(1/gamma). 1.0 is linear.
+#[derive(knuffel::Decode, Debug, Clone, Copy, PartialEq)]
+pub struct Gamma {
+    #[knuffel(property, default = FloatOrInt(1.))]
+    pub r: FloatOrInt<0, 10>,
+    #[knuffel(property, default = FloatOrInt(1.))]
+    pub g: FloatOrInt<0, 10>,
+    #[knuffel(property, default = FloatOrInt(1.))]
+    pub b: FloatOrInt<0, 10>,
 }
 
 #[derive(knuffel::Decode, Debug, Clone, PartialEq, Default)]
@@ -498,6 +512,27 @@ mod tests {
     use insta::assert_debug_snapshot;
 
     use super::*;
+
+    #[test]
+    fn parse_gamma() {
+        let config = crate::Config::parse_mem(
+            r#"
+            output "eDP-1" {
+                gamma r=0.95 g=0.95
+            }
+            output "DP-1" {
+                gamma b=2
+            }
+            "#,
+        )
+        .unwrap();
+        let gamma = |i: usize| {
+            let g = config.outputs.0[i].gamma.unwrap();
+            (g.r.0, g.g.0, g.b.0)
+        };
+        assert_eq!(gamma(0), (0.95, 0.95, 1.0));
+        assert_eq!(gamma(1), (1.0, 1.0, 2.0));
+    }
 
     #[test]
     fn parse_mode() {
