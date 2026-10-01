@@ -199,6 +199,7 @@ impl TabIndicator {
             let mut gradient_area = match tab.gradient.relative_to {
                 GradientRelativeTo::Window => tab.geometry,
                 GradientRelativeTo::WorkspaceView => area_view_rect,
+                GradientRelativeTo::Tab => rect,
             };
             gradient_area.loc -= *loc;
 

@@ -99,7 +99,7 @@ impl FocusRing {
 
         let full_rect = Rectangle::new(Point::from((-width, -width)), self.full_size);
         let gradient_area = match gradient.relative_to {
-            GradientRelativeTo::Window => full_rect,
+            GradientRelativeTo::Window | GradientRelativeTo::Tab => full_rect,
             GradientRelativeTo::WorkspaceView => view_rect,
         };
 

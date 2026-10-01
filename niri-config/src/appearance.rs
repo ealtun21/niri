@@ -114,6 +114,10 @@ pub enum GradientRelativeTo {
     #[default]
     Window,
     WorkspaceView,
+    /// Relative to the individual tab in the tab indicator.
+    ///
+    /// Outside of the tab indicator, behaves like `Window`.
+    Tab,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
@@ -1347,6 +1351,30 @@ mod tests {
             false,
         )
         "
+        );
+    }
+
+    #[test]
+    fn parse_gradient_relative_to_tab() {
+        let config = Config::parse_mem(
+            r##"
+            layout {
+                tab-indicator {
+                    active-gradient from="#101010" to="#202020" relative-to="tab"
+                }
+            }
+            "##,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config
+                .layout
+                .tab_indicator
+                .active_gradient
+                .unwrap()
+                .relative_to,
+            GradientRelativeTo::Tab
         );
     }
 }
