@@ -177,6 +177,15 @@ impl<'a> WindowRef<'a> {
             WindowRef::Mapped(mapped) => mapped.is_window_cast_target(),
         }
     }
+
+    pub fn is_graved(self) -> bool {
+        match self {
+            // A window cannot be graved before it is mapped: graving is an explicit action on an
+            // existing window.
+            WindowRef::Unmapped(_) => false,
+            WindowRef::Mapped(mapped) => mapped.is_graved(),
+        }
+    }
 }
 
 impl ResolvedWindowRules {
@@ -435,6 +444,12 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
 
     if let Some(is_floating) = m.is_floating {
         if window.is_floating() != is_floating {
+            return false;
+        }
+    }
+
+    if let Some(is_graved) = m.is_graved {
+        if window.is_graved() != is_graved {
             return false;
         }
     }

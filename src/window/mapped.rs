@@ -97,6 +97,13 @@ pub struct Mapped {
     /// Whether this window is floating.
     is_floating: bool,
 
+    /// Whether this window is in the grave.
+    ///
+    /// Sticky: it stays set while the window is summoned out of the grave and visible, and is
+    /// cleared only by ungraving. Floating-ness cannot stand in for this, because a summoned
+    /// window is floating and so is every window the user floats by hand.
+    is_graved: bool,
+
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
 
@@ -289,6 +296,7 @@ impl Mapped {
             is_focused: false,
             is_active_in_column: true,
             is_floating: false,
+            is_graved: false,
             is_window_cast_target: false,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
@@ -381,6 +389,19 @@ impl Mapped {
 
     pub fn is_window_cast_target(&self) -> bool {
         self.is_window_cast_target
+    }
+
+    pub fn is_graved(&self) -> bool {
+        self.is_graved
+    }
+
+    pub fn set_graved(&mut self, graved: bool) {
+        if self.is_graved == graved {
+            return;
+        }
+
+        self.is_graved = graved;
+        self.need_to_recompute_rules = true;
     }
 
     pub fn toggle_ignore_opacity_window_rule(&mut self) {

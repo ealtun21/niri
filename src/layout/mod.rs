@@ -1516,12 +1516,34 @@ impl<W: LayoutElement> Layout<W> {
         ws_idx == mon.active_workspace_idx
     }
 
+    /// Brings a window out of a stash onto the active workspace as floating, so that activating
+    /// it (taskbar, focus-window --id, xdg-activation) shows it here instead of switching to the
+    /// stash, which can never be active.
+    fn unstash_window(&mut self, window: &W::Id) {
+        let stashed = self
+            .workspaces()
+            .any(|(_, _, ws)| ws.stash && ws.has_window(window));
+        if !stashed {
+            return;
+        }
+
+        let Some(mon) = self.active_monitor_ref() else {
+            return;
+        };
+        let output = mon.output.clone();
+        let idx = mon.active_workspace_idx;
+        self.move_to_output(Some(window), &output, Some(idx), ActivateWindow::No);
+        self.set_window_floating(Some(window), true);
+    }
+
     pub fn activate_window(&mut self, window: &W::Id) {
         if let Some(InteractiveMoveState::Moving(move_)) = &self.interactive_move {
             if move_.tile.window().id() == window {
                 return;
             }
         }
+
+        self.unstash_window(window);
 
         let MonitorSet::Normal {
             monitors,
@@ -1558,6 +1580,8 @@ impl<W: LayoutElement> Layout<W> {
                 return;
             }
         }
+
+        self.unstash_window(window);
 
         let MonitorSet::Normal {
             monitors,

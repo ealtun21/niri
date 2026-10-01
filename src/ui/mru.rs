@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::rc::Rc;
 use std::time::Duration;
@@ -581,6 +581,7 @@ impl WindowMru {
 
         let config = niri.config.borrow().recent_windows.previews;
         let mut thumbnails = Vec::new();
+        let mut graved = HashSet::new();
         for (mon, ws_idx, ws) in niri.layout.workspaces() {
             // A hidden workspace is out of normal navigation, so selecting a window on it would
             // be a one-way door: don't offer them.
@@ -596,12 +597,21 @@ impl WindowMru {
                 let mut thumbnail = Thumbnail::from_mapped(mapped, niri.clock.clone(), config);
                 thumbnail.on_current_output = on_current_output;
                 thumbnail.on_current_workspace = on_current_workspace;
+                if mapped.is_graved() {
+                    graved.insert(thumbnail.id);
+                }
                 thumbnails.push(thumbnail);
             }
         }
 
         thumbnails
             .sort_by(|Thumbnail { timestamp: t1, .. }, Thumbnail { timestamp: t2, .. }| t2.cmp(t1));
+
+        // Summoning a graved window means you're working there now, so offer those first. Ones
+        // still in the grave never got here: the grave is a hidden workspace, skipped above. A
+        // stable sort on a bool is a partition: both groups keep their MRU order, nothing is
+        // dropped, and with nothing graved the list is untouched.
+        thumbnails.sort_by_key(|t| !graved.contains(&t.id));
 
         let current_id = thumbnails.first().map(|t| t.id);
         Self {
@@ -614,6 +624,11 @@ impl WindowMru {
 
     pub fn is_empty(&self) -> bool {
         self.thumbnails.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn window_ids(&self) -> Vec<MappedId> {
+        self.thumbnails.iter().map(|t| t.id).collect()
     }
 
     #[cfg(test)]

@@ -7,6 +7,7 @@ mod server;
 mod animations;
 mod floating;
 mod fullscreen;
+mod grave;
 mod layer_shell;
 mod mru;
 mod remove_output;

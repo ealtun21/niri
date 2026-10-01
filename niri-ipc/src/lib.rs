@@ -831,6 +831,36 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         id: Option<u64>,
     },
+    /// Move the focused window into the grave, hiding it until it is summoned or ungraved.
+    GraveWindow {
+        /// Id of the window to grave.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Take the focused window out of the grave, into the tiling layout here.
+    UngraveWindow {
+        /// Id of the window to ungrave.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Move the focused window into or out of the grave.
+    ToggleWindowGraved {
+        /// Id of the window to grave or ungrave.
+        ///
+        /// If `None`, uses the focused window.
+        #[cfg_attr(feature = "clap", arg(long))]
+        id: Option<u64>,
+    },
+    /// Summon all graved windows onto the current workspace as floating.
+    ShowGravedWindows {},
+    /// Send all summoned graved windows back into the grave.
+    HideGravedWindows {},
+    /// Summon all graved windows, or send them back if they are already summoned.
+    ToggleGravedWindows {},
     /// Switches focus to the floating layout.
     FocusFloating {},
     /// Switches focus to the tiling layout.
@@ -1322,6 +1352,11 @@ pub struct Window {
     ///
     /// If the window isn't floating then it is in the tiling layout.
     pub is_floating: bool,
+    /// Whether this window is in the grave.
+    ///
+    /// A graved window is either stashed away out of sight, or temporarily summoned onto the
+    /// current workspace as floating; this stays true either way, until the window is ungraved.
+    pub is_graved: bool,
     /// Whether this window requests your attention.
     pub is_urgent: bool,
     /// Position- and size-related properties of the window.

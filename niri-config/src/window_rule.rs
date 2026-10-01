@@ -132,6 +132,8 @@ pub struct Match {
     #[knuffel(property)]
     pub is_floating: Option<bool>,
     #[knuffel(property)]
+    pub is_graved: Option<bool>,
+    #[knuffel(property)]
     pub is_window_cast_target: Option<bool>,
     #[knuffel(property)]
     pub is_urgent: Option<bool>,

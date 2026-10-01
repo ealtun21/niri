@@ -109,6 +109,10 @@ pub struct Workspace<W: LayoutElement> {
     /// Whether this workspace is kept out of the workspace strip.
     pub(super) hidden: bool,
 
+    /// Whether this workspace is a stash (the grave): hidden, and never the active workspace.
+    /// Activating a window on it brings the window out to the active workspace instead.
+    pub(super) stash: bool,
+
     /// Layout config overrides for this workspace.
     layout_config: Option<niri_config::LayoutPart>,
 
@@ -272,6 +276,7 @@ impl<W: LayoutElement> Workspace<W> {
             base_options,
             options,
             hidden: config.as_ref().is_some_and(|c| c.hidden),
+            stash: false,
             name: config.map(|c| c.name.0),
             layout_config,
             id: WorkspaceId::next(),
@@ -337,6 +342,7 @@ impl<W: LayoutElement> Workspace<W> {
             base_options,
             options,
             hidden: config.as_ref().is_some_and(|c| c.hidden),
+            stash: false,
             name: config.map(|c| c.name.0),
             layout_config,
             id: WorkspaceId::next(),
@@ -357,6 +363,11 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn is_hidden(&self) -> bool {
         self.hidden
+    }
+
+    pub fn set_stash(&mut self) {
+        self.hidden = true;
+        self.stash = true;
     }
 
     pub fn unname(&mut self) {

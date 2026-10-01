@@ -2149,6 +2149,95 @@ impl State {
                     self.niri.queue_redraw_all();
                 }
             }
+            Action::GraveWindow => {
+                if let Some(window) = self.niri.layout.focus().map(|m| m.window.clone()) {
+                    self.niri.grave_window(&window);
+                    self.maybe_warp_cursor_to_focus();
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::GraveWindowById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.grave_window(&window);
+                    self.maybe_warp_cursor_to_focus();
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::UngraveWindow => {
+                if let Some(window) = self.niri.layout.focus().map(|m| m.window.clone()) {
+                    self.niri.ungrave_window(&window);
+                    self.maybe_warp_cursor_to_focus();
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::UngraveWindowById(id) => {
+                let window = self.niri.layout.windows().find(|(_, m)| m.id().get() == id);
+                let window = window.map(|(_, m)| m.window.clone());
+                if let Some(window) = window {
+                    self.niri.ungrave_window(&window);
+                    self.maybe_warp_cursor_to_focus();
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleWindowGraved => {
+                let window = self
+                    .niri
+                    .layout
+                    .focus()
+                    .map(|m| (m.window.clone(), m.is_graved()));
+                if let Some((window, graved)) = window {
+                    if graved {
+                        self.niri.ungrave_window(&window);
+                    } else {
+                        self.niri.grave_window(&window);
+                    }
+                    self.maybe_warp_cursor_to_focus();
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ToggleWindowGravedById(id) => {
+                let window = self
+                    .niri
+                    .layout
+                    .windows()
+                    .find(|(_, m)| m.id().get() == id)
+                    .map(|(_, m)| (m.window.clone(), m.is_graved()));
+                if let Some((window, graved)) = window {
+                    if graved {
+                        self.niri.ungrave_window(&window);
+                    } else {
+                        self.niri.grave_window(&window);
+                    }
+                    self.maybe_warp_cursor_to_focus();
+                    // FIXME: granular
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::ShowGravedWindows => {
+                self.niri.show_graved_windows();
+                self.maybe_warp_cursor_to_focus();
+                // FIXME: granular
+                self.niri.queue_redraw_all();
+            }
+            Action::HideGravedWindows => {
+                self.niri.hide_graved_windows();
+                self.maybe_warp_cursor_to_focus();
+                // FIXME: granular
+                self.niri.queue_redraw_all();
+            }
+            Action::ToggleGravedWindows => {
+                self.niri.toggle_graved_windows();
+                self.maybe_warp_cursor_to_focus();
+                // FIXME: granular
+                self.niri.queue_redraw_all();
+            }
             Action::FocusFloating => {
                 self.niri.layout.focus_floating();
                 self.maybe_warp_cursor_to_focus();

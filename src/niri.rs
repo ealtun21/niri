@@ -138,10 +138,13 @@ use crate::input::{
 use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
 use crate::layer::MappedLayer;
+use niri_config::workspace::{Workspace as WorkspaceConfig, WorkspaceName};
+
 use crate::layout::tile::TileRenderElement;
 use crate::layout::workspace::{Workspace, WorkspaceId};
 use crate::layout::{
-    HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
+    ActivateWindow, HitType, Layout, LayoutElement as _, LayoutElementRenderElement,
+    MonitorRenderElement,
 };
 use crate::niri_render_elements;
 use crate::protocols::ext_workspace::{self, ExtWorkspaceManagerState};
@@ -190,6 +193,9 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+
+/// Name of the auto-created hidden workspace that holds graved windows.
+pub const GRAVE_WORKSPACE_NAME: &str = "grave";
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
@@ -3595,6 +3601,157 @@ impl Niri {
 
         let target_output = target_workspace.current_output();
         Some((target_output.cloned(), target_workspace_index))
+    }
+
+    /// Id of the grave workspace, or `None` if nothing has ever been graved.
+    fn grave_workspace(&self) -> Option<WorkspaceId> {
+        let (_idx, ws) = self.layout.find_workspace_by_name(GRAVE_WORKSPACE_NAME)?;
+        Some(ws.id())
+    }
+
+    /// Id of the grave workspace, creating it hidden if it doesn't exist yet.
+    ///
+    /// The grave is just a hidden workspace: hiding, navigation exclusion, overview culling,
+    /// IPC exclusion and MRU exclusion all come from that. It is auto-created so there is
+    /// nothing for the user to declare.
+    fn ensure_grave_workspace(&mut self) -> Option<WorkspaceId> {
+        if self.grave_workspace().is_none() {
+            self.layout.ensure_named_workspace(&WorkspaceConfig {
+                name: WorkspaceName(String::from(GRAVE_WORKSPACE_NAME)),
+                open_on_output: None,
+                layout: None,
+                hidden: true,
+            });
+            if let Some(ws) = self
+                .layout
+                .workspaces_mut()
+                .find(|ws| ws.name().map(String::as_str) == Some(GRAVE_WORKSPACE_NAME))
+            {
+                ws.set_stash();
+            }
+        }
+
+        self.grave_workspace()
+    }
+
+    fn set_window_graved(&mut self, window: &Window, graved: bool) {
+        let mapped = self
+            .layout
+            .workspaces_mut()
+            .find_map(|ws| ws.windows_mut().find(|m| &m.window == window));
+        if let Some(mapped) = mapped {
+            mapped.set_graved(graved);
+        }
+    }
+
+    /// Moves `window` to the workspace with `ws_id`, across outputs if needed.
+    fn move_window_to_workspace_id(
+        &mut self,
+        window: &Window,
+        ws_id: WorkspaceId,
+        activate: ActivateWindow,
+    ) {
+        let Some((idx, ws)) = self.layout.find_workspace_by_id(ws_id) else {
+            return;
+        };
+        // move_to_output() handles the same-output case too, and returns early if the window is
+        // already on the target workspace.
+        let Some(output) = ws.current_output().cloned() else {
+            return;
+        };
+        self.layout
+            .move_to_output(Some(window), &output, Some(idx), activate);
+    }
+
+    /// Windows that are graved, and either in the grave (`summoned == false`) or out of it.
+    fn graved_windows(&self, summoned: bool) -> Vec<Window> {
+        let Some(grave_id) = self.grave_workspace() else {
+            return Vec::new();
+        };
+
+        self.layout
+            .workspaces()
+            .filter(|(_mon, _idx, ws)| (ws.id() == grave_id) != summoned)
+            .flat_map(|(_mon, _idx, ws)| ws.windows())
+            .filter(|mapped| mapped.is_graved())
+            .map(|mapped| mapped.window.clone())
+            .collect()
+    }
+
+    pub fn grave_window(&mut self, window: &Window) {
+        let Some(grave_id) = self.ensure_grave_workspace() else {
+            return;
+        };
+
+        self.set_window_graved(window, true);
+        self.move_window_to_workspace_id(window, grave_id, ActivateWindow::No);
+    }
+
+    pub fn ungrave_window(&mut self, window: &Window) {
+        self.set_window_graved(window, false);
+
+        // Bring it back into the tiling layout here, so that leaving the grave is visible even
+        // when the window was already summoned and floating.
+        let Some(ws_id) = self.layout.active_workspace().map(|ws| ws.id()) else {
+            return;
+        };
+        self.move_window_to_workspace_id(window, ws_id, ActivateWindow::Yes);
+        self.layout.set_window_floating(Some(window), false);
+    }
+
+    /// Summons every window sitting in the grave onto the current workspace as floating, and
+    /// focuses the most recently focused one.
+    ///
+    /// Idempotent: with nothing left in the grave this changes nothing, not even the focus, so
+    /// it is safe to spam from a held-down key.
+    pub fn show_graved_windows(&mut self) {
+        let windows = self.graved_windows(false);
+        if windows.is_empty() {
+            return;
+        }
+
+        let Some(ws_id) = self.layout.active_workspace().map(|ws| ws.id()) else {
+            return;
+        };
+
+        for window in &windows {
+            self.move_window_to_workspace_id(window, ws_id, ActivateWindow::No);
+            self.layout.set_window_floating(Some(window), true);
+        }
+
+        let focus = self
+            .layout
+            .windows()
+            .filter(|(_mon, mapped)| windows.contains(&mapped.window))
+            .max_by_key(|(_mon, mapped)| mapped.get_focus_timestamp())
+            .map(|(_mon, mapped)| mapped.window.clone());
+        if let Some(window) = focus {
+            self.layout.activate_window(&window);
+        }
+    }
+
+    /// Summons the graved windows, or sends them back if they are already out.
+    ///
+    /// The direction comes from where the windows actually are, not from a remembered flag, so
+    /// repeated invocations from a held-down key recompute it every time and cannot latch into a
+    /// half-summoned state. With nothing graved, both branches are no-ops.
+    pub fn toggle_graved_windows(&mut self) {
+        if self.graved_windows(false).is_empty() {
+            self.hide_graved_windows();
+        } else {
+            self.show_graved_windows();
+        }
+    }
+
+    /// Sends every summoned graved window back into the grave. Idempotent, like the summon.
+    pub fn hide_graved_windows(&mut self) {
+        let Some(grave_id) = self.grave_workspace() else {
+            return;
+        };
+
+        for window in self.graved_windows(true) {
+            self.move_window_to_workspace_id(&window, grave_id, ActivateWindow::No);
+        }
     }
 
     pub fn find_window_by_id(&self, id: MappedId) -> Option<Window> {

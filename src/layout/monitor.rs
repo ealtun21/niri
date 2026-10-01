@@ -481,6 +481,12 @@ impl<W: LayoutElement> Monitor<W> {
         idx: usize,
         config: Option<niri_config::Animation>,
     ) {
+        // A stash is storage, not a place: nothing may switch to it. Every way of reaching a
+        // workspace (by name, id, previous, focus-follows, ext-workspace) funnels through here.
+        if self.workspaces[idx].stash {
+            return;
+        }
+
         // FIXME: also compute and use current velocity.
         let current_idx = self.workspace_render_idx();
         let new_idx = render_pos(&self.workspaces, idx);
@@ -2155,6 +2161,10 @@ impl<W: LayoutElement> Monitor<W> {
             "monitor must have at least one workspace"
         );
         assert!(self.active_workspace_idx < self.workspaces.len());
+        assert!(
+            !self.workspaces[self.active_workspace_idx].stash,
+            "a stash workspace must never be active"
+        );
 
         if let Some(WorkspaceSwitch::Animation(anim)) = &self.workspace_switch {
             let before_idx = anim.from() as usize;

@@ -340,6 +340,18 @@ pub enum Action {
     MoveWindowToTiling,
     #[knuffel(skip)]
     MoveWindowToTilingById(u64),
+    GraveWindow,
+    #[knuffel(skip)]
+    GraveWindowById(u64),
+    UngraveWindow,
+    #[knuffel(skip)]
+    UngraveWindowById(u64),
+    ToggleWindowGraved,
+    #[knuffel(skip)]
+    ToggleWindowGravedById(u64),
+    ShowGravedWindows,
+    HideGravedWindows,
+    ToggleGravedWindows,
     FocusFloating,
     FocusTiling,
     SwitchFocusBetweenFloatingAndTiling,
@@ -673,6 +685,17 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::MoveWindowToTiling { id: Some(id) } => {
                 Self::MoveWindowToTilingById(id)
             }
+            niri_ipc::Action::GraveWindow { id: None } => Self::GraveWindow,
+            niri_ipc::Action::GraveWindow { id: Some(id) } => Self::GraveWindowById(id),
+            niri_ipc::Action::UngraveWindow { id: None } => Self::UngraveWindow,
+            niri_ipc::Action::UngraveWindow { id: Some(id) } => Self::UngraveWindowById(id),
+            niri_ipc::Action::ToggleWindowGraved { id: None } => Self::ToggleWindowGraved,
+            niri_ipc::Action::ToggleWindowGraved { id: Some(id) } => {
+                Self::ToggleWindowGravedById(id)
+            }
+            niri_ipc::Action::ShowGravedWindows {} => Self::ShowGravedWindows,
+            niri_ipc::Action::HideGravedWindows {} => Self::HideGravedWindows,
+            niri_ipc::Action::ToggleGravedWindows {} => Self::ToggleGravedWindows,
             niri_ipc::Action::FocusFloating {} => Self::FocusFloating,
             niri_ipc::Action::FocusTiling {} => Self::FocusTiling,
             niri_ipc::Action::SwitchFocusBetweenFloatingAndTiling {} => {
