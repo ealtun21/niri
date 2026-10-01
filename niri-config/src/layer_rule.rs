@@ -25,6 +25,9 @@ pub struct LayerRule {
     pub background_effect: BackgroundEffectRule,
     #[knuffel(child, default)]
     pub popups: PopupsRule,
+    /// Layer to place this surface on, overriding the one the client requested.
+    #[knuffel(child, unwrap(argument, str))]
+    pub layer: Option<niri_ipc::Layer>,
 }
 
 #[derive(knuffel::Decode, Debug, Default, Clone, PartialEq)]

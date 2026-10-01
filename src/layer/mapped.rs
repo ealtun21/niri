@@ -4,8 +4,8 @@ use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
-use smithay::wayland::compositor::{remove_pre_commit_hook, HookId};
-use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
+use smithay::wayland::compositor::{remove_pre_commit_hook, with_states, HookId};
+use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer, LayerSurfaceCachedState};
 
 use super::ResolvedLayerRules;
 use crate::animation::Clock;
@@ -53,6 +53,10 @@ pub struct MappedLayer {
 
     /// Clock for driving animations.
     clock: Clock,
+
+    /// Layer the client asked for, and the layer we moved it to, while the `layer` rule is
+    /// overriding it.
+    layer_override: Option<(Layer, Layer)>,
 }
 
 niri_render_elements! {
@@ -79,7 +83,7 @@ impl MappedLayer {
         shadow_config.on = false;
         shadow_config.merge_with(&rules.shadow);
 
-        Self {
+        let mut rv = Self {
             surface,
             pre_commit_hook,
             rules,
@@ -90,7 +94,10 @@ impl MappedLayer {
             shadow: Shadow::new(shadow_config),
             blur_config: config.blur,
             clock,
-        }
+            layer_override: None,
+        };
+        rv.apply_layer_rule();
+        rv
     }
 
     pub fn update_config(&mut self, config: &Config) {
@@ -141,12 +148,49 @@ impl MappedLayer {
     /// Recomputes the resolved layer rules and returns whether they changed.
     pub fn recompute_layer_rules(&mut self, rules: &[LayerRule], is_at_startup: bool) -> bool {
         let new_rules = ResolvedLayerRules::compute(rules, &self.surface, is_at_startup);
-        if new_rules == self.rules {
-            return false;
-        }
-
+        let changed = new_rules != self.rules;
         self.rules = new_rules;
-        true
+
+        // Also when the rules didn't change: this runs when the client moves the surface to
+        // another layer itself, and then the override must be reapplied.
+        self.apply_layer_rule();
+
+        changed
+    }
+
+    /// Applies the `layer` rule, moving the surface to another layer-shell layer.
+    ///
+    /// The layer is written into the surface's cached state, which is exactly what the client's
+    /// own set_layer request does, so everything downstream (arrangement, render order, input,
+    /// exclusive zones, IPC) sees the surface on its new layer natively.
+    fn apply_layer_rule(&mut self) {
+        let current = self.surface.layer();
+
+        // If the surface isn't where we put it, the client moved it itself.
+        if self
+            .layer_override
+            .is_some_and(|(_, forced)| forced != current)
+        {
+            self.layer_override = None;
+        }
+        let client = self.layer_override.map_or(current, |(client, _)| client);
+
+        // place-within-backdrop only works on the background layer, so let it win.
+        let target = if self.rules.place_within_backdrop {
+            client
+        } else {
+            self.rules.layer.unwrap_or(client)
+        };
+
+        if target != current {
+            with_states(self.surface.wl_surface(), |states| {
+                let mut state = states.cached_state.get::<LayerSurfaceCachedState>();
+                // Set the pending state too, so that the client's next commit doesn't revert this.
+                state.pending().layer = target;
+                state.current().layer = target;
+            });
+        }
+        self.layer_override = (target != client).then_some((client, target));
     }
 
     pub fn set_recompute_rules_on_commit(&mut self) {

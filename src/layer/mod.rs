@@ -33,6 +33,9 @@ pub struct ResolvedLayerRules {
 
     /// Rules for this layer surface's popups.
     pub popups: ResolvedPopupsRules,
+
+    /// Layer to place this surface on, overriding the one the client requested.
+    pub layer: Option<Layer>,
 }
 
 impl ResolvedLayerRules {
@@ -75,6 +78,9 @@ impl ResolvedLayerRules {
             if let Some(x) = rule.baba_is_float {
                 resolved.baba_is_float = x;
             }
+            if let Some(x) = rule.layer {
+                resolved.layer = Some(from_ipc_layer(x));
+            }
 
             resolved.shadow.merge_with(&rule.shadow);
 
@@ -86,6 +92,15 @@ impl ResolvedLayerRules {
         }
 
         resolved
+    }
+}
+
+fn from_ipc_layer(layer: niri_ipc::Layer) -> Layer {
+    match layer {
+        niri_ipc::Layer::Background => Layer::Background,
+        niri_ipc::Layer::Bottom => Layer::Bottom,
+        niri_ipc::Layer::Top => Layer::Top,
+        niri_ipc::Layer::Overlay => Layer::Overlay,
     }
 }
 

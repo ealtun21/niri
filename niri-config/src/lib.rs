@@ -908,6 +908,7 @@ mod tests {
             layer-rule {
                 match namespace="^notifications$"
                 block-out-from "screencast"
+                layer "bottom"
             }
 
             binds {
@@ -1944,6 +1945,9 @@ mod tests {
                             saturation: None,
                         },
                     },
+                    layer: Some(
+                        Bottom,
+                    ),
                 },
             ],
             binds: Binds(

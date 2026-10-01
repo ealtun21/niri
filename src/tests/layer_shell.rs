@@ -1,11 +1,14 @@
 use insta::assert_snapshot;
+use niri_config::Config;
+use smithay::desktop::layer_map_for_output;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
     Anchor, KeyboardInteractivity,
 };
+use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use super::*;
-use crate::tests::client::{LayerConfigureProps, LayerMargin};
+use crate::tests::client::{ClientId, LayerConfigureProps, LayerMargin};
 
 #[test]
 fn simple_top_anchor() {
@@ -255,4 +258,73 @@ fn multiple_commits_before_mapping() {
     let layer = f.client(id).layer(&surface);
     // Configure with new size.
     assert_snapshot!(layer.format_recent_configures(), @"size: 1920 × 50");
+}
+
+#[test]
+fn layer_rule_overrides_layer() {
+    fn map_layer(f: &mut Fixture, id: ClientId, namespace: &str) {
+        let layer = f
+            .client(id)
+            .create_layer(None, Layer::Background, namespace);
+        let surface = layer.surface.clone();
+        layer.set_configure_props(LayerConfigureProps {
+            size: Some((100, 100)),
+            ..Default::default()
+        });
+        layer.commit();
+        f.roundtrip(id);
+
+        let layer = f.client(id).layer(&surface);
+        layer.attach_new_buffer();
+        layer.set_size(100, 100);
+        layer.ack_last_and_commit();
+        f.double_roundtrip(id);
+    }
+
+    fn layers(f: &Fixture) -> Vec<(String, WlrLayer)> {
+        let output = f.niri_output(1);
+        let map = layer_map_for_output(&output);
+        let mut layers: Vec<_> = map
+            .layers()
+            .map(|l| (l.namespace().to_owned(), l.layer()))
+            .collect();
+        layers.sort_by(|a, b| a.0.cmp(&b.0));
+        layers
+    }
+
+    let config = Config::parse_mem(
+        r#"
+        layer-rule {
+            match namespace="^desktop$"
+            layer "bottom"
+        }
+        "#,
+    )
+    .unwrap();
+
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+
+    map_layer(&mut f, id, "desktop");
+    map_layer(&mut f, id, "wallpaper");
+
+    // The matched surface moves to the bottom layer, the unmatched one stays put.
+    assert_eq!(
+        layers(&f),
+        [
+            ("desktop".to_owned(), WlrLayer::Bottom),
+            ("wallpaper".to_owned(), WlrLayer::Background),
+        ]
+    );
+
+    // Removing the rule puts the surface back where the client asked.
+    f.niri_state().reload_config(Ok(Config::default()));
+    assert_eq!(
+        layers(&f),
+        [
+            ("desktop".to_owned(), WlrLayer::Background),
+            ("wallpaper".to_owned(), WlrLayer::Background),
+        ]
+    );
 }
