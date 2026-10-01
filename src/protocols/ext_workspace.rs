@@ -90,7 +90,7 @@ pub fn refresh(state: &mut State) {
 
     // Remove workspaces that no longer exist (sending workspace_leave to workspace groups).
     let mut seen_workspaces = HashMap::new();
-    for (mon, _, ws) in state.niri.layout.workspaces() {
+    for (mon, _, ws) in state.niri.layout.workspaces_visible() {
         let output = mon.map(|mon| mon.output());
         seen_workspaces.insert(ws.id(), output);
     }
@@ -132,7 +132,7 @@ pub fn refresh(state: &mut State) {
     });
 
     // Update existing workspaces and create new ones.
-    for (mon, ws_idx, ws) in state.niri.layout.workspaces() {
+    for (mon, ws_idx, ws) in state.niri.layout.workspaces_visible() {
         changed |= refresh_workspace(protocol_state, mon, ws_idx, ws);
     }
 

@@ -10,6 +10,9 @@ pub struct Workspace {
     pub open_on_output: Option<String>,
     #[knuffel(child)]
     pub layout: Option<WorkspaceLayoutPart>,
+    /// Keep this workspace out of the workspace strip and out of implicit navigation.
+    #[knuffel(child)]
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

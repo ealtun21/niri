@@ -783,6 +783,11 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
 
+                // The shifts above can land on a hidden workspace, which must never become
+                // active implicitly.
+                primary.active_workspace_idx =
+                    monitor::first_visible_from(&primary.workspaces, primary.active_workspace_idx);
+
                 // If we stopped a workspace switch, then we might need to clean up workspaces.
                 // Also if empty_workspace_above_first is set and there are only 2 workspaces left,
                 // both will be empty and one of them needs to be removed. clean_up_workspaces
@@ -2190,6 +2195,13 @@ impl<W: LayoutElement> Layout<W> {
         monitor.switch_workspace(idx);
     }
 
+    /// Maps a 0-based workspace index from a `WorkspaceReference` to a real workspace index,
+    /// skipping hidden workspaces.
+    pub fn workspace_idx_at_pos(&self, pos: usize) -> usize {
+        self.active_monitor_ref()
+            .map_or(pos, |mon| monitor::idx_at_render_pos(&mon.workspaces, pos))
+    }
+
     pub fn switch_workspace_auto_back_and_forth(&mut self, idx: usize) {
         let Some(monitor) = self.active_monitor() else {
             return;
@@ -2951,6 +2963,7 @@ impl<W: LayoutElement> Layout<W> {
             let Some(name) = ws.name() else { continue };
             if let Some(config) = config.workspaces.iter().find(|w| &w.name.0 == name) {
                 ws.update_layout_config(config.layout.clone().map(|x| x.0));
+                ws.hidden = config.hidden;
             }
         }
 
@@ -4953,6 +4966,26 @@ impl<W: LayoutElement> Layout<W> {
         let iter_normal = iter_normal.into_iter().flatten();
         let iter_no_outputs = iter_no_outputs.into_iter().flatten();
         iter_normal.chain(iter_no_outputs)
+    }
+
+    /// Workspaces as clients see them: hidden workspaces are omitted, and the index is the
+    /// workspace's position in the strip, which is the index `focus-workspace <n>` resolves.
+    pub fn workspaces_visible(
+        &self,
+    ) -> impl Iterator<Item = (Option<&Monitor<W>>, usize, &Workspace<W>)> + '_ {
+        let no_outputs: &[Workspace<W>] = match &self.monitor_set {
+            MonitorSet::Normal { .. } => &[],
+            MonitorSet::NoOutputs { workspaces } => workspaces,
+        };
+
+        self.workspaces().filter_map(move |(mon, idx, ws)| {
+            if ws.hidden {
+                return None;
+            }
+
+            let workspaces = mon.map_or(no_outputs, |mon| &mon.workspaces);
+            Some((mon, monitor::render_pos(workspaces, idx) as usize, ws))
+        })
     }
 
     pub fn workspaces_mut(&mut self) -> impl Iterator<Item = &mut Workspace<W>> + '_ {

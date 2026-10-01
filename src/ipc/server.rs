@@ -603,7 +603,7 @@ impl State {
         // Check for workspace changes.
         let mut seen = HashSet::new();
         let mut need_workspaces_changed = false;
-        for (mon, ws_idx, ws) in layout.workspaces() {
+        for (mon, ws_idx, ws) in layout.workspaces_visible() {
             let id = ws.id().get();
             seen.insert(id);
 
@@ -645,7 +645,7 @@ impl State {
             }
 
             // Check if this workspace became active.
-            let is_active = mon.is_some_and(|mon| mon.active_workspace_idx() == ws_idx);
+            let is_active = mon.is_some_and(|mon| mon.active_workspace_ref().id() == ws.id());
             if is_active && !ipc_ws.is_active {
                 events.push(Event::WorkspaceActivated { id, focused: false });
             }
@@ -660,7 +660,7 @@ impl State {
             events.clear();
 
             let workspaces = layout
-                .workspaces()
+                .workspaces_visible()
                 .map(|(mon, ws_idx, ws)| {
                     let id = ws.id().get();
                     Workspace {
@@ -669,7 +669,8 @@ impl State {
                         name: ws.name().cloned(),
                         output: mon.map(|mon| mon.output_name().clone()),
                         is_urgent: ws.is_urgent(),
-                        is_active: mon.is_some_and(|mon| mon.active_workspace_idx() == ws_idx),
+                        is_active: mon
+                            .is_some_and(|mon| mon.active_workspace_ref().id() == ws.id()),
                         is_focused: Some(id) == focused_ws_id,
                         active_window_id: ws.active_window().map(|win| win.id().get()),
                     }

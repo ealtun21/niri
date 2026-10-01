@@ -861,6 +861,7 @@ impl Op {
                     name: WorkspaceName(format!("ws{ws_name}")),
                     open_on_output: output_name.map(|name| format!("output{name}")),
                     layout: layout_config.map(|x| niri_config::WorkspaceLayoutPart(*x)),
+                    hidden: false,
                 });
             }
             Op::UnnameWorkspace { ws_name } => {
@@ -2355,6 +2356,156 @@ fn open_right_of_on_different_workspace_ewaf() {
         1,
         "the new window must become active"
     );
+}
+
+#[test]
+fn hidden_workspace_is_out_of_the_strip_but_reachable_by_name() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddNamedWorkspace {
+            ws_name: 1,
+            output_name: None,
+            layout_config: None,
+        },
+        Op::AddNamedWorkspace {
+            ws_name: 2,
+            output_name: None,
+            layout_config: None,
+        },
+    ]);
+    layout.ensure_named_workspace(&WorkspaceConfig {
+        name: WorkspaceName(String::from("scratch")),
+        open_on_output: None,
+        layout: None,
+        hidden: true,
+    });
+    layout.verify_invariants();
+
+    let mon = layout.active_monitor_ref().unwrap();
+    let hidden_idx = mon.workspaces.iter().position(|ws| ws.hidden).unwrap();
+    let visible: Vec<_> = (0..mon.workspaces.len())
+        .filter(|idx| !mon.workspaces[*idx].hidden)
+        .collect();
+    assert!(visible.len() >= 2, "need a visible workspace to move between");
+
+    // The strip has no gap where the hidden workspace sits.
+    let mon = layout.active_monitor_ref().unwrap();
+    let positions: Vec<_> = (0..=mon.workspaces.len())
+        .map(|idx| monitor::render_pos(&mon.workspaces, idx))
+        .collect();
+    assert_eq!(
+        *positions.last().unwrap(),
+        monitor::visible_count(&mon.workspaces) as f64
+    );
+
+    // Implicit navigation never lands on it.
+    for pos in 0..positions.len() + 2 {
+        layout.switch_workspace(layout.workspace_idx_at_pos(pos));
+        assert_ne!(layout.active_monitor_ref().unwrap().active_workspace_idx, hidden_idx);
+    }
+    layout.switch_workspace(0);
+    for _ in 0..positions.len() + 2 {
+        layout.switch_workspace_down();
+        assert_ne!(layout.active_monitor_ref().unwrap().active_workspace_idx, hidden_idx);
+    }
+    for _ in 0..positions.len() + 2 {
+        layout.switch_workspace_up();
+        assert_ne!(layout.active_monitor_ref().unwrap().active_workspace_idx, hidden_idx);
+    }
+
+    // It's absent from what gets rendered...
+    let mon = layout.active_monitor_ref().unwrap();
+    assert!(mon
+        .workspaces_with_render_geo_idx()
+        .all(|((idx, _ws), _geo)| idx != hidden_idx));
+
+    // ...until it's explicitly focused by name, and then it's the only one on screen.
+    let mon = layout.active_monitor().unwrap();
+    mon.activate_workspace(hidden_idx);
+    layout.verify_invariants();
+    let mon = layout.active_monitor_ref().unwrap();
+    assert_eq!(mon.active_workspace_idx, hidden_idx);
+    let shown: Vec<_> = mon
+        .workspaces_with_render_geo_idx()
+        .map(|((idx, _ws), geo)| (idx, geo.loc.y))
+        .collect();
+    assert_eq!(shown, [(hidden_idx, 0.)]);
+}
+
+#[test]
+fn hidden_workspace_is_not_active_at_startup() {
+    // Startup order: config workspaces are created before any output shows up.
+    // ensure_named_workspace inserts at the front, so add the visible one first to end up with
+    // the hidden workspace at index 0.
+    let mut layout = Layout::<TestWindow>::default();
+    for (name, hidden) in [("main", false), ("scratch", true)] {
+        layout.ensure_named_workspace(&WorkspaceConfig {
+            name: WorkspaceName(String::from(name)),
+            open_on_output: None,
+            layout: None,
+            hidden,
+        });
+    }
+    check_ops_on_layout(&mut layout, [Op::AddOutput(1)]);
+
+    let mon = layout.active_monitor_ref().unwrap();
+    assert!(mon.workspaces[0].hidden, "test needs the hidden workspace first");
+
+    // The active workspace must be the first visible one, not the hidden one.
+    let first_visible = mon.workspaces.iter().position(|ws| !ws.hidden).unwrap();
+    assert_eq!(mon.active_workspace_idx, first_visible);
+}
+
+#[test]
+fn hidden_workspace_is_absent_from_the_ipc_list() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::AddNamedWorkspace {
+            ws_name: 1,
+            output_name: None,
+            layout_config: None,
+        },
+        Op::AddNamedWorkspace {
+            ws_name: 2,
+            output_name: None,
+            layout_config: None,
+        },
+    ]);
+    layout.ensure_named_workspace(&WorkspaceConfig {
+        name: WorkspaceName(String::from("scratch")),
+        open_on_output: None,
+        layout: None,
+        hidden: true,
+    });
+    layout.verify_invariants();
+
+    let hidden_id = layout
+        .active_monitor_ref()
+        .unwrap()
+        .workspaces
+        .iter()
+        .find(|ws| ws.hidden)
+        .unwrap()
+        .id();
+
+    let listed: Vec<_> = layout
+        .workspaces_visible()
+        .map(|(_mon, idx, ws)| (idx, ws.id()))
+        .collect();
+
+    // The hidden workspace is not listed...
+    assert!(listed.iter().all(|(_idx, id)| *id != hidden_id));
+    // ...and the remaining indices are contiguous, with no gap where it sat. IPC reports
+    // idx + 1, so contiguous from 0 here means contiguous from 1 over IPC.
+    let indices: Vec<_> = listed.iter().map(|(idx, _id)| *idx).collect();
+    assert_eq!(indices, (0..listed.len()).collect::<Vec<_>>());
+
+    // Each listed index is the workspace that `focus-workspace <idx + 1>` resolves, so bar
+    // numbering and keybinds agree.
+    for (idx, id) in listed {
+        layout.switch_workspace(layout.workspace_idx_at_pos(idx));
+        assert_eq!(layout.active_workspace().unwrap().id(), id);
+    }
 }
 
 #[test]

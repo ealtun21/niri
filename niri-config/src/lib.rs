@@ -943,7 +943,9 @@ mod tests {
                 open-on-output "eDP-1"
             }
             workspace "workspace-2"
-            workspace "workspace-3"
+            workspace "workspace-3" {
+                hidden
+            }
 
             recent-windows {
                 off
@@ -2272,6 +2274,7 @@ mod tests {
                         "eDP-1",
                     ),
                     layout: None,
+                    hidden: false,
                 },
                 Workspace {
                     name: WorkspaceName(
@@ -2279,6 +2282,7 @@ mod tests {
                     ),
                     open_on_output: None,
                     layout: None,
+                    hidden: false,
                 },
                 Workspace {
                     name: WorkspaceName(
@@ -2286,6 +2290,7 @@ mod tests {
                     ),
                     open_on_output: None,
                     layout: None,
+                    hidden: true,
                 },
             ],
             recent_windows: RecentWindows {
