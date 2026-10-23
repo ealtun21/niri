@@ -13,7 +13,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::monitor::InsertPosition;
 use super::tab_indicator::{TabIndicator, TabIndicatorRenderElement, TabInfo};
-use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
+use super::tile::{take_framebuffer_effects, Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile};
 use crate::animation::{Animation, Clock};
@@ -1558,9 +1558,19 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             blocker
         };
 
+        let mut snapshot = snapshot;
+        let background_effects = take_framebuffer_effects(&mut snapshot.contents);
+
         let scale = Scale::from(self.scale);
         let res = ClosingWindow::new(
-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
+            renderer,
+            snapshot,
+            scale,
+            tile_size,
+            tile_pos,
+            blocker,
+            anim,
+            background_effects,
         );
         match res {
             Ok(closing) => {
@@ -2975,8 +2985,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         if layer.is_normal() {
             let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
             for closing in self.closing_windows.iter().rev() {
-                let elem = closing.render(ctx.as_gles(), view_rect, scale);
-                push(elem.into());
+                closing.render(ctx.as_gles(), view_rect, scale, &mut |elem| {
+                    push(elem.into())
+                });
             }
         }
 

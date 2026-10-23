@@ -22,6 +22,7 @@ use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
+use crate::render_helpers::framebuffer_effect::FramebufferEffectElement;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::resize::ResizeRenderElement;
@@ -1386,10 +1387,23 @@ impl<W: LayoutElement> Tile<W> {
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );
+            let tile_size = self.animated_tile_size();
+            let effects = open
+                .effect_transform(ctx.renderer, tile_alpha)
+                .map(|(s, alpha)| {
+                    // The open animation scales around the tile center.
+                    let center = tile_size.to_point().downscale(2.);
+                    let offset = location + center - center.upscale(s);
+                    take_framebuffer_effects(&mut elements)
+                        .into_iter()
+                        .map(|e| e.transformed(s, offset, alpha))
+                        .collect()
+                })
+                .unwrap_or_else(Vec::new);
             match open.render(
                 ctx.renderer,
                 &elements,
-                self.animated_tile_size(),
+                tile_size,
                 location,
                 scale,
                 tile_alpha,
@@ -1397,6 +1411,9 @@ impl<W: LayoutElement> Tile<W> {
                 Ok((elem, data)) => {
                     self.window().set_offscreen_data(Some(data));
                     push(elem.into());
+                    for effect in effects {
+                        push(BackgroundEffectElement::from(effect).into());
+                    }
                     pushed = true;
                 }
                 Err(err) => {
@@ -1413,6 +1430,10 @@ impl<W: LayoutElement> Tile<W> {
                 focus_ring,
                 &mut |elem| elements.push(elem),
             );
+            let effects: Vec<_> = take_framebuffer_effects(&mut elements)
+                .into_iter()
+                .map(|e| e.transformed(1., location, tile_alpha))
+                .collect();
             match alpha.offscreen.render(ctx.renderer, scale, &elements) {
                 Ok((elem, _sync, data)) => {
                     let offset = elem.offset();
@@ -1420,6 +1441,9 @@ impl<W: LayoutElement> Tile<W> {
 
                     self.window().set_offscreen_data(Some(data));
                     push(elem.into());
+                    for effect in effects {
+                        push(BackgroundEffectElement::from(effect).into());
+                    }
                     pushed = true;
                 }
                 Err(err) => {
@@ -1597,4 +1621,25 @@ impl<W: LayoutElement> Tile<W> {
         assert_abs_diff_eq!(size.w, rounded.w, epsilon = 1e-5);
         assert_abs_diff_eq!(size.h, rounded.h, epsilon = 1e-5);
     }
+}
+
+/// Removes framebuffer effects (non-xray blur) from elements about to be rendered offscreen, where
+/// there's nothing behind the tile for them to capture.
+///
+/// The caller should render the returned effects directly, behind the offscreen contents.
+pub fn take_framebuffer_effects(
+    elements: &mut Vec<TileRenderElement<GlesRenderer>>,
+) -> Vec<FramebufferEffectElement> {
+    let mut effects = Vec::new();
+    let mut rest = Vec::with_capacity(elements.len());
+    for elem in elements.drain(..) {
+        match elem {
+            TileRenderElement::BackgroundEffect(BackgroundEffectElement::FramebufferEffect(e)) => {
+                effects.push(e)
+            }
+            elem => rest.push(elem),
+        }
+    }
+    *elements = rest;
+    effects
 }
