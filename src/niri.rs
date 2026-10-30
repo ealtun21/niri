@@ -1040,7 +1040,8 @@ impl State {
         }
 
         // The cursor might overlap multiple outputs, so we need to queue a redraw for all of them.
-        // This is especially important when the cursor is straddling the boundary between two outputs.
+        // This is especially important when the cursor is straddling the boundary between two
+        // outputs.
         let mut cursor_geo = Rectangle::new(location.to_i32_round(), Size::from((1, 1)));
         if let CursorImageStatus::Surface(surface) = self.niri.cursor_manager.cursor_image() {
             let hotspot = with_states(surface, |states| {
