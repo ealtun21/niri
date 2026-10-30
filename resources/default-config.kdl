@@ -38,6 +38,7 @@ input {
         natural-scroll
         // accel-speed 0.2
         // accel-profile "flat"
+        // pinch-sensitivity 1.0
         // scroll-method "two-finger"
         // disabled-on-external-mouse
     }
@@ -134,7 +135,7 @@ layout {
         // fixed 1920
     }
 
-    // You can also customize the heights that "switch-preset-window-height" (Mod+Shift+R) toggles between.
+    // You can also customize the heights that "switch-preset-window-height" (Mod+Ctrl+Shift+R) toggles between.
     // preset-window-heights { }
 
     // You can change the default width of the new windows.
@@ -383,6 +384,7 @@ binds {
     // Example media keys mapping using playerctl.
     // This will work with any MPRIS-enabled media player.
     XF86AudioPlay        allow-when-locked=true { spawn-sh "playerctl play-pause"; }
+    XF86AudioPause       allow-when-locked=true { spawn-sh "playerctl play-pause"; }
     XF86AudioStop        allow-when-locked=true { spawn-sh "playerctl stop"; }
     XF86AudioPrev        allow-when-locked=true { spawn-sh "playerctl previous"; }
     XF86AudioNext        allow-when-locked=true { spawn-sh "playerctl next"; }
@@ -393,12 +395,30 @@ binds {
     XF86MonBrightnessUp allow-when-locked=true { spawn "brightnessctl" "--class=backlight" "set" "+10%"; }
     XF86MonBrightnessDown allow-when-locked=true { spawn "brightnessctl" "--class=backlight" "set" "10%-"; }
 
+    // Some laptops have a key for toggling the touchpad.
+    XF86TouchpadToggle repeat=false { toggle-touchpad; }
+
     // Open/close the Overview: a zoomed-out view of workspaces and windows.
     // You can also move the mouse into the top-left hot corner,
     // or do a four-finger swipe up on a touchpad.
-    Mod+O repeat=false { toggle-overview; }
+    //
+    // This is a release bind.
+    // Press and release Mod by itself to trigger it.
+    Mod {
+        release { toggle-overview; }
+    }
+
+    // You can also bind both press and release actions like so.
+    // If the press action fires, the release action
+    // is also guaranteed to fire.
+    // This is useful for binds like push-to-talk.
+    // Alt+Shift {
+    //     press   { spawn "notify-send" "Enable push-to-talk!"; }
+    //     release { spawn "notify-send" "Disable push-to-talk!"; }
+    // }
 
     Mod+Q repeat=false { close-window; }
+    Alt+F4 repeat=false { close-window; }
 
     Mod+Left  { focus-column-left; }
     Mod+Down  { focus-window-down; }
@@ -550,11 +570,14 @@ binds {
     // Expel the bottom window from the focused column to the right.
     Mod+Period { expel-window-from-column; }
 
+    // Cycle through widths set in preset-column-widths.
     Mod+R { switch-preset-column-width; }
     // Cycling through the presets in reverse order is also possible.
-    // Mod+R { switch-preset-column-width-back; }
-    Mod+Shift+R { switch-preset-window-height; }
+    Mod+Shift+R { switch-preset-column-width-back; }
+
+    Mod+Ctrl+Shift+R { switch-preset-window-height; }
     Mod+Ctrl+R { reset-window-height; }
+
     Mod+F { maximize-column; }
     Mod+Shift+F { fullscreen-window; }
 

@@ -12,7 +12,6 @@ mod imp {
 
     use anyhow::{ensure, Context};
     use gtk::gdk;
-    use gtk::prelude::*;
     use niri::animation::Clock;
     use niri::render_helpers::{resources, shaders};
     use smithay::backend::egl::ffi::egl;
@@ -20,6 +19,7 @@ mod imp {
     use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
     use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer};
     use smithay::reexports::gbm::Format as Fourcc;
+    use smithay::utils::user_data::UserDataMap;
     use smithay::utils::{Physical, Rectangle, Scale, Transform};
 
     use super::*;
@@ -206,8 +206,15 @@ mod imp {
 
                 if let Some(mut damage) = rect.intersection(dst) {
                     damage.loc -= dst.loc;
+
+                    let cache = UserDataMap::new();
+                    if element.is_framebuffer_effect() {
+                        element
+                            .capture_framebuffer(&mut frame, src, dst, &cache)
+                            .context("error in capture_framebuffer()")?;
+                    }
                     element
-                        .draw(&mut frame, src, dst, &[damage], &[])
+                        .draw(&mut frame, src, dst, &[damage], &[], Some(&cache))
                         .context("error drawing element")?;
                 }
             }

@@ -1,10 +1,10 @@
 use std::cmp::{max, min};
 
 use niri_config::utils::MergeWith as _;
-use niri_config::window_rule::{Match, WindowRule};
+use niri_config::window_rule::{Match, OnXdgActivate, VrrRule, WindowRule};
 use niri_config::{
-    BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize, ShadowRule,
-    TabIndicatorRule,
+    BackgroundEffect, BlockOutFrom, BorderRule, CornerRadius, FloatingPosition, PresetSize,
+    ResolvedPopupsRules, ShadowRule, TabIndicatorRule,
 };
 use niri_ipc::ColumnDisplay;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -73,6 +73,9 @@ pub struct ResolvedWindowRules {
     /// Whether the window should open focused.
     pub open_focused: Option<bool>,
 
+    /// What to do on xdg-activation requests.
+    pub on_xdg_activate: Option<OnXdgActivate>,
+
     /// Extra bound on the minimum window width.
     pub min_width: Option<u16>,
     /// Extra bound on the minimum window height.
@@ -112,13 +115,22 @@ pub struct ResolvedWindowRules {
     pub block_out_from: Option<BlockOutFrom>,
 
     /// Whether to enable VRR on this window's primary output if it is on-demand.
-    pub variable_refresh_rate: Option<bool>,
+    pub variable_refresh_rate: Option<VrrRule>,
 
     /// Multiplier for all scroll events sent to this window.
     pub scroll_factor: Option<f64>,
 
+    /// Pinch gesture sensitivity for this window.
+    pub pinch_sensitivity: Option<f64>,
+
     /// Override whether to set the Tiled xdg-toplevel state on the window.
     pub tiled_state: Option<bool>,
+
+    /// Background effect configuration.
+    pub background_effect: BackgroundEffect,
+
+    /// Rules for this window's popups.
+    pub popups: ResolvedPopupsRules,
 }
 
 impl<'a> WindowRef<'a> {
@@ -251,6 +263,10 @@ impl ResolvedWindowRules {
                     resolved.open_focused = Some(x);
                 }
 
+                if let Some(x) = rule.on_xdg_activate {
+                    resolved.on_xdg_activate = Some(x);
+                }
+
                 if let Some(x) = rule.min_width {
                     resolved.min_width = Some(x);
                 }
@@ -293,9 +309,18 @@ impl ResolvedWindowRules {
                 if let Some(x) = rule.scroll_factor {
                     resolved.scroll_factor = Some(x.0);
                 }
+                if let Some(x) = rule.pinch_sensitivity {
+                    resolved.pinch_sensitivity = Some(x.0);
+                }
                 if let Some(x) = rule.tiled_state {
                     resolved.tiled_state = Some(x);
                 }
+
+                resolved
+                    .background_effect
+                    .merge_with(&rule.background_effect);
+
+                resolved.popups.merge_with(&rule.popups);
             }
 
             resolved.open_on_output = open_on_output.map(|x| x.to_owned());

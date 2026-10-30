@@ -58,6 +58,8 @@ window-rule {
     default-column-display "tabbed"
     default-floating-position x=100 y=200 relative-to="bottom-left"
     scroll-factor 0.75
+    pinch-sensitivity 1.25
+    on-xdg-activate "focus"
 
     focus-ring {
         // off
@@ -99,6 +101,25 @@ window-rule {
     clip-to-geometry true
     tiled-state true
     baba-is-float true
+
+    background-effect {
+        xray true
+        blur true
+        noise 0.05
+        saturation 3
+    }
+
+    popups {
+        opacity 0.5
+        geometry-corner-radius 15
+
+        background-effect {
+            xray true
+            blur true
+            noise 0.05
+            saturation 3
+        }
+    }
 
     min-width 100
     max-width 200
@@ -575,6 +596,35 @@ window-rule {
 > This is because window title (and app ID) are not double-buffered in the Wayland protocol, so they are not tied to specific window contents.
 > There's no robust way for Firefox to synchronize visibly showing a different tab and changing the window title.
 
+#### `on-xdg-activate`
+
+<sup>Since: next release</sup>
+
+Set what niri does when a window requests activation through [xdg-activation](https://wayland.app/protocols/xdg-activation-v1).
+
+Values:
+
+- `"ignore"`: do nothing: neither focus the window nor mark it urgent.
+- `"set-urgent"`: always mark the window urgent instead of focusing it.
+- `"focus"`: always focus the window, even for activation requests without a serial.
+
+The default behavior, when this rule is unset, picks between focusing and marking the window urgent based on the serial that the application provides when creating the activation token.
+Requests with a valid serial focus the target window, and requests without a serial mark it urgent.
+
+Requests with a set, but invalid, serial, are always ignored, which you can change with the [`honor-xdg-activation-with-invalid-serial`](https://niri-wm.github.io/niri/Configuration%3A-Debug-Options.html#honor-xdg-activation-with-invalid-serial) debug flag.
+
+This is useful for apps that steal focus on incoming messages or when opening popup windows like Picture-in-Picture.
+
+```kdl
+// Don't let Firefox PiP steal focus.
+window-rule {
+    match title="^Picture-in-Picture$"
+
+    open-floating true
+    on-xdg-activate "set-urgent"
+}
+```
+
 #### `opacity`
 
 Set the opacity of the window.
@@ -615,6 +665,18 @@ window-rule {
     match app-id="^mpv$"
 
     variable-refresh-rate true
+}
+```
+
+<sup>Since: next release</sup> You can set `variable-refresh-rate` to `"fullscreen-only"` to activate on-demand VRR only when this window is fullscreen on this output.
+The window must cover the entire screen (when niri hides the top layer-shell layer).
+
+This mode will work even when there are overlays over the fullscreen window.
+
+```kdl
+// Enable on-demand VRR when any window is fullscreen.
+window-rule {
+    variable-refresh-rate "fullscreen-only"
 }
 ```
 
@@ -706,6 +768,23 @@ window-rule {
     match app-id="firefox$"
 
     scroll-factor 0.75
+}
+```
+
+#### `pinch-sensitivity`
+
+<sup>Since: next release</sup>
+
+Set the sensitivity of pinch gestures sent to a window.
+
+This will be multiplied with the pinch sensitivity set for your touchpad in the [input section](./Configuration:-Input.md#pointing-devices).
+
+```kdl
+// Make pinch gestures in Firefox more sensitive.
+window-rule {
+    match app-id="firefox$"
+
+    pinch-sensitivity 1.25
 }
 ```
 
@@ -908,6 +987,95 @@ window-rule {
 https://github.com/user-attachments/assets/3f4cb1a4-40b2-4766-98b7-eec014c19509
 
 </video>
+
+#### `background-effect`
+
+<sup>Since: 26.04</sup>
+
+Override the background effect options for this window.
+
+- `xray`: set to `true` to enable the xray effect, or `false` to disable it.
+- `blur`: set to `true` to enable blur behind this window, or `false` to force-disable it.
+- `noise`: amount of pixel noise added to the background (helps with color banding from blur).
+- `saturation`: color saturation of the background (`0` is desaturated, `1` is normal, `2` is 200% saturation).
+
+See the [window effects page](./Window-Effects.md) for an overview of background effects.
+
+```kdl
+// Make floating windows use the regular blur (if enabled),
+// while tiled windows keep using the efficient xray blur.
+//
+// Warning: non-xray blur is currently experimental and has known limitations.
+// In particular, it doesn't work during window opening and closing animations.
+window-rule {
+    match is-floating=true
+
+    background-effect {
+        xray false
+    }
+}
+```
+
+#### `popups`
+
+<sup>Since: 26.04</sup>
+
+Override properties for this window's pop-ups (menus and tooltips).
+
+The properties work the same way as the corresponding window-rule properties, except that they apply to the window's pop-ups rather than to the window itself.
+
+`opacity` is applied *on top* of the layer surface's own opacity rule, so setting both will make pop-ups more transparent than the surface.
+Other properties apply independently.
+
+> [!NOTE]
+> This block affects only pop-ups created by the app via Wayland's [xdg-popup](https://wayland.app/protocols/xdg-shell#xdg_popup) (which should be most of them).
+>
+> Examples of things that look like pop-ups that won't work:
+>
+> - Fully emulated by the client, i.e. not a pop-up at all, the client just draws something that looks like a pop-up inside its window.
+> These are common in game engines and in web apps, e.g. the right click menu in Google Docs or in Electron apps like Discord.
+>
+> - Uses a wl-subsurface instead of an xdg-popup.
+> Common in older apps using GTK 3, notably Firefox still uses these for some menus.
+> Subsurfaces are an indivisible part of a surface and they aren't usually pop-ups, so it wouldn't make sense for niri to apply these rules to them.
+>
+> These emulated pop-ups come with other downsides: they cannot reliably extend outside their window, and if the app tries to do that, they will be clipped by rules such as `clip-to-geometry`.
+> So most modern apps will correctly use xdg-popup, which is the intended way to show pop-ups on Wayland.
+>
+> This block also does not affect input-method pop-ups, such as Fcitx.
+>
+> For pop-ups created by your desktop shell or desktop components, use the corresponding [layer rule](./Configuration:-Layer-Rules.md#popups).
+
+```kdl
+// Blur the background behind pop-up menus in Nautilus.
+window-rule {
+    match app-id="Nautilus"
+
+    popups {
+        // Matches the default libadwaita pop-up corner radius.
+        geometry-corner-radius 15
+
+        // Note: it'll look better to set background opacity
+        // through your GTK theme CSS and not here.
+        // This is just an example that makes it look obvious.
+        opacity 0.5
+
+        background-effect {
+            blur true
+        }
+    }
+}
+```
+
+Keep in mind that the background effect will look right only if the pop-up is shaped like a (rounded) rectangle, and the window correctly sets its Wayland geometry to exclude any shadows.
+For example, GTK 4 pop-ups with pointing arrows (`has-arrow=true` property) are *not* rounded rectangles—the arrow sticks out—so if you enable blur, it will also stick out of the pop-up.
+
+| Correct                                             | Wrong                                                                          |
+|-----------------------------------------------------|--------------------------------------------------------------------------------|
+| The pop-up is a rounded rectangle. Blur looks fine. | The pop-up is not a rounded rectangle. Blur extends above, where the arrow is. |
+| ![](./img/popup-no-arrow.png)                       | ![](./img/popup-arrow.png)                                                     |
+
+These pop-ups with custom shapes will need the app to implement the [ext-background-effect protocol](https://wayland.app/protocols/ext-background-effect-v1) to work properly.
 
 #### Size Overrides
 
