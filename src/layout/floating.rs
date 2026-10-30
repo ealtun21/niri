@@ -10,7 +10,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
 use super::scrolling::ColumnWidth;
-use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
+use super::tile::{take_framebuffer_effects, Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, Options, RemovedTile, SizeFrac,
@@ -623,9 +623,19 @@ impl<W: LayoutElement> FloatingSpace<W> {
             blocker
         };
 
+        let mut snapshot = snapshot;
+        let background_effects = take_framebuffer_effects(&mut snapshot.contents);
+
         let scale = Scale::from(self.scale);
         let res = ClosingWindow::new(
-            renderer, snapshot, scale, tile_size, tile_pos, blocker, anim,
+            renderer,
+            snapshot,
+            scale,
+            tile_size,
+            tile_pos,
+            blocker,
+            anim,
+            background_effects,
         );
         match res {
             Ok(closing) => {
@@ -1081,8 +1091,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
         // FIXME: I guess this should rather preserve the stacking order when the window is closed.
         if layer.is_normal() {
             for closing in self.closing_windows.iter().rev() {
-                let elem = closing.render(ctx.as_gles(), view_rect, scale);
-                push(elem.into());
+                closing.render(ctx.as_gles(), view_rect, scale, &mut |elem| {
+                    push(elem.into())
+                });
             }
         }
 

@@ -12,7 +12,7 @@ use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{Frame as _, FrameContext, Offscreen, Texture as _};
 use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Transform};
 
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::background_effect::RenderParams;
@@ -27,7 +27,7 @@ pub struct FramebufferEffect {
     commit: CommitCounter,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FramebufferEffectElement {
     id: Id,
     commit: CommitCounter,
@@ -39,6 +39,7 @@ pub struct FramebufferEffectElement {
     blur_options: Option<BlurOptions>,
     noise: f32,
     saturation: f32,
+    alpha: f32,
 }
 
 #[derive(Debug)]
@@ -90,11 +91,29 @@ impl FramebufferEffect {
             blur_options,
             noise,
             saturation,
+            alpha: 1.,
         }
     }
 }
 
 impl FramebufferEffectElement {
+    /// Maps the element by `p -> p * scale + offset` and fades it, to follow a tile animation
+    /// rendered offscreen (the offscreen has no framebuffer contents to capture).
+    pub fn transformed(mut self, scale: f64, offset: Point<f64, Logical>, alpha: f32) -> Self {
+        let tf = |r: Rectangle<f64, Logical>| {
+            Rectangle::new(r.loc.upscale(scale) + offset, r.size.upscale(scale))
+        };
+        self.geometry = tf(self.geometry);
+        self.clip_geo = tf(self.clip_geo);
+        self.corner_radius = self.corner_radius.scaled_by(scale as f32);
+        if let Some(subregion) = &mut self.subregion {
+            subregion.scale = Scale::from((subregion.scale.x * scale, subregion.scale.y * scale));
+            subregion.offset = subregion.offset.upscale(scale) + offset;
+        }
+        self.alpha *= alpha;
+        self
+    }
+
     fn compute_uniforms(
         &self,
         crop: Rectangle<f64, Logical>,
@@ -412,7 +431,7 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             &[],
             // The intermediate texture has the same transform as the frame.
             frame.transformation().invert(),
-            1.,
+            self.alpha,
             program.as_ref(),
             uniforms,
         )

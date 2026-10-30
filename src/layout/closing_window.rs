@@ -16,6 +16,7 @@ use smithay::wayland::compositor::{Blocker, BlockerState};
 
 use crate::animation::Animation;
 use crate::niri_render_elements;
+use crate::render_helpers::framebuffer_effect::FramebufferEffectElement;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::shader_element::ShaderRenderElement;
 use crate::render_helpers::shaders::{mat3_uniform, ProgramType, Shaders};
@@ -61,12 +62,17 @@ pub struct ClosingWindow {
 
     /// Random seed for the shader.
     random_seed: f32,
+    /// Non-xray background effects of the window, relative to the window geometry.
+    ///
+    /// These can't be baked into the buffers since they capture what's behind the window.
+    background_effects: Vec<FramebufferEffectElement>,
 }
 
 niri_render_elements! {
     ClosingWindowRenderElement => {
         Texture = RelocateRenderElement<RescaleRenderElement<PrimaryGpuTextureRenderElement>>,
         Shader = ShaderRenderElement,
+        FramebufferEffect = FramebufferEffectElement,
     }
 }
 
@@ -94,6 +100,7 @@ impl AnimationState {
 }
 
 impl ClosingWindow {
+    #[allow(clippy::too_many_arguments)]
     pub fn new<E: RenderElement<GlesRenderer>>(
         renderer: &mut GlesRenderer,
         snapshot: RenderSnapshot<E, E>,
@@ -102,6 +109,7 @@ impl ClosingWindow {
         pos: Point<f64, Logical>,
         blocker: TransactionBlocker,
         anim: Animation,
+        background_effects: Vec<FramebufferEffectElement>,
     ) -> anyhow::Result<Self> {
         let _span = tracy_client::span!("ClosingWindow::new");
 
@@ -154,6 +162,7 @@ impl ClosingWindow {
             blocked_out_buffer_offset,
             anim_state: AnimationState::new(blocker, anim),
             random_seed: fastrand::f32(),
+            background_effects,
         })
     }
 
@@ -181,7 +190,8 @@ impl ClosingWindow {
         ctx: RenderCtx<GlesRenderer>,
         view_rect: Rectangle<f64, Logical>,
         scale: Scale<f64>,
-    ) -> ClosingWindowRenderElement {
+        push: &mut dyn FnMut(ClosingWindowRenderElement),
+    ) {
         let (buffer, offset) = if ctx.target.should_block_out(self.block_out_from) {
             (&self.blocked_out_buffer, self.blocked_out_buffer_offset)
         } else if ctx.target != RenderTarget::Output && self.buffer_with_blocked_out_bg.is_some() {
@@ -215,7 +225,9 @@ impl ClosingWindow {
                     Relocate::Relative,
                 );
 
-                return elem.into();
+                push(elem.into());
+                self.render_background_effects(view_rect, 1., 1., push);
+                return;
             }
             AnimationState::Animating(anim) => anim,
         };
@@ -250,7 +262,7 @@ impl ClosingWindow {
             let geo_to_tex =
                 Mat3::from_translation(-tex_loc / tex_size) * Mat3::from_scale(geo_size / tex_size);
 
-            return ShaderRenderElement::new(
+            let elem = ShaderRenderElement::new(
                 ProgramType::Close,
                 view_rect.size,
                 None,
@@ -267,8 +279,11 @@ impl ClosingWindow {
                 HashMap::from([(String::from("niri_tex"), buffer.texture().clone())]),
                 Kind::Unspecified,
             )
-            .with_location(Point::from((0., 0.)))
-            .into();
+            .with_location(Point::from((0., 0.)));
+
+            // A custom shader can draw the window anywhere, so we can't place effects under it.
+            push(elem.into());
+            return;
         }
 
         let elem = TextureRenderElement::from_texture_buffer(
@@ -283,10 +298,11 @@ impl ClosingWindow {
         let elem = PrimaryGpuTextureRenderElement(elem);
 
         let center = self.geo_size.to_point().downscale(2.);
+        let anim_scale = ((1. - clamped_progress) / 5. + 0.8).max(0.);
         let elem = RescaleRenderElement::from_element(
             elem,
             (center - offset).to_physical_precise_round(scale),
-            ((1. - clamped_progress) / 5. + 0.8).max(0.),
+            anim_scale,
         );
 
         let mut location = self.pos + offset;
@@ -297,6 +313,26 @@ impl ClosingWindow {
             Relocate::Relative,
         );
 
-        elem.into()
+        push(elem.into());
+        self.render_background_effects(view_rect, anim_scale, 1. - clamped_progress as f32, push);
+    }
+
+    fn render_background_effects(
+        &self,
+        view_rect: Rectangle<f64, Logical>,
+        anim_scale: f64,
+        alpha: f32,
+        push: &mut dyn FnMut(ClosingWindowRenderElement),
+    ) {
+        let mut location = self.pos;
+        location.x -= view_rect.loc.x;
+
+        // Scale around the window center, matching the window texture.
+        let center = self.geo_size.to_point().downscale(2.);
+        let offset = location + center - center.upscale(anim_scale);
+
+        for effect in &self.background_effects {
+            push(effect.clone().transformed(anim_scale, offset, alpha).into());
+        }
     }
 }

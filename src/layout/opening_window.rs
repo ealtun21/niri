@@ -44,6 +44,20 @@ impl OpenAnimation {
         self.anim.is_done()
     }
 
+    /// Scale (around the tile center) and alpha that the default open animation applies, for
+    /// elements drawn outside the offscreen. `None` with a custom open shader.
+    pub fn effect_transform(&self, renderer: &mut GlesRenderer, alpha: f32) -> Option<(f64, f32)> {
+        if Shaders::get(renderer).program(ProgramType::Open).is_some() {
+            return None;
+        }
+        let progress = self.anim.value();
+        let clamped_progress = self.anim.clamped_value().clamp(0., 1.);
+        Some((
+            (progress / 2. + 0.5).max(0.),
+            clamped_progress as f32 * alpha,
+        ))
+    }
+
     // We can't depend on view_rect here, because the result of window opening can be snapshot and
     // then rendered elsewhere.
     pub fn render(
