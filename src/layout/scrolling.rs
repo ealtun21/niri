@@ -206,6 +206,12 @@ pub struct Column<W: LayoutElement> {
     /// rather than normal.
     is_pending_maximized: bool,
 
+    /// Where to put the window back upon unfullscreening or unmaximizing.
+    ///
+    /// Set when fullscreening or maximizing expels a window from its column into this new one: the
+    /// original column and the index the window had in it.
+    restore_to_column: Option<(ColumnId, usize)>,
+
     /// How this column displays and arranges windows.
     display_mode: ColumnDisplay,
 
@@ -1825,46 +1831,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
                 return;
             }
 
-            // Move into adjacent column.
-            let target_column_idx = source_col_idx - 1;
-
-            let offset = if self.active_column_idx <= source_col_idx {
-                // Tiles to the right animate from the following column.
-                self.column_x(source_col_idx) - self.column_x(target_column_idx)
-            } else {
-                // Tiles to the left animate to preserve their right edge position.
-                f64::max(
-                    0.,
-                    self.data[target_column_idx].width - self.data[source_col_idx].width,
-                )
-            };
-            let mut offset = Point::from((offset, 0.));
-
-            if source_tile_was_active {
-                // Make sure the previous (target) column is activated so the animation looks right.
-                //
-                // However, if it was already going to be activated, leave the offset as is. This
-                // improves the workflow that has become common with tabbed columns: open a new
-                // window, then immediately consume it left as a new tab.
-                self.activate_prev_column_on_removal
-                    .get_or_insert(self.view_offset.stationary() + offset.x);
-            }
-
-            offset += self.columns[source_col_idx].render_offset();
-            let RemovedTile { tile, .. } = self.remove_tile_by_idx(
-                source_col_idx,
-                0,
-                Transaction::new(),
-                Some(self.options.animations.window_movement.0),
-            );
-            self.add_tile_to_column(target_column_idx, None, tile, source_tile_was_active);
-
-            let target_column = &mut self.columns[target_column_idx];
-            offset -= target_column.render_offset();
-            offset += prev_off - target_column.tile_offset(target_column.tiles.len() - 1);
-
-            let new_tile = target_column.tiles.last_mut().unwrap();
-            new_tile.animate_move_from(offset);
+            self.consume_into_left_column(source_col_idx, None);
         } else {
             // Move out of column.
             let mut offset = source_column.render_offset();
@@ -1898,6 +1865,56 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             offset += prev_off - new_col.tile_offset(0);
             new_col.tiles[0].animate_move_from(offset);
         }
+    }
+
+    /// Moves the tile of a single-tile column into the column to its left.
+    ///
+    /// The tile is inserted at `tile_idx` in the target column, or at the bottom if `None`.
+    fn consume_into_left_column(&mut self, source_col_idx: usize, tile_idx: Option<usize>) {
+        let source_column = &self.columns[source_col_idx];
+        debug_assert_eq!(source_column.tiles.len(), 1);
+        let prev_off = source_column.tile_offset(0);
+        let source_tile_was_active = self.active_column_idx == source_col_idx;
+
+        let target_column_idx = source_col_idx - 1;
+
+        let offset = if self.active_column_idx <= source_col_idx {
+            // Tiles to the right animate from the following column.
+            self.column_x(source_col_idx) - self.column_x(target_column_idx)
+        } else {
+            // Tiles to the left animate to preserve their right edge position.
+            f64::max(
+                0.,
+                self.data[target_column_idx].width - self.data[source_col_idx].width,
+            )
+        };
+        let mut offset = Point::from((offset, 0.));
+
+        if source_tile_was_active {
+            // Make sure the previous (target) column is activated so the animation looks right.
+            //
+            // However, if it was already going to be activated, leave the offset as is. This
+            // improves the workflow that has become common with tabbed columns: open a new
+            // window, then immediately consume it left as a new tab.
+            self.activate_prev_column_on_removal
+                .get_or_insert(self.view_offset.stationary() + offset.x);
+        }
+
+        offset += self.columns[source_col_idx].render_offset();
+        let RemovedTile { tile, .. } = self.remove_tile_by_idx(
+            source_col_idx,
+            0,
+            Transaction::new(),
+            Some(self.options.animations.window_movement.0),
+        );
+        self.add_tile_to_column(target_column_idx, tile_idx, tile, source_tile_was_active);
+
+        let target_column = &mut self.columns[target_column_idx];
+        let tile_idx = tile_idx.unwrap_or(target_column.tiles.len() - 1);
+        offset -= target_column.render_offset();
+        offset += prev_off - target_column.tile_offset(tile_idx);
+
+        target_column.tiles[tile_idx].animate_move_from(offset);
     }
 
     pub fn consume_or_expel_window_right(&mut self, window: Option<&W::Id>) {
@@ -2894,20 +2911,30 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let mut col = &mut self.columns[col_idx];
         let is_tabbed = col.display_mode == ColumnDisplay::Tabbed;
+        let was_normal = col.pending_sizing_mode().is_normal();
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
 
+        let mut restore_to_column = None;
         if is_fullscreen && (col.tiles.len() > 1 && !is_tabbed) {
             // This wasn't the only window in its column; extract it into a separate column.
+            restore_to_column = Some((col.id, col.position(window).unwrap()));
             self.consume_or_expel_window_right(Some(window));
             col_idx += 1;
             col = &mut self.columns[col_idx];
+        }
+
+        // When going from normal to fullscreen, remember if we should put the window back.
+        if was_normal {
+            col.restore_to_column = restore_to_column;
         }
 
         col.set_fullscreen(is_fullscreen);
 
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
+
+        self.restore_to_column(col_idx);
 
         true
     }
@@ -2925,14 +2952,22 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
         let mut col = &mut self.columns[col_idx];
         let is_tabbed = col.display_mode == ColumnDisplay::Tabbed;
+        let was_normal = col.pending_sizing_mode().is_normal();
 
         cancel_resize_for_column(&mut self.interactive_resize, col);
 
+        let mut restore_to_column = None;
         if maximize && (col.tiles.len() > 1 && !is_tabbed) {
             // This wasn't the only window in its column; extract it into a separate column.
+            restore_to_column = Some((col.id, col.position(window).unwrap()));
             self.consume_or_expel_window_right(Some(window));
             col_idx += 1;
             col = &mut self.columns[col_idx];
+        }
+
+        // When going from normal to maximized, remember if we should put the window back.
+        if was_normal {
+            col.restore_to_column = restore_to_column;
         }
 
         col.set_maximized(maximize);
@@ -2940,7 +2975,45 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         // With place_within_column, the tab indicator changes the column size immediately.
         self.data[col_idx].update(col);
 
+        self.restore_to_column(col_idx);
+
         true
+    }
+
+    /// Puts the window of a column that has just become normal back into the column that it was
+    /// expelled from upon fullscreening or maximizing.
+    ///
+    /// Only does so when that column is still right to the left; if the user moved things around in
+    /// the meantime, the window stays where it is.
+    fn restore_to_column(&mut self, col_idx: usize) {
+        let col = &mut self.columns[col_idx];
+        if !col.pending_sizing_mode().is_normal() {
+            return;
+        }
+        let Some((target_id, tile_idx)) = col.restore_to_column.take() else {
+            return;
+        };
+        if col.tiles.len() != 1 || col_idx == 0 {
+            return;
+        }
+
+        let target = &self.columns[col_idx - 1];
+        if target.id != target_id || !target.pending_sizing_mode().is_normal() {
+            return;
+        }
+
+        let tile_idx = min(tile_idx, target.tiles.len());
+        self.consume_into_left_column(col_idx, Some(tile_idx));
+
+        // Until the window actually unfullscreens, the target column keeps its fullscreen size,
+        // and other windows resizing in the meantime can scroll the view to fit it. Restore the
+        // view offset once it unfullscreens, same as for a single-window column.
+        let target_idx = col_idx - 1;
+        if self.active_column_idx == target_idx
+            && !self.columns[target_idx].sizing_mode().is_normal()
+        {
+            self.view_offset_to_restore = Some(self.view_offset.stationary());
+        }
     }
 
     pub fn fullscreen_window_above_top_layer(&self) -> Option<&W> {
@@ -4028,6 +4101,7 @@ impl<W: LayoutElement> Column<W> {
             is_full_width,
             is_pending_maximized: false,
             is_pending_fullscreen: false,
+            restore_to_column: None,
             display_mode,
             tab_indicator: TabIndicator::new(options.layout.tab_indicator),
             move_x_animation: None,

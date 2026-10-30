@@ -657,3 +657,236 @@ fn removing_only_fullscreen_tile_updates_view_offset() {
     // FIXME: currently, removing a tile doesn't cause the view offset to update.
     assert_snapshot!(layout.active_workspace().unwrap().scrolling().view_pos(), @"0");
 }
+
+fn column_windows(layout: &Layout<TestWindow>) -> Vec<Vec<usize>> {
+    let scrolling = layout.active_workspace().unwrap().scrolling();
+    scrolling
+        .columns()
+        .map(|col| col.tiles().map(|(tile, _)| *tile.window().id()).collect())
+        .collect()
+}
+
+/// Column [1, 2, 3] with window 2 focused.
+fn three_windows_in_one_column() -> [Op; 7] {
+    [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: Some(2) },
+        Op::ConsumeOrExpelWindowLeft { id: Some(3) },
+        Op::FocusWindow(2),
+    ]
+}
+
+#[test]
+fn unfullscreen_restores_window_to_its_column() {
+    let mut layout = check_ops(three_windows_in_one_column());
+    assert_eq!(column_windows(&layout), [vec![1, 2, 3]]);
+
+    check_ops_on_layout(&mut layout, [Op::FullscreenWindow(2), Op::Communicate(2)]);
+    assert_eq!(column_windows(&layout), [vec![1, 3], vec![2]]);
+
+    check_ops_on_layout(&mut layout, [Op::FullscreenWindow(2), Op::Communicate(2)]);
+    assert_eq!(column_windows(&layout), [vec![1, 2, 3]]);
+    assert_eq!(layout.focus().map(|win| *win.id()), Some(2));
+}
+
+#[test]
+fn unmaximize_restores_window_to_its_column() {
+    let mut layout = check_ops(three_windows_in_one_column());
+
+    let ops = [
+        Op::MaximizeWindowToEdges { id: Some(2) },
+        Op::Communicate(2),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column_windows(&layout), [vec![1, 3], vec![2]]);
+
+    let ops = [
+        Op::MaximizeWindowToEdges { id: Some(2) },
+        Op::Communicate(2),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column_windows(&layout), [vec![1, 2, 3]]);
+}
+
+#[test]
+fn restore_to_column_waits_for_both_unfullscreen_and_unmaximize() {
+    let mut layout = check_ops(three_windows_in_one_column());
+
+    let ops = [
+        Op::MaximizeWindowToEdges { id: Some(2) },
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+        // Unfullscreen: still maximized, so stays in its own column.
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column_windows(&layout), [vec![1, 3], vec![2]]);
+
+    let ops = [
+        Op::MaximizeWindowToEdges { id: Some(2) },
+        Op::Communicate(2),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column_windows(&layout), [vec![1, 2, 3]]);
+}
+
+#[test]
+fn unfullscreen_clamps_restore_position() {
+    let mut layout = check_ops(three_windows_in_one_column());
+
+    let ops = [
+        Op::FocusWindow(3),
+        Op::FullscreenWindow(3),
+        Op::Communicate(3),
+        Op::CloseWindow(1),
+        Op::FullscreenWindow(3),
+        Op::Communicate(3),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column_windows(&layout), [vec![2, 3]]);
+}
+
+#[test]
+fn unfullscreen_does_not_restore_after_moving_column() {
+    let mut layout = check_ops(three_windows_in_one_column());
+
+    let ops = [
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+        Op::MoveColumnLeft,
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column_windows(&layout), [vec![2], vec![1, 3]]);
+}
+
+#[test]
+fn unfullscreen_does_not_restore_into_fullscreen_column() {
+    let mut layout = check_ops(three_windows_in_one_column());
+
+    let ops = [
+        Op::CloseWindow(3),
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+        Op::FullscreenWindow(1),
+        Op::Communicate(1),
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column_windows(&layout), [vec![1], vec![2]]);
+}
+
+#[test]
+fn restore_to_column_resets_on_next_fullscreen() {
+    let mut layout = check_ops(three_windows_in_one_column());
+
+    let ops = [
+        Op::CloseWindow(3),
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+        // Consuming into the fullscreen column unfullscreens it without restoring.
+        Op::AddWindow {
+            params: TestWindowParams::new(3),
+        },
+        Op::ConsumeOrExpelWindowLeft { id: Some(3) },
+        Op::Communicate(2),
+        Op::ConsumeOrExpelWindowRight { id: Some(3) },
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column_windows(&layout), [vec![1], vec![2], vec![3]]);
+
+    // 2 is alone in its column now, so fullscreening it doesn't expel and there's nothing to
+    // restore.
+    let ops = [
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column_windows(&layout), [vec![1], vec![2], vec![3]]);
+}
+
+#[test]
+fn unfullscreen_does_not_restore_into_other_column() {
+    let mut layout = check_ops(three_windows_in_one_column());
+
+    let ops = [
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+        // A new column opens between the original column and the fullscreen one.
+        Op::FocusWindow(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(4),
+        },
+        Op::FullscreenWindow(2),
+        Op::Communicate(2),
+    ];
+    check_ops_on_layout(&mut layout, ops);
+    assert_eq!(column_windows(&layout), [vec![1, 3], vec![4], vec![2]]);
+}
+
+#[test]
+fn restore_to_column_keeps_view_position() {
+    for toggle in [
+        Op::FullscreenWindow(2),
+        Op::MaximizeWindowToEdges { id: Some(2) },
+    ] {
+        // [0] [1, 2, 3] [4] with 2 focused and the view not at the start.
+        let mut ops = vec![Op::AddOutput(1)];
+        ops.push(Op::AddWindow {
+            params: TestWindowParams::new(0),
+        });
+        ops.extend(three_windows_in_one_column().into_iter().skip(1));
+        ops.extend([
+            Op::AddWindow {
+                params: TestWindowParams::new(4),
+            },
+            Op::FocusWindow(2),
+            Op::Communicate(0),
+            Op::Communicate(1),
+            Op::Communicate(2),
+            Op::Communicate(3),
+            Op::Communicate(4),
+            Op::CompleteAnimations,
+        ]);
+        let mut layout = check_ops(ops);
+        let view_pos =
+            |layout: &Layout<TestWindow>| layout.active_workspace().unwrap().scrolling().view_pos();
+        let before = view_pos(&layout);
+
+        let ops = [
+            toggle.clone(),
+            Op::Communicate(1),
+            Op::Communicate(3),
+            Op::Communicate(2),
+            Op::CompleteAnimations,
+        ];
+        check_ops_on_layout(&mut layout, ops);
+
+        // The other windows in the column respond before the restored one, while it is still
+        // fullscreen or maximized.
+        let ops = [
+            toggle,
+            Op::Communicate(1),
+            Op::Communicate(3),
+            Op::Communicate(2),
+            Op::CompleteAnimations,
+        ];
+        check_ops_on_layout(&mut layout, ops);
+        assert_eq!(column_windows(&layout), [vec![0], vec![1, 2, 3], vec![4]]);
+        assert_eq!(view_pos(&layout), before);
+    }
+}
