@@ -3257,6 +3257,11 @@ impl Niri {
 
         let state = self.output_state.remove(output).unwrap();
 
+        // Granular cursor redraws call queue_redraw() on this output, which unwraps its state.
+        if self.pointer_contents.output.as_ref() == Some(output) {
+            self.pointer_contents.output = None;
+        }
+
         match state.redraw_state {
             RedrawState::Idle => (),
             RedrawState::Queued => (),
