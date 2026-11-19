@@ -4747,6 +4747,38 @@ impl<W: LayoutElement> Layout<W> {
         true
     }
 
+    /// Pans the overview camera on `output` by a screen-space delta.
+    ///
+    /// Returns `false` if the overview is not open.
+    pub fn pan_overview(&mut self, output: &Output, delta: Point<f64, Logical>) -> bool {
+        if !self.overview_open {
+            return false;
+        }
+
+        let Some(mon) = self.monitor_for_output_mut(output) else {
+            return false;
+        };
+
+        let zoom = mon.overview_zoom();
+        mon.pan_overview_by(delta.downscale(zoom));
+        true
+    }
+
+    /// Animates the overview camera on every output back to the center.
+    ///
+    /// Returns `true` if any camera started moving.
+    pub fn center_overview(&mut self) -> bool {
+        if !self.overview_open {
+            return false;
+        }
+
+        let mut centered = false;
+        for mon in self.monitors_mut() {
+            centered |= mon.center_overview();
+        }
+        centered
+    }
+
     pub fn toggle_overview_to_workspace(&mut self, ws_idx: usize) {
         let config = self.options.animations.overview_open_close.0;
         if let Some(mon) = self.active_monitor() {

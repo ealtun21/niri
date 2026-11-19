@@ -519,6 +519,7 @@ pub enum Action {
     CloseOverview,
     OverviewZoomIn,
     OverviewZoomOut,
+    OverviewCenter,
     #[knuffel(skip)]
     ToggleWindowUrgent(u64),
     #[knuffel(skip)]
@@ -894,6 +895,7 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::CloseOverview {} => Self::CloseOverview,
             niri_ipc::Action::OverviewZoomIn {} => Self::OverviewZoomIn,
             niri_ipc::Action::OverviewZoomOut {} => Self::OverviewZoomOut,
+            niri_ipc::Action::OverviewCenter {} => Self::OverviewCenter,
             niri_ipc::Action::ToggleWindowUrgent { id } => Self::ToggleWindowUrgent(id),
             niri_ipc::Action::SetWindowUrgent { id } => Self::SetWindowUrgent(id),
             niri_ipc::Action::UnsetWindowUrgent { id } => Self::UnsetWindowUrgent(id),

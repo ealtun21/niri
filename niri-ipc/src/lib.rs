@@ -1009,6 +1009,8 @@ pub enum Action {
     OverviewZoomIn {},
     /// Zoom the open Overview out by one step.
     OverviewZoomOut {},
+    /// Recenter the Overview camera after panning.
+    OverviewCenter {},
     /// Toggle urgent status of a window.
     ToggleWindowUrgent {
         /// Id of the window to toggle urgent.

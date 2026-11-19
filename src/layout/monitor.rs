@@ -83,6 +83,10 @@ pub struct Monitor<W: LayoutElement> {
     overview_progress: Option<OverviewProgress>,
     /// Overview zoom set by the zoom actions; None means the configured zoom.
     pub(super) overview_zoom: Option<Animation>,
+    /// Overview camera pan in unzoomed logical units.
+    overview_pan: Point<f64, Logical>,
+    /// Recenter animation from 1 to 0, scaling `overview_pan`.
+    overview_pan_anim: Option<Animation>,
     /// Clock for driving animations.
     pub(super) clock: Clock,
     /// Configurable properties of the layout as received from the parent layout.
@@ -291,6 +295,14 @@ impl From<&super::OverviewProgress> for OverviewProgress {
     }
 }
 
+/// Whether a workspace row overlaps the output vertically.
+///
+/// Only the row matters: the overview pan can move a workspace card sideways off the output
+/// while its columns, which are drawn past the card edges, are still on screen.
+fn row_on_output(output_h: f64, geo: Rectangle<f64, Logical>) -> bool {
+    geo.loc.y < output_h && 0. < geo.loc.y + geo.size.h
+}
+
 impl<W: LayoutElement> Monitor<W> {
     pub fn new(
         output: Output,
@@ -345,6 +357,8 @@ impl<W: LayoutElement> Monitor<W> {
             overview_open: false,
             overview_progress: None,
             overview_zoom: None,
+            overview_pan: Point::from((0., 0.)),
+            overview_pan_anim: None,
             workspace_switch: None,
             clock,
             base_options,
@@ -1068,6 +1082,10 @@ impl<W: LayoutElement> Monitor<W> {
             None => (),
         }
 
+        if self.overview_pan_anim.as_ref().is_some_and(|a| a.is_done()) {
+            self.reset_overview_pan();
+        }
+
         for ws in &mut self.workspaces {
             ws.advance_animations();
         }
@@ -1077,6 +1095,10 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspace_switch
             .as_ref()
             .is_some_and(|s| s.is_animation_ongoing())
+            || self
+                .overview_pan_anim
+                .as_ref()
+                .is_some_and(|a| !a.is_done())
             || self.workspaces.iter().any(|ws| ws.are_animations_ongoing())
     }
 
@@ -1379,9 +1401,61 @@ impl<W: LayoutElement> Monitor<W> {
         compute_overview_zoom(&self.options, self.overview_zoom.as_ref(), progress)
     }
 
+    /// Current overview camera pan in unzoomed logical units.
+    pub fn overview_pan(&self) -> Point<f64, Logical> {
+        let factor = self.overview_pan_anim.as_ref().map_or(1., Animation::value);
+        self.overview_pan.upscale(factor)
+    }
+
+    /// On-screen offset of the overview camera pan.
+    ///
+    /// The pan fades in and out with the overview.
+    fn overview_pan_offset(&self) -> Point<f64, Logical> {
+        let progress = self
+            .overview_progress
+            .as_ref()
+            .map_or(0., |p| p.value())
+            .clamp(0., 1.);
+        self.overview_pan().upscale(self.overview_zoom() * progress)
+    }
+
+    /// Pans the overview camera by a delta in unzoomed logical units.
+    pub(super) fn pan_overview_by(&mut self, delta: Point<f64, Logical>) {
+        self.overview_pan = self.overview_pan() + delta;
+        self.overview_pan_anim = None;
+    }
+
+    /// Starts animating the overview camera back to the center.
+    ///
+    /// Returns `false` if the camera is already centered.
+    pub(super) fn center_overview(&mut self) -> bool {
+        let pan = self.overview_pan();
+        if pan == Point::from((0., 0.)) {
+            return false;
+        }
+
+        self.overview_pan = pan;
+        self.overview_pan_anim = Some(Animation::new(
+            self.clock.clone(),
+            1.,
+            0.,
+            0.,
+            self.options.animations.overview_open_close.0,
+        ));
+        true
+    }
+
+    fn reset_overview_pan(&mut self) {
+        self.overview_pan = Point::from((0., 0.));
+        self.overview_pan_anim = None;
+    }
+
     pub(super) fn set_overview_progress(&mut self, progress: Option<&super::OverviewProgress>) {
         let prev_render_idx = self.workspace_render_idx();
         self.overview_progress = progress.map(OverviewProgress::from);
+        if self.overview_progress.is_none() {
+            self.reset_overview_pan();
+        }
         let new_render_idx = self.workspace_render_idx();
 
         // If the view jumped (can happen when going from corrected to uncorrected render_idx, for
@@ -1484,7 +1558,8 @@ impl<W: LayoutElement> Monitor<W> {
         let gap = self.workspace_gap(zoom);
         let ws_height_with_gap = ws_size.h + gap;
 
-        let static_offset = (self.view_size.to_point() - ws_size.to_point()).downscale(2.);
+        let static_offset = (self.view_size.to_point() - ws_size.to_point()).downscale(2.)
+            + self.overview_pan_offset();
         let static_offset = static_offset
             .to_physical_precise_round(scale)
             .to_logical(scale);
@@ -1511,12 +1586,12 @@ impl<W: LayoutElement> Monitor<W> {
         &self,
         cull: bool,
     ) -> impl Iterator<Item = (&Workspace<W>, Rectangle<f64, Logical>)> {
-        let output_geo = Rectangle::from_size(self.view_size);
+        let output_h = self.view_size.h;
 
         let geo = self.workspaces_render_geo();
         zip(self.workspaces.iter(), geo)
             // Cull out workspaces outside the output.
-            .filter(move |(_ws, geo)| !cull || geo.intersection(output_geo).is_some())
+            .filter(move |(_ws, geo)| !cull || row_on_output(output_h, *geo))
     }
 
     pub fn workspaces_with_render_geo(
@@ -1528,24 +1603,24 @@ impl<W: LayoutElement> Monitor<W> {
     pub fn workspaces_with_render_geo_idx(
         &self,
     ) -> impl Iterator<Item = ((usize, &Workspace<W>), Rectangle<f64, Logical>)> {
-        let output_geo = Rectangle::from_size(self.view_size);
+        let output_h = self.view_size.h;
 
         let geo = self.workspaces_render_geo();
         zip(self.workspaces.iter().enumerate(), geo)
             // Cull out workspaces outside the output.
-            .filter(move |(_ws, geo)| geo.intersection(output_geo).is_some())
+            .filter(move |(_ws, geo)| row_on_output(output_h, *geo))
     }
 
     pub fn workspaces_with_render_geo_mut(
         &mut self,
         cull: bool,
     ) -> impl Iterator<Item = (&mut Workspace<W>, Rectangle<f64, Logical>)> {
-        let output_geo = Rectangle::from_size(self.view_size);
+        let output_h = self.view_size.h;
 
         let geo = self.workspaces_render_geo();
         zip(self.workspaces.iter_mut(), geo)
             // Cull out workspaces outside the output.
-            .filter(move |(_ws, geo)| !cull || geo.intersection(output_geo).is_some())
+            .filter(move |(_ws, geo)| !cull || row_on_output(output_h, *geo))
     }
 
     pub fn workspace_under(
@@ -1955,6 +2030,7 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn dnd_scroll_gesture_scroll(&mut self, pos: Point<f64, Logical>, speed: f64) -> bool {
         let zoom = self.overview_zoom();
+        let pan_x = self.overview_pan_offset().x;
 
         let Some(WorkspaceSwitch::Gesture(gesture)) = &mut self.workspace_switch else {
             return false;
@@ -1971,7 +2047,7 @@ impl<W: LayoutElement> Monitor<W> {
         // Restrict the scrolling horizontally to the strip of workspaces to avoid unwanted trigger
         // after using the hot corner or during horizontal scroll.
         let width = self.view_size.w * zoom;
-        let x = pos.x - (self.view_size.w - width) / 2.;
+        let x = pos.x - (self.view_size.w - width) / 2. - pan_x;
 
         // Consider the working area so layer-shell docks and such don't prevent scrolling.
         let y = pos.y - self.working_area.loc.y;
@@ -2138,6 +2214,11 @@ impl<W: LayoutElement> Monitor<W> {
             !self.workspaces.is_empty(),
             "monitor must have at least one workspace"
         );
+
+        if self.overview_progress.is_none() {
+            assert_eq!(self.overview_pan, Point::from((0., 0.)));
+            assert!(self.overview_pan_anim.is_none());
+        }
         assert!(self.active_workspace_idx < self.workspaces.len());
 
         if let Some(WorkspaceSwitch::Animation(anim)) = &self.workspace_switch {

@@ -759,6 +759,15 @@ enum Op {
     ToggleOverview,
     OverviewZoomIn,
     OverviewZoomOut,
+    OverviewPan {
+        #[proptest(strategy = "1..=5usize")]
+        id: usize,
+        #[proptest(strategy = "-2000f64..2000f64")]
+        dx: f64,
+        #[proptest(strategy = "-2000f64..2000f64")]
+        dy: f64,
+    },
+    OverviewCenter,
     UpdateConfig {
         #[proptest(strategy = "arbitrary_layout_part().prop_map(Box::new)")]
         layout_config: Box<niri_config::LayoutPart>,
@@ -1669,6 +1678,17 @@ impl Op {
             Op::OverviewZoomOut => {
                 layout.zoom_overview(OVERVIEW_ZOOM_STEP.recip());
             }
+            Op::OverviewPan { id, dx, dy } => {
+                let name = format!("output{id}");
+                let Some(output) = layout.outputs().find(|o| o.name() == name).cloned() else {
+                    return;
+                };
+
+                layout.pan_overview(&output, Point::from((dx, dy)));
+            }
+            Op::OverviewCenter => {
+                layout.center_overview();
+            }
             Op::UpdateConfig { layout_config } => {
                 let options = Options {
                     layout: niri_config::Layout::from_part(&layout_config),
@@ -1729,6 +1749,246 @@ fn overview_zoom_actions() {
         ..Options::clone(&layout.options)
     });
     assert_eq!(zoom_target(&layout), None);
+}
+
+fn overview_ws_loc(
+    layout: &Layout<TestWindow>,
+    mon_idx: usize,
+    ws_idx: usize,
+) -> Point<f64, Logical> {
+    let mon = layout.monitors().nth(mon_idx).unwrap();
+    mon.workspaces_render_geo().nth(ws_idx).unwrap().loc
+}
+
+fn overview_pan_of(layout: &Layout<TestWindow>, mon_idx: usize) -> Point<f64, Logical> {
+    layout.monitors().nth(mon_idx).unwrap().overview_pan()
+}
+
+fn output_named(layout: &Layout<TestWindow>, name: &str) -> Output {
+    layout
+        .outputs()
+        .find(|o| o.name() == name)
+        .cloned()
+        .unwrap()
+}
+
+#[track_caller]
+fn assert_point_near(actual: Point<f64, Logical>, expected: Point<f64, Logical>, tolerance: f64) {
+    let d = actual - expected;
+    assert!(
+        d.x.abs() <= tolerance && d.y.abs() <= tolerance,
+        "{actual:?} not within {tolerance} of {expected:?}"
+    );
+}
+
+#[test]
+fn overview_pan_follows_pointer() {
+    let mut layout = check_ops([Op::AddOutput(1), Op::AddOutput(2)]);
+    let output1 = output_named(&layout, "output1");
+
+    assert!(!layout.pan_overview(&output1, Point::from((100., 50.))));
+    assert_eq!(overview_pan_of(&layout, 0), Point::from((0., 0.)));
+
+    check_ops_on_layout(&mut layout, [Op::ToggleOverview, Op::CompleteAnimations]);
+    let ws0 = overview_ws_loc(&layout, 0, 0);
+    let ws1 = overview_ws_loc(&layout, 0, 1);
+    let other = overview_ws_loc(&layout, 1, 0);
+
+    check_ops_on_layout(
+        &mut layout,
+        [Op::OverviewPan {
+            id: 1,
+            dx: 100.,
+            dy: -40.,
+        }],
+    );
+    let delta = Point::from((100., -40.));
+    assert_point_near(overview_ws_loc(&layout, 0, 0), ws0 + delta, 1.);
+    assert_point_near(overview_ws_loc(&layout, 0, 1), ws1 + delta, 1.);
+    assert_eq!(overview_ws_loc(&layout, 1, 0), other);
+}
+
+#[test]
+fn overview_pan_survives_zoom() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::ToggleOverview,
+        Op::CompleteAnimations,
+        Op::OverviewPan {
+            id: 1,
+            dx: 300.,
+            dy: 200.,
+        },
+    ]);
+
+    let center_in_ws = |layout: &Layout<TestWindow>| {
+        let mon = layout.monitors().next().unwrap();
+        let zoom = mon.overview_zoom();
+        let view_center = mon.view_size().to_point().downscale(2.);
+        (
+            (view_center - overview_ws_loc(layout, 0, 0)).downscale(zoom),
+            zoom,
+        )
+    };
+
+    let (before, _) = center_in_ws(&layout);
+    check_ops_on_layout(&mut layout, [Op::OverviewZoomOut, Op::CompleteAnimations]);
+    let (after, zoom) = center_in_ws(&layout);
+    assert_point_near(after, before, 2. / zoom);
+}
+
+#[test]
+fn overview_center_animates_back() {
+    let mut layout = check_ops([
+        Op::AddOutput(1),
+        Op::ToggleOverview,
+        Op::CompleteAnimations,
+        Op::OverviewPan {
+            id: 1,
+            dx: 200.,
+            dy: 0.,
+        },
+    ]);
+    let output1 = output_named(&layout, "output1");
+    let p0 = overview_pan_of(&layout, 0);
+    assert!(p0.x > 0.);
+
+    assert!(layout.center_overview());
+    check_ops_on_layout(&mut layout, [Op::AdvanceAnimations { msec_delta: 50 }]);
+    let mid = overview_pan_of(&layout, 0);
+    assert!(0. < mid.x && mid.x < p0.x, "pan glides back: {mid:?}");
+
+    // Dragging during the glide continues from where the camera is.
+    let zoom = layout.monitors().next().unwrap().overview_zoom();
+    assert!(layout.pan_overview(&output1, Point::from((10., 0.))));
+    let pan = overview_pan_of(&layout, 0);
+    assert!((pan.x - (mid.x + 10. / zoom)).abs() < 1e-6, "{pan:?}");
+    check_ops_on_layout(&mut layout, [Op::AdvanceAnimations { msec_delta: 50 }]);
+    assert_eq!(overview_pan_of(&layout, 0), pan);
+
+    assert!(layout.center_overview());
+    check_ops_on_layout(&mut layout, [Op::CompleteAnimations]);
+    assert_eq!(overview_pan_of(&layout, 0), Point::from((0., 0.)));
+    assert!(!layout.center_overview());
+}
+
+#[test]
+fn overview_pan_resets_when_closed() {
+    let mut layout = check_ops([Op::AddOutput(1), Op::ToggleOverview, Op::CompleteAnimations]);
+    let unpanned = overview_ws_loc(&layout, 0, 0);
+
+    check_ops_on_layout(
+        &mut layout,
+        [
+            Op::OverviewPan {
+                id: 1,
+                dx: 300.,
+                dy: 200.,
+            },
+            Op::ToggleOverview,
+            Op::CompleteAnimations,
+        ],
+    );
+    assert_eq!(overview_pan_of(&layout, 0), Point::from((0., 0.)));
+    assert_eq!(overview_ws_loc(&layout, 0, 0), Point::from((0., 0.)));
+    assert!(!layout.center_overview());
+
+    check_ops_on_layout(&mut layout, [Op::ToggleOverview, Op::CompleteAnimations]);
+    assert_eq!(overview_ws_loc(&layout, 0, 0), unpanned);
+}
+
+#[test]
+fn overview_pan_keeps_off_card_columns_visible() {
+    let mut ops = vec![Op::AddOutput(1)];
+    for id in 0..8 {
+        ops.push(Op::AddWindow {
+            params: TestWindowParams {
+                bbox: Rectangle::from_size(Size::from((1000, 600))),
+                ..TestWindowParams::new(id)
+            },
+        });
+    }
+    ops.extend([
+        Op::FocusColumnFirst,
+        Op::ToggleOverview,
+        Op::CompleteAnimations,
+    ]);
+    let mut layout = check_ops(ops);
+    let output = output_named(&layout, "output1");
+
+    let mon = layout.monitors().next().unwrap();
+    let view_w = mon.view_size().w;
+    let card = mon.workspaces_render_geo().next().unwrap();
+    let row_y = card.loc.y + card.size.h / 2.;
+
+    // Pan left until the card is 2 px past the left screen edge. Its later columns, drawn
+    // past the card edge, are still on screen.
+    let dx = -(card.loc.x + card.size.w + 2.);
+    assert!(layout.pan_overview(&output, Point::from((dx, 0.))));
+
+    let mon = layout.monitors().next().unwrap();
+    assert!(mon.workspaces_render_geo().next().unwrap().loc.x + card.size.w < 0.);
+    let panned_ws = mon.workspaces[0].id();
+    assert!(
+        mon.workspaces_with_render_geo()
+            .any(|(ws, _)| ws.id() == panned_ws),
+        "the panned workspace must still be drawn"
+    );
+
+    let hit = (0..view_w as i32).step_by(4).any(|x| {
+        layout
+            .window_under(&output, Point::from((f64::from(x), row_y)))
+            .is_some()
+    });
+    assert!(hit, "columns past the card edge must stay clickable");
+}
+
+#[test]
+fn overview_dnd_edge_scroll_follows_pan() {
+    let base = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(0),
+        },
+        Op::ToggleOverview,
+        Op::CompleteAnimations,
+    ];
+    let mut layout = check_ops(base.clone());
+    let output = output_named(&layout, "output1");
+    let view = layout.monitors().next().unwrap().view_size();
+
+    // Pan the strip right so that the old strip center is no longer over it.
+    assert!(layout.pan_overview(&output, Point::from((view.w * 0.45, 0.))));
+    let card = overview_ws_loc(&layout, 0, 0);
+    let strip_x = (card.x + view.w).min(view.w) - view.w * 0.1;
+    assert!(card.x < strip_x);
+
+    let scrolled_after_drag_to = |layout: &mut Layout<TestWindow>, x: f64| {
+        let output = output_named(layout, "output1");
+        let start = layout.monitors().next().unwrap().workspace_render_idx();
+        layout.dnd_update(output, Point::from((x, view.h - 1.)));
+        // The first advance only arms the edge scroll.
+        check_ops_on_layout(
+            layout,
+            [16, 200, 200].map(|msec_delta| Op::AdvanceAnimations { msec_delta }),
+        );
+        let scrolled = layout.monitors().next().unwrap().workspace_render_idx() != start;
+        layout.dnd_end();
+        scrolled
+    };
+
+    assert!(
+        scrolled_after_drag_to(&mut layout, strip_x),
+        "dragging to the edge over the panned strip scrolls"
+    );
+
+    let mut layout = check_ops(base);
+    let output = output_named(&layout, "output1");
+    assert!(layout.pan_overview(&output, Point::from((view.w * 0.45, 0.))));
+    assert!(
+        !scrolled_after_drag_to(&mut layout, view.w / 2.),
+        "the strip's unpanned spot no longer scrolls"
+    );
 }
 
 fn workspace_output_name(layout: &Layout<TestWindow>, ws_name: usize) -> &str {

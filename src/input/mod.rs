@@ -46,6 +46,7 @@ use smithay::wayland::virtual_keyboard::VirtualKeyboardDevice;
 use touch_overview_grab::TouchOverviewGrab;
 
 use self::move_grab::MoveGrab;
+use self::overview_pan_grab::OverviewPanGrab;
 use self::pick_color_grab::PickColorGrab;
 use self::pick_window_grab::PickWindowGrab;
 use self::resize_grab::ResizeGrab;
@@ -66,6 +67,7 @@ use crate::window::mapped::MappedId;
 pub mod backend_ext;
 pub mod click_grab;
 pub mod move_grab;
+pub mod overview_pan_grab;
 pub mod pick_color_grab;
 pub mod pick_window_grab;
 pub mod resize_grab;
@@ -2629,6 +2631,11 @@ impl State {
                     self.niri.queue_redraw_all();
                 }
             }
+            Action::OverviewCenter => {
+                if self.niri.layout.center_overview() {
+                    self.niri.queue_redraw_all();
+                }
+            }
             Action::ToggleWindowUrgent(id) => {
                 let window = self
                     .niri
@@ -3272,6 +3279,33 @@ impl State {
 
                     // FIXME: granular.
                     self.niri.queue_redraw_all();
+                    return;
+                }
+            }
+
+            if is_overview_open
+                && !pointer.is_grabbed()
+                && button == Some(MouseButton::Middle)
+                && !mod_down
+                && !self.niri.is_locked()
+                && !self.niri.screenshot_ui.is_open()
+                // Leave middle clicks on bars and other layer surfaces to their clients.
+                && self
+                    .niri
+                    .contents_under(pointer.current_location())
+                    .overview
+            {
+                if let Some(output) = self.niri.output_under_cursor() {
+                    let start_data = PointerGrabStartData {
+                        focus: None,
+                        button: button_code,
+                        location: pointer.current_location(),
+                    };
+                    let grab = OverviewPanGrab::new(start_data, output);
+                    pointer.set_grab(self, grab, serial, Focus::Clear);
+                    self.niri
+                        .cursor_manager
+                        .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
                     return;
                 }
             }
@@ -5858,7 +5892,7 @@ fn grab_allows_hot_corner(grab: &(dyn PointerGrab<State> + 'static)) -> bool {
     // - DnDGrab allows hot corner to DnD across workspaces.
     // - ClickGrab keeps pointer focus on the window, so the hot corner doesn't trigger.
     // - Touch grabs: touch doesn't trigger the hot corner.
-    if grab.is::<ResizeGrab>() || grab.is::<SpatialMovementGrab>() {
+    if grab.is::<ResizeGrab>() || grab.is::<SpatialMovementGrab>() || grab.is::<OverviewPanGrab>() {
         return false;
     }
 
@@ -5896,6 +5930,7 @@ fn hardcoded_overview_binds<'a>() -> impl Iterator<Item = &'a Bind> + Clone {
         bind(Keysym::Right, Action::FocusColumnRight, true),
         bind(Keysym::Up, Action::FocusWindowOrWorkspaceUp, true),
         bind(Keysym::Down, Action::FocusWindowOrWorkspaceDown, true),
+        bind(Keysym::space, Action::OverviewCenter, false),
     ];
 
     BINDS.iter()
@@ -6219,6 +6254,22 @@ mod tests {
             )
             .as_ref(),
             Some(&bindings.0[5])
+        );
+    }
+
+    #[test]
+    fn space_centers_the_overview_camera() {
+        let bind = find_bind(
+            hardcoded_overview_binds(),
+            ModKey::Super,
+            Some(Keysym::space),
+            &[Keysym::space],
+            Modifiers::empty(),
+            false,
+        );
+        assert_eq!(
+            bind.map(|bind| bind.action),
+            Some(BoundAction::Press(Action::OverviewCenter))
         );
     }
 
