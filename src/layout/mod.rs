@@ -102,6 +102,11 @@ const INTERACTIVE_MOVE_ALPHA: f64 = 0.75;
 /// Amount of touchpad movement to toggle the overview.
 const OVERVIEW_GESTURE_MOVEMENT: f64 = 300.;
 
+/// Overview zoom factor of one zoom action step.
+pub const OVERVIEW_ZOOM_STEP: f64 = 1.1;
+const OVERVIEW_ZOOM_MIN: f64 = 0.05;
+const OVERVIEW_ZOOM_MAX: f64 = 0.75;
+
 const OVERVIEW_GESTURE_RUBBER_BAND: RubberBand = RubberBand {
     stiffness: 0.5,
     limit: 0.05,
@@ -371,6 +376,8 @@ pub struct Layout<W: LayoutElement> {
     overview_open: bool,
     /// The overview zoom progress.
     overview_progress: Option<OverviewProgress>,
+    /// Overview zoom set by the zoom actions; None means the configured zoom.
+    overview_zoom: Option<Animation>,
     /// Configurable properties of the layout.
     options: Rc<Options>,
 }
@@ -728,6 +735,7 @@ impl<W: LayoutElement> Layout<W> {
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
             overview_progress: None,
+            overview_zoom: None,
             options: Rc::new(options),
         }
     }
@@ -753,6 +761,7 @@ impl<W: LayoutElement> Layout<W> {
             update_render_elements_time: Duration::ZERO,
             overview_open: false,
             overview_progress: None,
+            overview_zoom: None,
             options: opts,
         }
     }
@@ -844,6 +853,7 @@ impl<W: LayoutElement> Layout<W> {
                 );
                 monitor.overview_open = self.overview_open;
                 monitor.set_overview_progress(self.overview_progress.as_ref());
+                monitor.overview_zoom = self.overview_zoom.clone();
                 monitors.push(monitor);
 
                 MonitorSet::Normal {
@@ -865,6 +875,7 @@ impl<W: LayoutElement> Layout<W> {
                 );
                 monitor.overview_open = self.overview_open;
                 monitor.set_overview_progress(self.overview_progress.as_ref());
+                monitor.overview_zoom = self.overview_zoom.clone();
 
                 MonitorSet::Normal {
                     monitors: vec![monitor],
@@ -2428,7 +2439,7 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn overview_zoom(&self) -> f64 {
         let progress = self.overview_progress.as_ref().map(|p| p.value());
-        compute_overview_zoom(&self.options, progress)
+        compute_overview_zoom(&self.options, self.overview_zoom.as_ref(), progress)
     }
 
     #[cfg(test)]
@@ -2569,6 +2580,10 @@ impl<W: LayoutElement> Layout<W> {
             assert_eq!(
                 self.overview_progress.as_ref().map(|p| p.value()),
                 monitor.overview_progress_value()
+            );
+            assert_eq!(
+                self.overview_zoom.as_ref().map(Animation::value),
+                monitor.overview_zoom.as_ref().map(Animation::value)
             );
 
             monitor.verify_invariants();
@@ -2795,6 +2810,7 @@ impl<W: LayoutElement> Layout<W> {
             .overview_progress
             .as_ref()
             .is_some_and(|p| p.is_animation())
+            || self.overview_zoom.as_ref().is_some_and(|a| !a.is_done())
         {
             return true;
         }
@@ -3027,6 +3043,11 @@ impl<W: LayoutElement> Layout<W> {
                     ws.update_config(options.clone());
                 }
             }
+        }
+
+        if options.overview.zoom != self.options.overview.zoom {
+            self.overview_zoom = None;
+            self.set_monitors_overview_state();
         }
 
         self.options = options;
@@ -4661,6 +4682,7 @@ impl<W: LayoutElement> Layout<W> {
         for mon in monitors {
             mon.overview_open = self.overview_open;
             mon.set_overview_progress(self.overview_progress.as_ref());
+            mon.overview_zoom = self.overview_zoom.clone();
         }
     }
 
@@ -4696,6 +4718,32 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         self.toggle_overview();
+        true
+    }
+
+    pub fn zoom_overview(&mut self, factor: f64) -> bool {
+        if !self.overview_open {
+            return false;
+        }
+
+        let configured = self.options.overview.zoom;
+        let (from, target) = self
+            .overview_zoom
+            .as_ref()
+            .map_or((configured, configured), |anim| (anim.value(), anim.to()));
+        let to = (target * factor).clamp(OVERVIEW_ZOOM_MIN, OVERVIEW_ZOOM_MAX);
+        if to == target {
+            return false;
+        }
+
+        self.overview_zoom = Some(Animation::new(
+            self.clock.clone(),
+            from,
+            to,
+            0.,
+            self.options.animations.overview_open_close.0,
+        ));
+        self.set_monitors_overview_state();
         true
     }
 
@@ -5068,9 +5116,15 @@ impl<W: LayoutElement> Default for MonitorSet<W> {
     }
 }
 
-fn compute_overview_zoom(options: &Options, overview_progress: Option<f64>) -> f64 {
+fn compute_overview_zoom(
+    options: &Options,
+    zoom: Option<&Animation>,
+    overview_progress: Option<f64>,
+) -> f64 {
     // Clamp to some sane values.
-    let zoom = options.overview.zoom.clamp(0.0001, 0.75);
+    let zoom = zoom
+        .map_or(options.overview.zoom, Animation::value)
+        .clamp(0.0001, 0.75);
 
     if let Some(p) = overview_progress {
         (1. - p * (1. - zoom)).max(0.0001)

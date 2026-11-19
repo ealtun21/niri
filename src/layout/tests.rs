@@ -749,6 +749,8 @@ enum Op {
         window: usize,
     },
     ToggleOverview,
+    OverviewZoomIn,
+    OverviewZoomOut,
     UpdateConfig {
         #[proptest(strategy = "arbitrary_layout_part().prop_map(Box::new)")]
         layout_config: Box<niri_config::LayoutPart>,
@@ -1620,6 +1622,12 @@ impl Op {
             Op::ToggleOverview => {
                 layout.toggle_overview();
             }
+            Op::OverviewZoomIn => {
+                layout.zoom_overview(OVERVIEW_ZOOM_STEP);
+            }
+            Op::OverviewZoomOut => {
+                layout.zoom_overview(OVERVIEW_ZOOM_STEP.recip());
+            }
             Op::UpdateConfig { layout_config } => {
                 let options = Options {
                     layout: niri_config::Layout::from_part(&layout_config),
@@ -1645,6 +1653,41 @@ fn check_ops(ops: impl IntoIterator<Item = Op>) -> Layout<TestWindow> {
     let mut layout = Layout::default();
     check_ops_on_layout(&mut layout, ops);
     layout
+}
+
+#[test]
+fn overview_zoom_actions() {
+    let zoom_target =
+        |layout: &Layout<TestWindow>| layout.overview_zoom.as_ref().map(Animation::to);
+
+    let mut layout = check_ops([Op::AddOutput(1), Op::OverviewZoomIn]);
+    assert_eq!(zoom_target(&layout), None);
+
+    check_ops_on_layout(&mut layout, [Op::ToggleOverview, Op::OverviewZoomOut]);
+    let configured = layout.options.overview.zoom;
+    let target = configured * OVERVIEW_ZOOM_STEP.recip();
+    assert_eq!(zoom_target(&layout), Some(target));
+
+    let zoom_value = |layout: &Layout<TestWindow>| layout.overview_zoom.as_ref().unwrap().value();
+    assert_eq!(zoom_value(&layout), configured);
+    check_ops_on_layout(&mut layout, [Op::AdvanceAnimations { msec_delta: 50 }]);
+    let mid = zoom_value(&layout);
+    assert!(target < mid && mid < configured, "zoom animates: {mid}");
+
+    check_ops_on_layout(&mut layout, (0..20).map(|_| Op::OverviewZoomIn));
+    assert_eq!(zoom_target(&layout), Some(OVERVIEW_ZOOM_MAX));
+
+    layout.update_options(Options::clone(&layout.options));
+    assert_eq!(zoom_target(&layout), Some(OVERVIEW_ZOOM_MAX));
+
+    layout.update_options(Options {
+        overview: niri_config::Overview {
+            zoom: 0.3,
+            ..layout.options.overview
+        },
+        ..Options::clone(&layout.options)
+    });
+    assert_eq!(zoom_target(&layout), None);
 }
 
 fn workspace_output_name(layout: &Layout<TestWindow>, ws_name: usize) -> &str {

@@ -53,7 +53,7 @@ use crate::dbus::freedesktop_a11y::KbMonBlock;
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell::GlobalShortcutsPortalBinds;
 use crate::layout::scrolling::ScrollDirection;
-use crate::layout::{ActivateWindow, LayoutElement as _};
+use crate::layout::{ActivateWindow, LayoutElement as _, OVERVIEW_ZOOM_STEP};
 use crate::niri::{CastTarget, Niri, PointerVisibility, State};
 use crate::ui::mru::{WindowMru, WindowMruUi};
 use crate::ui::screenshot_ui::ScreenshotUi;
@@ -2598,6 +2598,16 @@ impl State {
             }
             Action::CloseOverview => {
                 if self.niri.layout.close_overview() {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::OverviewZoomIn => {
+                if self.niri.layout.zoom_overview(OVERVIEW_ZOOM_STEP) {
+                    self.niri.queue_redraw_all();
+                }
+            }
+            Action::OverviewZoomOut => {
+                if self.niri.layout.zoom_overview(OVERVIEW_ZOOM_STEP.recip()) {
                     self.niri.queue_redraw_all();
                 }
             }
