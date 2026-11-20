@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use async_channel::Sender;
 use calloop::timer::{TimeoutAction, Timer};
-use niri_ipc::{AgentError, WindowCapture};
+use niri_ipc::{AgentError, CapturePopup, WindowCapture};
+use smithay::desktop::PopupManager;
 use smithay::utils::Scale;
 
 use super::{
@@ -16,7 +17,7 @@ use super::{
 use crate::layout::LayoutElement as _;
 use crate::niri::{Niri, State};
 use crate::utils::{with_toplevel_role, write_png_rgba8};
-use crate::window::mapped::MappedId;
+use crate::window::mapped::{Mapped, MappedId};
 
 /// Checks, in order, that captures aren't paused, the window exists and it isn't blocked out.
 ///
@@ -86,6 +87,27 @@ pub fn capture_window(
         .unwrap();
 }
 
+/// Popup surface origins and geometry sizes, relative to the window's main surface origin.
+///
+/// `popups_for_surface` yields the popup geometry location relative to the window geometry, so
+/// the surface origin is that plus the window geometry location minus the popup geometry
+/// location, the same placement `render_popups` uses.
+pub fn capture_popups(mapped: &Mapped) -> Vec<CapturePopup> {
+    let geo_loc = mapped.window.geometry().loc;
+    PopupManager::popups_for_surface(mapped.toplevel().wl_surface())
+        .map(|(popup, offset)| {
+            let geo = popup.geometry();
+            let origin = geo_loc + offset - geo.loc;
+            CapturePopup {
+                x: f64::from(origin.x),
+                y: f64::from(origin.y),
+                width: f64::from(geo.size.w),
+                height: f64::from(geo.size.h),
+            }
+        })
+        .collect()
+}
+
 /// Renders the window, stores its `CaptureRecord` and returns the reply and the pixels.
 fn render(
     state: &mut State,
@@ -140,6 +162,7 @@ fn render(
         workspace_visible,
         app_id,
         title,
+        popups: capture_popups(mapped),
     };
 
     state.niri.agent.captures.insert(id, record);

@@ -16,6 +16,8 @@ pub mod input;
 pub mod ipc;
 pub mod layer;
 pub mod layout;
+#[cfg(feature = "dbus")]
+pub mod mcp;
 pub mod niri;
 pub mod protocols;
 pub mod render_helpers;

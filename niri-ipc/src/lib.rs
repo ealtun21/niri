@@ -295,6 +295,20 @@ pub enum AgentMod {
     Super,
 }
 
+/// A popup of a captured window.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct CapturePopup {
+    /// Popup surface origin x, in logical pixels relative to the window's main surface origin.
+    pub x: f64,
+    /// Popup surface origin y, in logical pixels relative to the window's main surface origin.
+    pub y: f64,
+    /// Popup geometry width in logical pixels.
+    pub width: f64,
+    /// Popup geometry height in logical pixels.
+    pub height: f64,
+}
+
 /// Result of a window capture.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -321,6 +335,10 @@ pub struct WindowCapture {
     pub app_id: Option<String>,
     /// Title of the window.
     pub title: Option<String>,
+    /// Popups of the window, topmost first: children before their parents, newer siblings first.
+    /// Missing from older compositors.
+    #[serde(default)]
+    pub popups: Vec<CapturePopup>,
 }
 
 /// Result of an agent operation.
@@ -2451,6 +2469,15 @@ fn default_position_change() -> PositionChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_capture_without_popups_field_parses() {
+        let s = r#"{"id":1,"path":"/x.png","width":10,"height":10,"scale":1.0,
+            "origin":[0.0,0.0],"geometry_loc":[0.0,0.0],"window_size":[10,10],
+            "workspace_visible":true,"app_id":null,"title":null}"#;
+        let c: WindowCapture = serde_json::from_str(s).unwrap();
+        assert!(c.popups.is_empty());
+    }
 
     #[test]
     fn agent_error_codes() {

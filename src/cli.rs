@@ -47,6 +47,9 @@ pub enum Sub {
         #[arg(long)]
         print_request: bool,
     },
+    /// Serve MCP on stdio for AI agents driving windows.
+    #[cfg(feature = "dbus")]
+    Mcp,
     /// Validate the config file.
     Validate {
         /// Path to config file (default: `$XDG_CONFIG_HOME/niri/config.kdl`).

@@ -77,6 +77,8 @@ pub struct State {
     pub layers: Vec<LayerSurface>,
     /// Popups that got `popup_done`.
     pub popups_done: Vec<XdgPopup>,
+    /// Configures received by popup xdg-surfaces, not acked automatically.
+    pub popup_configures: Vec<(XdgSurface, u32)>,
 }
 
 pub struct Window {
@@ -315,6 +317,7 @@ impl Client {
             windows: Vec::new(),
             layers: Vec::new(),
             popups_done: Vec::new(),
+            popup_configures: Vec::new(),
         };
 
         Self {
@@ -434,12 +437,22 @@ impl State {
         parent: &XdgSurface,
         grab_serial: Option<u32>,
     ) -> (WlSurface, XdgPopup) {
+        self.create_popup_at(parent, grab_serial, (0, 0))
+    }
+
+    /// Like `create_popup`, with the 1x1 anchor rect at `anchor` in the parent's geometry.
+    pub fn create_popup_at(
+        &mut self,
+        parent: &XdgSurface,
+        grab_serial: Option<u32>,
+        anchor: (i32, i32),
+    ) -> (WlSurface, XdgPopup) {
         let surface = self.create_surface();
 
         let xdg_wm_base = self.xdg_wm_base.as_ref().unwrap();
         let positioner = xdg_wm_base.create_positioner(&self.qh, ());
         positioner.set_size(10, 10);
-        positioner.set_anchor_rect(0, 0, 1, 1);
+        positioner.set_anchor_rect(anchor.0, anchor.1, 1, 1);
         let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &self.qh, ());
         let popup = xdg_surface.get_popup(Some(parent), &positioner, &self.qh, ());
         positioner.destroy();
@@ -1125,6 +1138,7 @@ impl Dispatch<XdgSurface, ()> for State {
                     .iter_mut()
                     .find(|w| w.xdg_surface == *xdg_surface)
                 else {
+                    state.popup_configures.push((xdg_surface.clone(), serial));
                     return;
                 };
                 let configure = window.pending_configure.clone();

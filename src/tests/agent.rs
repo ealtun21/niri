@@ -13,7 +13,7 @@ use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
 
 use super::client::{ClientId, PointerEvent};
 use super::*;
-use crate::agent::capture::{capture_precheck, settle_time};
+use crate::agent::capture::{capture_popups, capture_precheck, settle_time};
 use crate::agent::pointer::{self, capture_to_buffer};
 use crate::agent::{
     capture_scale, check_target, keyboard, CaptureRecord, OpKind, DEFAULT_SETTLE, MAX_DRAG_STEPS,
@@ -1628,4 +1628,39 @@ fn matcher_is_agent_active_expires() {
     f.niri().agent.active_until.insert(id, Instant::now());
     f.niri_state().refresh_and_flush_clients();
     assert_eq!(opacity_of(&mut f, "agent-b"), None);
+}
+
+#[test]
+fn capture_popups_reports_popup_offset() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let parent = f.client(agent).window(&b).xdg_surface.clone();
+    let (surface, _popup) = f
+        .client(agent)
+        .state
+        .create_popup_at(&parent, None, (20, 30));
+    f.double_roundtrip(agent);
+    // Commit the popup's position and size.
+    let (xdg_surface, serial) = f.client(agent).state.popup_configures.pop().unwrap();
+    xdg_surface.ack_configure(serial);
+    xdg_surface.set_window_geometry(0, 0, 10, 10);
+    // Smithay only applies the acked popup state once the popup has a buffer.
+    let state = &f.client(agent).state;
+    let buffer = state
+        .spbm
+        .as_ref()
+        .unwrap()
+        .create_u32_rgba_buffer(0, 0, 0, 0, &state.qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    f.double_roundtrip(agent);
+
+    let id = mapped_id(&mut f, "agent-b");
+    let (mapped, _) = f.niri().find_mapped_output_by_id(id).unwrap();
+    let geo = mapped.window.geometry();
+    let popups = capture_popups(mapped);
+    assert_eq!(popups.len(), 1);
+    // Anchor point (20, 30) minus half the 10x10 popup, relative to the window geometry.
+    assert_eq!(popups[0].x, f64::from(geo.loc.x + 15));
+    assert_eq!(popups[0].y, f64::from(geo.loc.y + 25));
+    assert_eq!((popups[0].width, popups[0].height), (10., 10.));
 }
