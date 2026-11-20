@@ -2473,3 +2473,57 @@ fn redundant_modifier_binds() {
         run("binds { Alt+Alt+Q { release { close-window; }; }; }", input)
     );
 }
+
+#[test]
+fn overview_wheel_zooms_and_mod_wheel_switches_workspace() {
+    let (mut f, id, surface) = set_up("");
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+
+    // Park the pointer mid-output, away from the hot corner, so the overview handles the wheel.
+    let pointer = f.client(id).state.virtual_pointer();
+    pointer.motion_absolute(0, 960, 540, 1920, 1080);
+    pointer.frame();
+    f.roundtrip(id);
+
+    let ws_idx = |f: &mut Fixture| {
+        let layout = &f.niri().layout;
+        let active = layout.active_workspace().unwrap().id();
+        layout
+            .workspaces()
+            .position(|(_, _, ws)| ws.id() == active)
+            .unwrap()
+    };
+    let zoom = |f: &mut Fixture| {
+        f.niri_complete_animations();
+        f.niri().layout.overview_zoom()
+    };
+
+    // One physical wheel notch: `axis_discrete` gives niri the v120 value a real mouse sends.
+    let notch = |f: &mut Fixture, steps: i32| {
+        let pointer = f.client(id).state.virtual_pointer();
+        pointer.axis_source(wl_pointer::AxisSource::Wheel);
+        pointer.axis_discrete(
+            0,
+            wl_pointer::Axis::VerticalScroll,
+            f64::from(steps) * 15.,
+            steps,
+        );
+        pointer.frame();
+        f.roundtrip(id);
+    };
+
+    let z0 = zoom(&mut f);
+    notch(&mut f, -1);
+    let z1 = zoom(&mut f);
+    assert!(z1 > z0, "wheel up zooms in: {z0} -> {z1}");
+    notch(&mut f, 1);
+    notch(&mut f, 1);
+    assert!(zoom(&mut f) < z1, "wheel down zooms out");
+    assert_eq!(ws_idx(&mut f), 0, "plain wheel keeps the workspace");
+
+    run_f(&mut f, id, &surface, "+LWIN");
+    notch(&mut f, 1);
+    run_f(&mut f, id, &surface, "-LWIN");
+    assert_eq!(ws_idx(&mut f), 1, "Mod+wheel down switches workspace");
+}

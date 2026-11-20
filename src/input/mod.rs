@@ -3701,35 +3701,42 @@ impl State {
                 let vertical = vertical_amount_v120.unwrap_or(0.);
                 let ticks = self.niri.vertical_wheel_tracker.accumulate(vertical);
                 if ticks != 0 {
+                    // Overview camera: the plain wheel zooms, Mod+wheel switches workspaces.
+                    let overview_wheel = |trigger, action, cooldown| {
+                        Some(Bind {
+                            key: Key {
+                                trigger,
+                                modifiers: Modifiers::empty(),
+                            },
+                            action: BoundAction::Press(action),
+                            repeat: true,
+                            pass_through: None,
+                            cooldown,
+                            allow_when_locked: false,
+                            allow_inhibiting: false,
+                            hotkey_overlay_title: None,
+                        })
+                    };
                     let (bind_up, bind_down) = if should_handle_in_overview && modifiers.is_empty()
                     {
-                        let bind_up = Some(Bind {
-                            key: Key {
-                                trigger: Trigger::WheelScrollUp,
-                                modifiers: Modifiers::empty(),
-                            },
-                            action: BoundAction::Press(Action::FocusWorkspaceUpUnderMouse),
-                            repeat: true,
-                            pass_through: None,
-                            cooldown: Some(Duration::from_millis(50)),
-                            allow_when_locked: false,
-                            allow_inhibiting: false,
-                            hotkey_overlay_title: None,
-                        });
-                        let bind_down = Some(Bind {
-                            key: Key {
-                                trigger: Trigger::WheelScrollDown,
-                                modifiers: Modifiers::empty(),
-                            },
-                            action: BoundAction::Press(Action::FocusWorkspaceDownUnderMouse),
-                            repeat: true,
-                            pass_through: None,
-                            cooldown: Some(Duration::from_millis(50)),
-                            allow_when_locked: false,
-                            allow_inhibiting: false,
-                            hotkey_overlay_title: None,
-                        });
-                        (bind_up, bind_down)
+                        (
+                            overview_wheel(Trigger::WheelScrollUp, Action::OverviewZoomIn, None),
+                            overview_wheel(Trigger::WheelScrollDown, Action::OverviewZoomOut, None),
+                        )
+                    } else if should_handle_in_overview && modifiers == mod_key.to_modifiers() {
+                        let cooldown = Some(Duration::from_millis(50));
+                        (
+                            overview_wheel(
+                                Trigger::WheelScrollUp,
+                                Action::FocusWorkspaceUpUnderMouse,
+                                cooldown,
+                            ),
+                            overview_wheel(
+                                Trigger::WheelScrollDown,
+                                Action::FocusWorkspaceDownUnderMouse,
+                                cooldown,
+                            ),
+                        )
                     } else if should_handle_in_overview && modifiers == Modifiers::SHIFT {
                         let bind_up = Some(Bind {
                             key: Key {
