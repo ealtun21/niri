@@ -183,6 +183,20 @@ impl<'a> WindowRef<'a> {
             WindowRef::Mapped(mapped) => mapped.is_window_cast_target(),
         }
     }
+
+    pub fn is_agent_granted(self) -> bool {
+        match self {
+            WindowRef::Unmapped(_) => false,
+            WindowRef::Mapped(mapped) => mapped.is_agent_granted(),
+        }
+    }
+
+    pub fn is_agent_active(self) -> bool {
+        match self {
+            WindowRef::Unmapped(_) => false,
+            WindowRef::Mapped(mapped) => mapped.is_agent_active(),
+        }
+    }
 }
 
 impl ResolvedWindowRules {
@@ -454,6 +468,18 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
 
     if let Some(is_window_cast_target) = m.is_window_cast_target {
         if window.is_window_cast_target() != is_window_cast_target {
+            return false;
+        }
+    }
+
+    if let Some(is_agent_granted) = m.is_agent_granted {
+        if window.is_agent_granted() != is_agent_granted {
+            return false;
+        }
+    }
+
+    if let Some(is_agent_active) = m.is_agent_active {
+        if window.is_agent_active() != is_agent_active {
             return false;
         }
     }

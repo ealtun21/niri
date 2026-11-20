@@ -4,7 +4,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use calloop::EventLoop;
@@ -15,6 +15,10 @@ use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
+use smithay::reexports::wayland_protocols::xdg::activation::v1::client::xdg_activation_token_v1::{self, XdgActivationTokenV1};
+use smithay::reexports::wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
+use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_popup::{self, XdgPopup};
+use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_positioner::XdgPositioner;
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
@@ -33,6 +37,7 @@ use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, WlSeat};
@@ -66,9 +71,12 @@ pub struct State {
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
     pub ksim: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
+    pub activation: Option<XdgActivationV1>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
+    /// Popups that got `popup_done`.
+    pub popups_done: Vec<XdgPopup>,
 }
 
 pub struct Window {
@@ -102,12 +110,48 @@ pub struct LayerSurface {
 #[derive(Debug, Default)]
 pub struct Seat {
     pub keyboard: Option<Keyboard>,
+    pub pointer: Option<Pointer>,
 }
 
 #[derive(Debug)]
 pub struct Surface {
     pub keyboard_events_received: Vec<KeyboardEvent>,
     pub keyboard_events_looked_at: usize,
+    pub pointer_events_received: Vec<PointerEvent>,
+}
+
+#[derive(Debug)]
+pub struct Pointer {
+    pub proxy: WlPointer,
+    pub surface: Option<WlSurface>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum PointerEvent {
+    Enter {
+        x: f64,
+        y: f64,
+    },
+    Leave,
+    Motion {
+        x: f64,
+        y: f64,
+    },
+    Button {
+        serial: u32,
+        button: u32,
+        state: wl_pointer::ButtonState,
+    },
+    Axis {
+        axis: wl_pointer::Axis,
+        value: f64,
+    },
+    AxisValue120 {
+        axis: wl_pointer::Axis,
+        value120: i32,
+    },
+    AxisSource(wl_pointer::AxisSource),
+    Frame,
 }
 
 #[derive(Debug)]
@@ -267,8 +311,10 @@ impl Client {
             spbm: None,
             viewporter: None,
             ksim: None,
+            activation: None,
             windows: Vec::new(),
             layers: Vec::new(),
+            popups_done: Vec::new(),
         };
 
         Self {
@@ -339,6 +385,7 @@ impl State {
             Surface {
                 keyboard_events_received: Vec::new(),
                 keyboard_events_looked_at: 0,
+                pointer_events_received: Vec::new(),
             },
         );
         surface
@@ -378,6 +425,30 @@ impl State {
             .iter_mut()
             .find(|w| w.surface == *surface)
             .unwrap()
+    }
+
+    /// Creates a 10 × 10 popup of `parent`, grabbing with the serial if given, and commits it
+    /// without a buffer.
+    pub fn create_popup(
+        &mut self,
+        parent: &XdgSurface,
+        grab_serial: Option<u32>,
+    ) -> (WlSurface, XdgPopup) {
+        let surface = self.create_surface();
+
+        let xdg_wm_base = self.xdg_wm_base.as_ref().unwrap();
+        let positioner = xdg_wm_base.create_positioner(&self.qh, ());
+        positioner.set_size(10, 10);
+        positioner.set_anchor_rect(0, 0, 1, 1);
+        let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &self.qh, ());
+        let popup = xdg_surface.get_popup(Some(parent), &positioner, &self.qh, ());
+        positioner.destroy();
+
+        if let Some(serial) = grab_serial {
+            popup.grab(self.seats.keys().next().unwrap(), serial);
+        }
+        surface.commit();
+        (surface, popup)
     }
 
     pub fn create_layer(
@@ -448,6 +519,30 @@ impl State {
         self.virtual_pointer = Some(pointer.clone());
         pointer
     }
+
+    /// Requests an xdg-activation token, which is set once the compositor sends `done`.
+    pub fn activation_token(
+        &self,
+        serial: Option<u32>,
+        surface: Option<&WlSurface>,
+    ) -> Arc<OnceLock<String>> {
+        let token = Arc::new(OnceLock::new());
+        let activation = self.activation.as_ref().unwrap();
+        let proxy = activation.get_activation_token(&self.qh, token.clone());
+        if let Some(serial) = serial {
+            proxy.set_serial(serial, self.seats.keys().next().unwrap());
+        }
+        if let Some(surface) = surface {
+            proxy.set_surface(surface);
+        }
+        proxy.commit();
+        token
+    }
+
+    pub fn activate(&self, token: &str, surface: &WlSurface) {
+        let activation = self.activation.as_ref().unwrap();
+        activation.activate(token.to_owned(), surface);
+    }
 }
 
 impl Window {
@@ -496,6 +591,10 @@ impl Window {
 
     pub fn set_parent(&self, parent: Option<&XdgToplevel>) {
         self.xdg_toplevel.set_parent(parent);
+    }
+
+    pub fn set_app_id(&self, app_id: &str) {
+        self.xdg_toplevel.set_app_id(app_id.to_owned());
     }
 
     pub fn set_title(&self, title: &str) {
@@ -684,6 +783,9 @@ impl Dispatch<WlRegistry, ()> for State {
                         ZwpKeyboardShortcutsInhibitManagerV1::interface().version,
                     );
                     state.ksim = Some(registry.bind(name, version, qh, ()));
+                } else if interface == XdgActivationV1::interface().name {
+                    let version = min(version, XdgActivationV1::interface().version);
+                    state.activation = Some(registry.bind(name, version, qh, ()));
                 }
 
                 let global = Global {
@@ -749,10 +851,104 @@ impl Dispatch<WlSeat, ()> for State {
                         keyboard.proxy.release();
                     }
                 }
+
+                if capabilities.contains(wl_seat::Capability::Pointer) {
+                    if data.pointer.is_none() {
+                        data.pointer = Some(Pointer {
+                            proxy: seat.get_pointer(qh, seat.clone()),
+                            surface: None,
+                        });
+                    }
+                } else if let Some(pointer) = data.pointer.take() {
+                    pointer.proxy.release();
+                }
             }
             wl_seat::Event::Name { .. } => (),
             _ => unreachable!(),
         }
+    }
+}
+
+impl Dispatch<WlPointer, WlSeat> for State {
+    fn event(
+        state: &mut Self,
+        _pointer: &WlPointer,
+        event: <WlPointer as wayland_client::Proxy>::Event,
+        seat: &WlSeat,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        let pointer = state.seats.get_mut(seat).unwrap().pointer.as_mut().unwrap();
+
+        let (surface, event) = match event {
+            wl_pointer::Event::Enter {
+                surface,
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                pointer.surface = Some(surface.clone());
+                let event = PointerEvent::Enter {
+                    x: surface_x,
+                    y: surface_y,
+                };
+                (surface, event)
+            }
+            wl_pointer::Event::Leave { surface, .. } => {
+                // Keep the surface: the `frame` after `leave` belongs to it.
+                (surface, PointerEvent::Leave)
+            }
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                let event = PointerEvent::Motion {
+                    x: surface_x,
+                    y: surface_y,
+                };
+                (pointer.surface.clone().unwrap(), event)
+            }
+            wl_pointer::Event::Button {
+                serial,
+                button,
+                state: button_state,
+                ..
+            } => {
+                let event = PointerEvent::Button {
+                    serial,
+                    button,
+                    state: button_state.into_result().unwrap(),
+                };
+                (pointer.surface.clone().unwrap(), event)
+            }
+            wl_pointer::Event::Axis { axis, value, .. } => {
+                let event = PointerEvent::Axis {
+                    axis: axis.into_result().unwrap(),
+                    value,
+                };
+                (pointer.surface.clone().unwrap(), event)
+            }
+            wl_pointer::Event::AxisValue120 { axis, value120 } => {
+                let event = PointerEvent::AxisValue120 {
+                    axis: axis.into_result().unwrap(),
+                    value120,
+                };
+                (pointer.surface.clone().unwrap(), event)
+            }
+            wl_pointer::Event::AxisSource { axis_source } => {
+                let event = PointerEvent::AxisSource(axis_source.into_result().unwrap());
+                (pointer.surface.clone().unwrap(), event)
+            }
+            wl_pointer::Event::Frame => (pointer.surface.clone().unwrap(), PointerEvent::Frame),
+            _ => return,
+        };
+        state
+            .surfaces
+            .get_mut(&surface)
+            .unwrap()
+            .pointer_events_received
+            .push(event);
     }
 }
 
@@ -873,6 +1069,25 @@ impl Dispatch<ZwlrLayerShellV1, ()> for State {
 
 wayland_client::delegate_noop!(State: ZwlrVirtualPointerManagerV1);
 wayland_client::delegate_noop!(State: ZwlrVirtualPointerV1);
+wayland_client::delegate_noop!(State: XdgActivationV1);
+
+impl Dispatch<XdgActivationTokenV1, Arc<OnceLock<String>>> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &XdgActivationTokenV1,
+        event: <XdgActivationTokenV1 as wayland_client::Proxy>::Event,
+        data: &Arc<OnceLock<String>>,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_activation_token_v1::Event::Done { token } => {
+                data.set(token).unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+}
 
 impl Dispatch<WlSurface, ()> for State {
     fn event(
@@ -904,14 +1119,47 @@ impl Dispatch<XdgSurface, ()> for State {
     ) {
         match event {
             xdg_surface::Event::Configure { serial } => {
-                let window = state
+                // Popups never map, so they ignore their configures.
+                let Some(window) = state
                     .windows
                     .iter_mut()
                     .find(|w| w.xdg_surface == *xdg_surface)
-                    .unwrap();
+                else {
+                    return;
+                };
                 let configure = window.pending_configure.clone();
                 window.configures_received.push((serial, configure));
             }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<XdgPositioner, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &XdgPositioner,
+        _event: <XdgPositioner as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<XdgPopup, ()> for State {
+    fn event(
+        state: &mut Self,
+        popup: &XdgPopup,
+        event: <XdgPopup as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_popup::Event::PopupDone => state.popups_done.push(popup.clone()),
+            xdg_popup::Event::Configure { .. } | xdg_popup::Event::Repositioned { .. } => (),
             _ => unreachable!(),
         }
     }

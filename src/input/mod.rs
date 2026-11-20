@@ -199,6 +199,13 @@ impl State {
             }
         }
 
+        if crate::agent::is_human_input(&event) {
+            self.niri.agent.note_human_input(std::time::Instant::now());
+            if matches!(event, InputEvent::PointerButton { .. }) {
+                crate::agent::dismiss_visible_popups(&mut self.niri);
+            }
+        }
+
         if should_reset_pointer_inactivity_timer(&event) {
             self.niri.reset_pointer_inactivity_timer();
         }
@@ -478,6 +485,7 @@ impl State {
         // Note that keyboard shortcuts can still be pressed across multiple
         // keyboards even with this, as intended.
         let source = virtual_keyboard.map_or(KeyboardSource::MAIN, |device| device.source());
+        let is_virtual_keyboard = virtual_keyboard.is_some();
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
@@ -720,6 +728,7 @@ impl State {
                         &this.niri.global_shortcuts_portal_binds,
                         this.niri.keyboard_focus.is_overview(),
                         modifiers,
+                        is_virtual_keyboard,
                     );
 
                     should_intercept_key(
@@ -1069,6 +1078,20 @@ impl State {
                             warn!("error taking screenshot: {err:?}");
                         }
                     });
+                }
+            }
+            Action::ToggleAgentInput => {
+                let agent = &mut self.niri.agent;
+                agent.paused = !agent.paused;
+                if agent.paused {
+                    agent.release_sticky();
+                    agent.dismiss_all();
+                }
+            }
+            Action::ToggleWindowAgentInput => {
+                if let Some(mapped) = self.niri.layout.focus() {
+                    let granted = !self.niri.agent.is_granted(mapped);
+                    self.niri.agent.granted.insert(mapped.id(), granted);
                 }
             }
             Action::ToggleKeyboardShortcutsInhibit => {
@@ -3147,6 +3170,7 @@ impl State {
         mod_key: ModKey,
         trigger: Trigger,
         mods: ModifiersState,
+        from_virtual_device: bool,
     ) -> Option<Bind> {
         let modifiers = modifiers_from_state(mods);
 
@@ -3159,12 +3183,17 @@ impl State {
             &self.niri.global_shortcuts_portal_binds,
             self.niri.keyboard_focus.is_overview(),
             modifiers,
+            from_virtual_device,
         );
 
         find_configured_bind(bindings, mod_key, trigger, mods)
     }
 
-    fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent) {
+    fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent)
+    where
+        I::Device: 'static,
+    {
+        let from_virtual_device = crate::agent::is_virtual_device(&event.device());
         let pointer = self.niri.seat.get_pointer().unwrap();
 
         let serial = SERIAL_COUNTER.next_serial();
@@ -3229,8 +3258,9 @@ impl State {
                     Some(MouseButton::Forward) => Some(Trigger::MouseForward),
                     _ => None,
                 }
-                .and_then(|trigger| self.find_pointer_bind(mod_key, trigger, mods))
-                {
+                .and_then(|trigger| {
+                    self.find_pointer_bind(mod_key, trigger, mods, from_virtual_device)
+                }) {
                     self.niri.suppressed_buttons.insert(button_code);
                     if should_record_release_bind(
                         &bind,
@@ -3537,7 +3567,11 @@ impl State {
         pointer.frame(self);
     }
 
-    fn on_pointer_axis<I: InputBackend>(&mut self, event: I::PointerAxisEvent) {
+    fn on_pointer_axis<I: InputBackend>(&mut self, event: I::PointerAxisEvent)
+    where
+        I::Device: 'static,
+    {
+        let from_virtual_device = crate::agent::is_virtual_device(&event.device());
         self.niri.cancel_interrupted_release_binds();
 
         let pointer = &self.niri.seat.get_pointer().unwrap();
@@ -3626,8 +3660,18 @@ impl State {
                             (bind_left, bind_right)
                         } else {
                             (
-                                self.find_pointer_bind(mod_key, Trigger::WheelScrollLeft, mods),
-                                self.find_pointer_bind(mod_key, Trigger::WheelScrollRight, mods),
+                                self.find_pointer_bind(
+                                    mod_key,
+                                    Trigger::WheelScrollLeft,
+                                    mods,
+                                    from_virtual_device,
+                                ),
+                                self.find_pointer_bind(
+                                    mod_key,
+                                    Trigger::WheelScrollRight,
+                                    mods,
+                                    from_virtual_device,
+                                ),
                             )
                         };
 
@@ -3716,8 +3760,18 @@ impl State {
                         (bind_up, bind_down)
                     } else {
                         (
-                            self.find_pointer_bind(mod_key, Trigger::WheelScrollUp, mods),
-                            self.find_pointer_bind(mod_key, Trigger::WheelScrollDown, mods),
+                            self.find_pointer_bind(
+                                mod_key,
+                                Trigger::WheelScrollUp,
+                                mods,
+                                from_virtual_device,
+                            ),
+                            self.find_pointer_bind(
+                                mod_key,
+                                Trigger::WheelScrollDown,
+                                mods,
+                                from_virtual_device,
+                            ),
                         )
                     };
 
@@ -3852,8 +3906,18 @@ impl State {
                     .accumulate(horizontal);
                 if ticks != 0 {
                     let (bind_left, bind_right) = (
-                        self.find_pointer_bind(mod_key, Trigger::TouchpadScrollLeft, mods),
-                        self.find_pointer_bind(mod_key, Trigger::TouchpadScrollRight, mods),
+                        self.find_pointer_bind(
+                            mod_key,
+                            Trigger::TouchpadScrollLeft,
+                            mods,
+                            from_virtual_device,
+                        ),
+                        self.find_pointer_bind(
+                            mod_key,
+                            Trigger::TouchpadScrollRight,
+                            mods,
+                            from_virtual_device,
+                        ),
                     );
 
                     if let Some(right) = bind_right {
@@ -3874,8 +3938,18 @@ impl State {
                     .accumulate(vertical);
                 if ticks != 0 {
                     let (bind_up, bind_down) = (
-                        self.find_pointer_bind(mod_key, Trigger::TouchpadScrollUp, mods),
-                        self.find_pointer_bind(mod_key, Trigger::TouchpadScrollDown, mods),
+                        self.find_pointer_bind(
+                            mod_key,
+                            Trigger::TouchpadScrollUp,
+                            mods,
+                            from_virtual_device,
+                        ),
+                        self.find_pointer_bind(
+                            mod_key,
+                            Trigger::TouchpadScrollDown,
+                            mods,
+                            from_virtual_device,
+                        ),
                     );
 
                     if let Some(down) = bind_down {
@@ -4314,7 +4388,7 @@ impl State {
                     let modifiers = modifiers_from_state(mods);
 
                     if self.niri.mods_with_tablet_stylus_binds.contains(&modifiers) {
-                        if let Some(bind) = self.find_pointer_bind(mod_key, trigger, mods) {
+                        if let Some(bind) = self.find_pointer_bind(mod_key, trigger, mods, false) {
                             self.niri.suppressed_buttons.insert(button);
                             if should_record_release_bind(
                                 &bind,
@@ -5415,6 +5489,7 @@ fn allowed_when_locked(action: &Action) -> bool {
             | Action::SwitchLayout(_)
             | Action::ToggleKeyboardShortcutsInhibit
             | Action::ToggleTouchpad
+            | Action::ToggleAgentInput
     )
 }
 
@@ -5936,6 +6011,16 @@ fn hardcoded_overview_binds<'a>() -> impl Iterator<Item = &'a Bind> + Clone {
     BINDS.iter()
 }
 
+/// Whether a bind with this action may fire. The owner controls fire only from physical devices,
+/// so that an agent can't press them through a virtual keyboard or pointer.
+pub fn agent_bind_allowed(action: &Action, from_virtual_device: bool) -> bool {
+    !(from_virtual_device
+        && matches!(
+            action,
+            Action::ToggleAgentInput | Action::ToggleWindowAgentInput
+        ))
+}
+
 /// Returns an iterator over bindings.
 ///
 /// Includes dynamically populated bindings like the MRU UI.
@@ -5946,6 +6031,7 @@ fn make_binds_iter<'a>(
     #[cfg(feature = "dbus")] global_shortcuts: &'a GlobalShortcutsPortalBinds,
     overview_focused: bool,
     mods: Modifiers,
+    from_virtual_device: bool,
 ) -> impl Iterator<Item = &'a Bind> + Clone {
     let general_binds = config.binds.0.iter();
 
@@ -5979,7 +6065,16 @@ fn make_binds_iter<'a>(
     #[cfg(feature = "dbus")]
     let all_binds = all_binds.chain(global_shortcuts.binds());
 
-    all_binds
+    // Virtual devices can't trigger the agent owner controls.
+    all_binds.filter(move |bind| match &bind.action {
+        BoundAction::Press(action) | BoundAction::Release(action) => {
+            agent_bind_allowed(action, from_virtual_device)
+        }
+        BoundAction::Both { press, release } => {
+            agent_bind_allowed(press, from_virtual_device)
+                && agent_bind_allowed(release, from_virtual_device)
+        }
+    })
 }
 
 #[cfg(test)]

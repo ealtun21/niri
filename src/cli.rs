@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
-use niri_ipc::{Action, OutputAction};
+use niri_ipc::{Action, AgentButton, AgentMod, OutputAction};
 
 use crate::utils::version;
 
@@ -112,8 +112,83 @@ pub enum Msg {
     OverviewState,
     /// List screencasts.
     Casts,
+    /// Capture a window to a PNG file.
+    CaptureWindow {
+        /// Id of the window.
+        #[arg(long)]
+        id: u64,
+        /// Path of the PNG file to write.
+        #[arg(long)]
+        path: String,
+        /// Longest edge of the image in pixels.
+        #[arg(long)]
+        max_edge: Option<u32>,
+        /// Milliseconds to wait for the window to settle before capturing.
+        #[arg(long)]
+        settle_ms: Option<u32>,
+    },
+    /// Perform an agent input operation on a window.
+    Agent {
+        /// Id of the window.
+        #[arg(long)]
+        id: u64,
+        #[command(subcommand)]
+        op: AgentCmd,
+    },
     /// Send a raw JSON request to the compositor, reading from stdin.
     RawRequest,
+}
+
+/// Agent input operations; coordinates are pixels of the last capture.
+#[derive(Subcommand)]
+pub enum AgentCmd {
+    /// Click at a point.
+    #[command(allow_negative_numbers = true)]
+    Click {
+        x: f64,
+        y: f64,
+        #[arg(long, value_enum, default_value = "left")]
+        button: AgentButton,
+        #[arg(long, default_value_t = 1)]
+        count: u8,
+        /// Comma-separated modifiers, e.g. `ctrl,shift`.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        mods: Vec<AgentMod>,
+    },
+    /// Move the pointer.
+    #[command(allow_negative_numbers = true)]
+    Move { x: f64, y: f64 },
+    /// Scroll at a point.
+    #[command(allow_negative_numbers = true)]
+    Scroll {
+        x: f64,
+        y: f64,
+        #[arg(long, default_value_t = 0.)]
+        dx: f64,
+        #[arg(long, default_value_t = 0.)]
+        dy: f64,
+    },
+    /// Drag from one point to another.
+    #[command(allow_negative_numbers = true)]
+    Drag {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        #[arg(long, default_value_t = 10)]
+        steps: u16,
+    },
+    /// Press a key chord such as `ctrl+l`.
+    Key {
+        chord: String,
+        #[arg(long, default_value_t = 1)]
+        repeat: u16,
+    },
+    /// Type text.
+    Type {
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -137,6 +212,110 @@ impl TryFrom<CompletionShell> for Shell {
             CompletionShell::PowerShell => Ok(Shell::PowerShell),
             CompletionShell::Zsh => Ok(Shell::Zsh),
             CompletionShell::Nushell => Err("Nushell should be handled separately"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_agent_click() {
+        let cli = Cli::try_parse_from([
+            "niri",
+            "msg",
+            "agent",
+            "--id",
+            "7",
+            "click",
+            "10",
+            "20",
+            "--button",
+            "right",
+            "--mods",
+            "ctrl,shift",
+        ])
+        .unwrap();
+        let Some(Sub::Msg {
+            msg: Msg::Agent { id, op },
+            ..
+        }) = cli.subcommand
+        else {
+            panic!("expected Msg::Agent");
+        };
+        assert_eq!(id, 7);
+        let AgentCmd::Click {
+            x,
+            y,
+            button,
+            count,
+            mods,
+        } = op
+        else {
+            panic!("expected click");
+        };
+        assert_eq!((x, y, count), (10., 20., 1));
+        assert_eq!(button, AgentButton::Right);
+        assert_eq!(mods, [AgentMod::Ctrl, AgentMod::Shift]);
+    }
+
+    #[test]
+    fn parse_agent_negative_numbers() {
+        let parse = |args: &[&str]| {
+            let mut v = vec!["niri", "msg", "agent", "--id", "7"];
+            v.extend_from_slice(args);
+            Cli::try_parse_from(v)
+        };
+        let Some(Sub::Msg {
+            msg:
+                Msg::Agent {
+                    op: AgentCmd::Scroll { x, y, dx, dy },
+                    ..
+                },
+            ..
+        }) = parse(&["scroll", "1", "2", "--dy", "-3"])
+            .unwrap()
+            .subcommand
+        else {
+            panic!("expected scroll");
+        };
+        assert_eq!((x, y, dx, dy), (1., 2., 0., -3.));
+
+        let Some(Sub::Msg {
+            msg:
+                Msg::Agent {
+                    op: AgentCmd::Move { x, y },
+                    ..
+                },
+            ..
+        }) = parse(&["move", "-5", "20"]).unwrap().subcommand
+        else {
+            panic!("expected move");
+        };
+        assert_eq!((x, y), (-5., 20.));
+
+        assert!(parse(&["click", "-5", "20"]).is_ok());
+        assert!(parse(&["drag", "-1", "-2", "-3", "-4"]).is_ok());
+    }
+
+    #[test]
+    fn parse_agent_type_hyphen_text() {
+        for args in [&["type", "--", "-x"][..], &["type", "-x"]] {
+            let mut v = vec!["niri", "msg", "agent", "--id", "7"];
+            v.extend_from_slice(args);
+            let Some(Sub::Msg {
+                msg:
+                    Msg::Agent {
+                        op: AgentCmd::Type { text },
+                        ..
+                    },
+                ..
+            }) = Cli::try_parse_from(v).unwrap().subcommand
+            else {
+                panic!("expected type");
+            };
+            assert_eq!(text, "-x", "{args:?}");
         }
     }
 }

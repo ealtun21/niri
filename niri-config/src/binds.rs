@@ -235,6 +235,10 @@ pub struct SwitchAction {
 }
 
 // Remember to add new actions to the CLI enum too.
+//
+// Except `ToggleAgentInput` and `ToggleWindowAgentInput`: they are deliberately omitted from
+// `niri_ipc::Action` and the CLI, so that agents can't call them. `From<niri_ipc::Action>` is the
+// only conversion and no test enforces parity, so config-only variants need nothing else.
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub enum Action {
     Quit(#[knuffel(property(name = "skip-confirmation"), default)] bool),
@@ -507,6 +511,8 @@ pub enum Action {
     ToggleWindowRuleOpacity,
     #[knuffel(skip)]
     ToggleWindowRuleOpacityById(u64),
+    ToggleAgentInput,
+    ToggleWindowAgentInput,
     SetDynamicCastWindow,
     #[knuffel(skip)]
     SetDynamicCastWindowById(u64),
@@ -1235,15 +1241,27 @@ where
 
         // The toggle-inhibit action must always be uninhibitable.
         // Otherwise, it would be impossible to trigger it.
-        if matches!(press_action, Some(Action::ToggleKeyboardShortcutsInhibit))
-            || matches!(release_action, Some(Action::ToggleKeyboardShortcutsInhibit))
-        {
+        //
+        // Same for the agent kill switch: a shortcut-inhibiting app (a VM, a remote desktop) must
+        // not swallow it.
+        let uninhibitable = |action: &Option<Action>| {
+            matches!(
+                action,
+                Some(Action::ToggleKeyboardShortcutsInhibit | Action::ToggleAgentInput)
+            )
+        };
+        if uninhibitable(&press_action) || uninhibitable(&release_action) {
             allow_inhibiting = false;
         }
 
+        // A held agent toggle would flip at key-repeat rate.
+        let is_agent_toggle = matches!(
+            press_action,
+            Some(Action::ToggleAgentInput | Action::ToggleWindowAgentInput)
+        );
         let repeat = match repeat {
             Some(value) => value,
-            None => release_action.is_none(),
+            None => release_action.is_none() && !is_agent_toggle,
         };
 
         let action = match (press_action, release_action) {
@@ -1682,6 +1700,30 @@ mod tests {
         assert!(key("Ctrl+Alt_L").conflicts_with(&key("Alt+Ctrl")));
 
         assert!(!key("Ctrl+Alt").conflicts_with(&key("Ctrl+Alt+A")));
+    }
+
+    #[test]
+    fn agent_toggles_dont_repeat_and_kill_switch_ignores_inhibit() {
+        let config = crate::Config::parse_mem(
+            r#"
+            binds {
+                Mod+Alt+A { toggle-agent-input; }
+                Mod+Alt+G { toggle-window-agent-input; }
+                Mod+Alt+H repeat=true allow-inhibiting=true { toggle-agent-input; }
+            }
+            "#,
+        )
+        .unwrap();
+        let [a, g, h] = &config.binds.0[..] else {
+            panic!("expected three binds");
+        };
+        // A held key doesn't flip the toggles at key-repeat rate.
+        assert!(!a.repeat && !g.repeat);
+        // An explicit repeat still applies.
+        assert!(h.repeat);
+        // The kill switch works under a shortcut-inhibiting app, whatever the config says.
+        assert!(!a.allow_inhibiting && !h.allow_inhibiting);
+        assert!(g.allow_inhibiting);
     }
 
     #[test]

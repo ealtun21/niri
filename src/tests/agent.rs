@@ -1,0 +1,1610 @@
+use std::time::{Duration, Instant};
+
+use async_channel::Receiver;
+use insta::assert_snapshot;
+use niri_config::Config;
+use niri_ipc::{AgentButton, AgentDone, AgentError, AgentOp};
+use smithay::backend::input::{InputEvent, InputTime, KeyState, Keycode};
+use smithay::desktop::Window;
+use smithay::input::keyboard::Layout;
+use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_popup::XdgPopup;
+use smithay::utils::{Point, Serial, Size};
+use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
+
+use super::client::{ClientId, PointerEvent};
+use super::*;
+use crate::agent::capture::{capture_precheck, settle_time};
+use crate::agent::pointer::{self, capture_to_buffer};
+use crate::agent::{
+    capture_scale, check_target, keyboard, CaptureRecord, OpKind, DEFAULT_SETTLE, MAX_DRAG_STEPS,
+    MAX_SETTLE, TYPE_CHUNK_CHARS, TYPE_CHUNK_INTERVAL,
+};
+use crate::layout::{ActivateWindow, LayoutElement as _};
+use crate::tests::test_input_backend::{
+    TestInputBackend, TestKeyboardKeyEvent, TestPointerButtonEvent,
+};
+use crate::window::mapped::MappedId;
+
+fn set_up(config: Config) -> (Fixture, MappedId) {
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    let mapped_id = f.niri().layout.windows().next().unwrap().1.id();
+    (f, mapped_id)
+}
+
+fn set_up_blocked_out(target: &str) -> (Fixture, MappedId) {
+    let config = format!(
+        r#"
+window-rule {{
+    block-out-from "{target}"
+}}
+"#
+    );
+    set_up(Config::parse_mem(&config).unwrap())
+}
+
+#[test]
+fn capture_scale_caps_long_edge() {
+    assert!((capture_scale(2.0, Size::from((1920., 1080.)), 1568) - 1568. / 1920.).abs() < 1e-9);
+}
+
+#[test]
+fn capture_scale_keeps_small_window() {
+    assert_eq!(capture_scale(1.0, Size::from((800., 600.)), 1568), 1.0);
+}
+
+#[test]
+fn capture_scale_keeps_hidpi_small() {
+    assert_eq!(capture_scale(2.0, Size::from((500., 400.)), 1568), 2.0);
+}
+
+#[test]
+fn capture_plain_window_is_ok() {
+    let (mut f, id) = set_up(Config::default());
+    assert_eq!(capture_precheck(f.niri(), id), Ok(()));
+}
+
+#[test]
+fn capture_unknown_window_is_window_gone() {
+    let (mut f, _) = set_up(Config::default());
+    let unknown = MappedId::specific(u64::MAX);
+    assert_eq!(
+        capture_precheck(f.niri(), unknown),
+        Err(AgentError::WindowGone)
+    );
+}
+
+#[test]
+fn capture_while_paused_is_paused() {
+    let (mut f, id) = set_up(Config::default());
+    f.niri().agent.paused = true;
+    assert_eq!(capture_precheck(f.niri(), id), Err(AgentError::Paused));
+}
+
+#[test]
+fn capture_blocked_out() {
+    let (mut f, id) = set_up_blocked_out("screen-capture");
+    assert_eq!(capture_precheck(f.niri(), id), Err(AgentError::BlockedOut));
+}
+
+#[test]
+fn capture_blocked_out_from_screencast() {
+    let (mut f, id) = set_up_blocked_out("screencast");
+    assert_eq!(capture_precheck(f.niri(), id), Err(AgentError::BlockedOut));
+}
+
+#[test]
+fn settle_is_capped() {
+    assert_eq!(settle_time(None), DEFAULT_SETTLE);
+    assert_eq!(settle_time(Some(300)), Duration::from_millis(300));
+    assert_eq!(settle_time(Some(u32::MAX)), MAX_SETTLE);
+}
+
+type WlSurface = wayland_client::protocol::wl_surface::WlSurface;
+
+fn map_window(f: &mut Fixture, id: ClientId, app_id: &str) -> WlSurface {
+    map_window_with(f, id, app_id, |_, _| ())
+}
+
+/// Like `map_window`, running `before_map` between the initial commit and the first buffer.
+fn map_window_with(
+    f: &mut Fixture,
+    id: ClientId,
+    app_id: &str,
+    before_map: impl FnOnce(&mut Fixture, &WlSurface),
+) -> WlSurface {
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.set_app_id(app_id);
+    window.commit();
+    f.roundtrip(id);
+    before_map(f, &surface);
+
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_size(100, 100);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    surface
+}
+
+fn window_of(f: &mut Fixture, app_id: &str) -> Window {
+    f.niri()
+        .layout
+        .windows()
+        .find(|(_, m)| {
+            crate::utils::with_toplevel_role(m.toplevel(), |r| r.app_id.as_deref() == Some(app_id))
+        })
+        .unwrap()
+        .1
+        .window
+        .clone()
+}
+
+fn mapped_id(f: &mut Fixture, app_id: &str) -> MappedId {
+    let w = window_of(f, app_id);
+    f.niri()
+        .layout
+        .windows()
+        .find(|(_, m)| m.window == w)
+        .unwrap()
+        .1
+        .id()
+}
+
+/// Human window `a` (focused) and agent window `agent-b` on workspace 2, from another client.
+fn two_clients() -> (Fixture, ClientId, WlSurface, ClientId, WlSurface) {
+    two_clients_with(Config::default())
+}
+
+fn two_clients_with(config: Config) -> (Fixture, ClientId, WlSurface, ClientId, WlSurface) {
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+
+    let human = f.add_client();
+    let a = map_window(&mut f, human, "a");
+    let agent = f.add_client();
+    let b = map_window(&mut f, agent, "agent-b");
+
+    let b_id = window_of(&mut f, "agent-b");
+    f.niri()
+        .layout
+        .move_to_workspace(Some(&b_id), 1, ActivateWindow::No);
+    let a_id = window_of(&mut f, "a");
+    f.niri().layout.activate_window(&a_id);
+    f.niri_state().update_keyboard_focus();
+    f.double_roundtrip(human);
+    f.double_roundtrip(agent);
+    (f, human, a, agent, b)
+}
+
+#[test]
+fn prefix_window_is_granted() {
+    let (mut f, ..) = two_clients();
+    let id = mapped_id(&mut f, "agent-b");
+    assert!(check_target(f.niri(), id, OpKind::Keyboard).is_ok());
+}
+
+#[test]
+fn plain_window_is_not_granted() {
+    let (mut f, human, ..) = two_clients();
+    map_window(&mut f, human, "b");
+    let id = mapped_id(&mut f, "b");
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::NotGranted)
+    );
+}
+
+#[test]
+fn manual_grant_allows() {
+    let (mut f, _, _, agent, _) = two_clients();
+    map_window(&mut f, agent, "b");
+    let id = mapped_id(&mut f, "b");
+    let w = window_of(&mut f, "b");
+    f.niri().agent.granted.insert(id, true);
+    f.niri()
+        .layout
+        .move_to_workspace(Some(&w), 1, ActivateWindow::No);
+    let a = window_of(&mut f, "a");
+    f.niri().layout.activate_window(&a);
+    f.niri_state().update_keyboard_focus();
+    f.double_roundtrip(agent);
+    assert!(check_target(f.niri(), id, OpKind::Keyboard).is_ok());
+}
+
+#[test]
+fn paused_refuses() {
+    let (mut f, ..) = two_clients();
+    let id = mapped_id(&mut f, "agent-b");
+    f.niri().agent.paused = true;
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::Paused)
+    );
+}
+
+#[test]
+fn focused_window_is_human_focused() {
+    let (mut f, ..) = two_clients();
+    let id = mapped_id(&mut f, "a");
+    f.niri().agent.granted.insert(id, true);
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::HumanFocused)
+    );
+}
+
+#[test]
+fn second_window_of_focused_client_is_same_client() {
+    let (mut f, human, ..) = two_clients();
+    map_window(&mut f, human, "agent-a2");
+    let a_id = window_of(&mut f, "a");
+    f.niri().layout.activate_window(&a_id);
+    f.niri_state().update_keyboard_focus();
+    f.double_roundtrip(human);
+    let id = mapped_id(&mut f, "agent-a2");
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::SameClient)
+    );
+}
+
+#[test]
+fn pointer_without_capture_is_no_capture() {
+    let (mut f, ..) = two_clients();
+    let id = mapped_id(&mut f, "agent-b");
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Pointer).err(),
+        Some(AgentError::NoCapture)
+    );
+}
+
+fn record_for(f: &mut Fixture, id: MappedId) -> CaptureRecord {
+    let (mapped, output) = f.niri().find_mapped_output_by_id(id).unwrap();
+    let (window_size, output_scale, popup_count) = crate::agent::window_view(mapped, output);
+    CaptureRecord {
+        origin: (0, 0).into(),
+        scale: 1.,
+        size: (100, 100).into(),
+        window_size,
+        output_scale,
+        popup_count,
+        at: Instant::now(),
+    }
+}
+
+#[test]
+fn fresh_capture_allows_pointer() {
+    let (mut f, ..) = two_clients();
+    let id = mapped_id(&mut f, "agent-b");
+    let record = record_for(&mut f, id);
+    f.niri().agent.captures.insert(id, record);
+    assert!(check_target(f.niri(), id, OpKind::Pointer).is_ok());
+}
+
+#[test]
+fn resize_after_capture_is_stale() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = mapped_id(&mut f, "agent-b");
+    let record = record_for(&mut f, id);
+    f.niri().agent.captures.insert(id, record);
+
+    let window = f.client(agent).window(&b);
+    window.set_size(200, 150);
+    window.commit();
+    f.double_roundtrip(agent);
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Pointer).err(),
+        Some(AgentError::StaleCapture)
+    );
+}
+
+type AgentReply = Result<AgentDone, AgentError>;
+
+fn start_type(f: &mut Fixture, id: MappedId, text: &str) -> Receiver<AgentReply> {
+    let (tx, rx) = async_channel::bounded(1);
+    keyboard::type_text(f.niri_state(), id, text, tx);
+    rx
+}
+
+fn type_now(f: &mut Fixture, id: MappedId, text: &str) -> AgentReply {
+    start_type(f, id, text).try_recv().unwrap()
+}
+
+fn key_now(f: &mut Fixture, id: MappedId, chord: &str, repeat: u16) -> AgentReply {
+    let (tx, rx) = async_channel::bounded(1);
+    keyboard::key(f.niri_state(), id, chord, repeat, tx);
+    rx.try_recv().unwrap()
+}
+
+/// Keyboard events `surface` got since the last call, one per line.
+fn events(f: &mut Fixture, client: ClientId, surface: &WlSurface) -> String {
+    f.double_roundtrip(client);
+    f.client(client)
+        .state
+        .format_recent_keyboard_events(surface)
+}
+
+fn owner_layout(f: &mut Fixture) -> u32 {
+    let state = f.niri_state();
+    let keyboard = state.niri.seat.get_keyboard().unwrap();
+    keyboard.with_xkb_state(state, |ctx| ctx.xkb().lock().unwrap().active_layout().0)
+}
+
+fn set_owner_layout(f: &mut Fixture, layout: u32) {
+    let state = f.niri_state();
+    let keyboard = state.niri.seat.get_keyboard().unwrap();
+    keyboard.with_xkb_state(state, |mut ctx| ctx.set_layout(Layout(layout)));
+}
+
+fn focus_for_owner(f: &mut Fixture, app_id: &str) {
+    let w = window_of(f, app_id);
+    f.niri().layout.activate_window(&w);
+    f.niri_state().update_keyboard_focus();
+}
+
+/// Agent B's id, with the keyboard events from setting up drained.
+fn agent_target(f: &mut Fixture, agent: ClientId, b: &WlSurface) -> MappedId {
+    events(f, agent, b);
+    mapped_id(f, "agent-b")
+}
+
+#[test]
+fn type_reaches_target_only() {
+    let (mut f, human, a, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+    events(&mut f, human, &a);
+
+    type_now(&mut f, id, "hi").unwrap();
+
+    assert_snapshot!(events(&mut f, agent, &b), @"
+    enter: []
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    key pressed: 35
+    key released: 35
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    key pressed: 23
+    key released: 23
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+    assert_eq!(events(&mut f, human, &a), "");
+    let a_surface = window_of(&mut f, "a")
+        .toplevel()
+        .unwrap()
+        .wl_surface()
+        .clone();
+    assert_eq!(f.niri().keyboard_focus.surface(), Some(&a_surface));
+    let keyboard = f.niri().seat.get_keyboard().unwrap();
+    assert_eq!(keyboard.current_focus(), Some(a_surface));
+}
+
+#[test]
+fn sticky_across_calls() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+
+    type_now(&mut f, id, "a").unwrap();
+    type_now(&mut f, id, "b").unwrap();
+
+    let events = events(&mut f, agent, &b);
+    assert_eq!(events.matches("enter").count(), 1, "{events}");
+    assert_eq!(events.matches("leave").count(), 0, "{events}");
+}
+
+#[test]
+fn owner_focusing_sticky_client_leaves_first() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+
+    type_now(&mut f, id, "a").unwrap();
+    focus_for_owner(&mut f, "agent-b");
+
+    let events = events(&mut f, agent, &b);
+    let focus_changes: Vec<_> = events
+        .lines()
+        .filter(|l| l.starts_with("enter") || l.starts_with("leave"))
+        .collect();
+    assert_eq!(
+        focus_changes,
+        ["enter: []", "leave", "enter: []"],
+        "{events}"
+    );
+}
+
+fn us_tr() -> Config {
+    let config = r#"
+input {
+    keyboard {
+        xkb {
+            layout "us,tr"
+        }
+    }
+}
+"#;
+    Config::parse_mem(config).unwrap()
+}
+
+#[test]
+fn turkish_char_uses_group_1() {
+    let (mut f, _, _, agent, b) = two_clients_with(us_tr());
+    let id = agent_target(&mut f, agent, &b);
+
+    type_now(&mut f, id, "ğ").unwrap();
+
+    assert_snapshot!(events(&mut f, agent, &b), @"
+    enter: []
+    modifiers: depressed=0, latched=0, locked=0, group=1
+    key pressed: 26
+    key released: 26
+    modifiers: depressed=0, latched=0, locked=0, group=1
+    ");
+    assert_eq!(owner_layout(&mut f), 0);
+}
+
+#[test]
+fn ascii_while_owner_on_tr_layout() {
+    let (mut f, _, _, agent, b) = two_clients_with(us_tr());
+    let id = agent_target(&mut f, agent, &b);
+    set_owner_layout(&mut f, 1);
+
+    type_now(&mut f, id, "a").unwrap();
+
+    assert_snapshot!(events(&mut f, agent, &b), @"
+    enter: []
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    key pressed: 30
+    key released: 30
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+    assert_eq!(owner_layout(&mut f), 1);
+}
+
+#[test]
+fn unmappable_char_sends_nothing() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+
+    let err = type_now(&mut f, id, "a日").unwrap_err();
+
+    assert_eq!(err, AgentError::UnmappableChar('日'));
+    assert_eq!(events(&mut f, agent, &b), "");
+}
+
+#[test]
+fn empty_type_sends_nothing() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+
+    type_now(&mut f, id, "").unwrap();
+
+    assert_eq!(events(&mut f, agent, &b), "");
+    // No burst, so the handoff guard stays off.
+    assert!(!f.niri().agent.agent_acted_last());
+}
+
+#[test]
+fn paste_chord_refused() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+
+    for chord in ["ctrl+v", "ctrl+shift+v", "shift+Insert", "Ctrl+V"] {
+        let err = key_now(&mut f, id, chord, 1).unwrap_err();
+        assert_eq!(err, AgentError::PasteUnsupported, "{chord}");
+    }
+    assert_eq!(events(&mut f, agent, &b), "");
+}
+
+#[test]
+fn key_chord_with_repeat() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+
+    key_now(&mut f, id, "ctrl+l", 2).unwrap();
+    assert_snapshot!(events(&mut f, agent, &b), @"
+    enter: []
+    modifiers: depressed=4, latched=0, locked=0, group=0
+    key pressed: 38
+    key released: 38
+    modifiers: depressed=4, latched=0, locked=0, group=0
+    key pressed: 38
+    key released: 38
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+
+    for chord in ["ctrl+nosuchkey", "hyper+a", "ctrl+", "", "a\0"] {
+        let err = key_now(&mut f, id, chord, 1).unwrap_err();
+        assert_eq!(err, AgentError::BadChord(chord.to_owned()), "{chord:?}");
+    }
+}
+
+#[test]
+fn idle_release_sends_leave() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "a").unwrap();
+    events(&mut f, agent, &b);
+
+    f.niri()
+        .agent
+        .release_if_idle(Instant::now() + Duration::from_secs(9));
+    assert_eq!(events(&mut f, agent, &b), "");
+
+    f.niri()
+        .agent
+        .release_if_idle(Instant::now() + Duration::from_secs(11));
+    assert_eq!(events(&mut f, agent, &b), "leave");
+}
+
+/// Runs the next `type` chunk: waits out its timer, then dispatches the server once.
+///
+/// Each chunk arms the next one's timer when it runs, so one call runs exactly one chunk.
+fn step_chunk(f: &mut Fixture) {
+    std::thread::sleep(TYPE_CHUNK_INTERVAL);
+    f.state.server.dispatch();
+}
+
+#[test]
+fn long_type_paces_chunks() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+
+    let rx = start_type(&mut f, id, &"a".repeat(2500));
+    // The next chunk waits for its timer, not just for the next dispatch.
+    f.state.server.dispatch();
+    assert!(rx.is_empty());
+    step_chunk(&mut f);
+    // Read without dispatching the server, or the test socket fills up.
+    f.client(agent).dispatch();
+    assert!(rx.is_empty());
+    step_chunk(&mut f);
+    assert!(rx.try_recv().unwrap().is_ok());
+
+    let events = events(&mut f, agent, &b);
+    assert_eq!(events.matches("key pressed: 30").count(), 2500);
+}
+
+#[test]
+fn next_chunk_waits_for_interval() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+
+    let rx = start_type(&mut f, id, &"a".repeat(2 * TYPE_CHUNK_CHARS));
+    // A slow client gets 200 ms to read each chunk.
+    std::thread::sleep(Duration::from_millis(100));
+    f.state.server.dispatch();
+    assert!(rx.is_empty());
+    f.client(agent).dispatch();
+    step_chunk(&mut f);
+    assert!(rx.try_recv().unwrap().is_ok());
+}
+
+fn assert_interrupted_after_first_chunk(
+    f: &mut Fixture,
+    rx: &Receiver<AgentReply>,
+    agent: ClientId,
+    b: &WlSurface,
+) {
+    let err = rx.try_recv().unwrap().unwrap_err();
+    assert_eq!(
+        err,
+        AgentError::Interrupted {
+            error: Box::new(AgentError::HumanFocused),
+            typed: 1000
+        }
+    );
+    let events = events(f, agent, b);
+    assert_eq!(events.matches("key pressed").count(), 1000);
+    let (_, after_leave) = events.split_once("leave").unwrap();
+    assert!(!after_leave.contains("key"), "{after_leave}");
+}
+
+#[test]
+fn owner_focus_between_chunks_interrupts() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+
+    let rx = start_type(&mut f, id, &"a".repeat(2500));
+    focus_for_owner(&mut f, "agent-b");
+    step_chunk(&mut f);
+
+    assert_interrupted_after_first_chunk(&mut f, &rx, agent, &b);
+}
+
+#[test]
+fn owner_focus_not_yet_refreshed_interrupts() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+
+    let rx = start_type(&mut f, id, &"a".repeat(2500));
+    // A focus bind moves the layout focus; niri.keyboard_focus catches up only in refresh, which
+    // runs after the chunk in the same loop pass.
+    let w = window_of(&mut f, "agent-b");
+    f.niri().layout.activate_window(&w);
+    step_chunk(&mut f);
+
+    assert_interrupted_after_first_chunk(&mut f, &rx, agent, &b);
+}
+
+fn rec(origin: (i32, i32), scale: f64) -> CaptureRecord {
+    CaptureRecord {
+        origin: origin.into(),
+        scale,
+        size: (100, 100).into(),
+        window_size: (100, 100).into(),
+        output_scale: scale,
+        popup_count: 0,
+        at: Instant::now(),
+    }
+}
+
+#[test]
+fn capture_to_buffer_scale_1() {
+    let rec = rec((0, 0), 1.0);
+    assert_eq!(capture_to_buffer(10., 20., &rec), Point::from((10., 20.)));
+}
+
+#[test]
+fn capture_to_buffer_fractional_with_csd_origin() {
+    let rec = rec((-23, -23), 1.5);
+    let p = capture_to_buffer(150., 75., &rec);
+    assert!((p.x - 84.666_666).abs() < 0.5 && (p.y - 34.666_666).abs() < 0.5);
+}
+
+fn pointer_now(f: &mut Fixture, id: MappedId, op: AgentOp) -> AgentReply {
+    let (tx, rx) = async_channel::bounded(1);
+    pointer::pointer(f.niri_state(), id, &op, tx);
+    rx.try_recv().unwrap()
+}
+
+fn pointer_events(f: &mut Fixture, client: ClientId, surface: &WlSurface) -> Vec<PointerEvent> {
+    f.double_roundtrip(client);
+    let surface = f.client(client).state.surfaces.get_mut(surface).unwrap();
+    std::mem::take(&mut surface.pointer_events_received)
+}
+
+fn click(x: f64, y: f64) -> AgentOp {
+    AgentOp::Click {
+        x,
+        y,
+        button: AgentButton::Left,
+        count: 1,
+        mods: Vec::new(),
+    }
+}
+
+fn captured_target(f: &mut Fixture, agent: ClientId, b: &WlSurface) -> MappedId {
+    let id = agent_target(f, agent, b);
+    let record = record_for(f, id);
+    f.niri().agent.captures.insert(id, record);
+    pointer_events(f, agent, b);
+    id
+}
+
+#[test]
+fn click_reaches_target_only() {
+    let (mut f, human, a, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+    pointer_events(&mut f, human, &a);
+    let location = f.niri().seat.get_pointer().unwrap().current_location();
+
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+
+    use PointerEvent::*;
+    let button = |state| Button {
+        serial: 0,
+        button: 0x110,
+        state,
+    };
+    let mut got = pointer_events(&mut f, agent, &b);
+    for event in &mut got {
+        if let Button { serial, .. } = event {
+            *serial = 0;
+        }
+    }
+    assert_eq!(
+        got,
+        [
+            Enter { x: 10., y: 10. },
+            Frame,
+            Motion { x: 10., y: 10. },
+            Frame,
+            button(ButtonState::Pressed),
+            Frame,
+            button(ButtonState::Released),
+            Frame,
+            Leave,
+            Frame,
+        ]
+    );
+    assert_eq!(pointer_events(&mut f, human, &a), []);
+    assert_eq!(
+        f.niri().seat.get_pointer().unwrap().current_location(),
+        location
+    );
+}
+
+#[test]
+fn scroll_sends_value120() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+
+    let op = AgentOp::Scroll {
+        x: 5.,
+        y: 5.,
+        dx: 0.,
+        dy: 3.,
+    };
+    pointer_now(&mut f, id, op).unwrap();
+
+    let got = pointer_events(&mut f, agent, &b);
+    assert_eq!(
+        got[4..8],
+        [
+            PointerEvent::AxisSource(wayland_client::protocol::wl_pointer::AxisSource::Wheel),
+            PointerEvent::AxisValue120 {
+                axis: Axis::VerticalScroll,
+                value120: 360
+            },
+            PointerEvent::Axis {
+                axis: Axis::VerticalScroll,
+                value: 45.
+            },
+            PointerEvent::Frame
+        ]
+    );
+}
+
+#[test]
+fn click_after_close_is_window_gone() {
+    let (mut f, human, a, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+    pointer_events(&mut f, human, &a);
+
+    let window = f.client(agent).window(&b);
+    window.attach_null();
+    window.commit();
+    f.double_roundtrip(agent);
+
+    assert_eq!(
+        pointer_now(&mut f, id, click(10., 10.)).err(),
+        Some(AgentError::WindowGone)
+    );
+    assert_eq!(pointer_events(&mut f, human, &a), []);
+}
+
+#[test]
+fn click_with_mods_wraps_clicks_in_modifiers() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+
+    let op = AgentOp::Click {
+        x: 10.,
+        y: 10.,
+        button: AgentButton::Left,
+        count: 1,
+        mods: vec![niri_ipc::AgentMod::Ctrl],
+    };
+    pointer_now(&mut f, id, op).unwrap();
+
+    assert_snapshot!(events(&mut f, agent, &b), @"
+    enter: []
+    modifiers: depressed=4, latched=0, locked=0, group=0
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+}
+
+#[test]
+fn drag_presses_moves_and_releases() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+
+    let op = AgentOp::Drag {
+        x0: 10.,
+        y0: 10.,
+        x1: 30.,
+        y1: 10.,
+        steps: 2,
+    };
+    pointer_now(&mut f, id, op).unwrap();
+
+    let motions: Vec<_> = pointer_events(&mut f, agent, &b)
+        .into_iter()
+        .filter_map(|e| match e {
+            PointerEvent::Motion { x, .. } => Some(x),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(motions, [10., 20., 30.]);
+}
+
+#[test]
+fn drag_steps_are_capped() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+
+    let op = AgentOp::Drag {
+        x0: 10.,
+        y0: 10.,
+        x1: 30.,
+        y1: 10.,
+        steps: MAX_DRAG_STEPS + 500,
+    };
+    pointer_now(&mut f, id, op).unwrap();
+
+    let motions = pointer_events(&mut f, agent, &b)
+        .into_iter()
+        .filter(|e| matches!(e, PointerEvent::Motion { .. }))
+        .count();
+    // The motion to the start point, then one per step.
+    assert_eq!(motions, 1 + usize::from(MAX_DRAG_STEPS));
+}
+
+#[test]
+fn click_serial_survives_drags_and_typing() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let serial = agent_click_serial(&mut f, agent, &b);
+    let id = mapped_id(&mut f, "agent-b");
+
+    // Chromium may ask for its activation token long after the click.
+    let drag = AgentOp::Drag {
+        x0: 10.,
+        y0: 10.,
+        x1: 30.,
+        y1: 10.,
+        steps: MAX_DRAG_STEPS,
+    };
+    for _ in 0..3 {
+        pointer_now(&mut f, id, drag.clone()).unwrap();
+        pointer_events(&mut f, agent, &b);
+    }
+    type_now(&mut f, id, &"a".repeat(TYPE_CHUNK_CHARS)).unwrap();
+    events(&mut f, agent, &b);
+
+    assert!(f.niri().agent.is_agent_serial(Serial::from(serial)));
+}
+
+#[test]
+fn click_with_mods_keeps_owner_layout_group() {
+    let (mut f, _, _, agent, b) = two_clients_with(us_tr());
+    let id = captured_target(&mut f, agent, &b);
+    set_owner_layout(&mut f, 1);
+
+    let op = AgentOp::Click {
+        x: 10.,
+        y: 10.,
+        button: AgentButton::Left,
+        count: 1,
+        mods: vec![niri_ipc::AgentMod::Ctrl],
+    };
+    pointer_now(&mut f, id, op).unwrap();
+
+    assert_snapshot!(events(&mut f, agent, &b), @"
+    enter: []
+    modifiers: depressed=4, latched=0, locked=0, group=1
+    modifiers: depressed=0, latched=0, locked=0, group=1
+    ");
+    assert_eq!(owner_layout(&mut f), 1);
+}
+
+/// Like the owner's config: tokens with any serial are honored.
+const HONOR_INVALID_SERIAL: &str = "debug { honor-xdg-activation-with-invalid-serial; }";
+
+fn honor_invalid_serial() -> Config {
+    Config::parse_mem(HONOR_INVALID_SERIAL).unwrap()
+}
+
+/// A serial no event ever had.
+const BOGUS_SERIAL: u32 = u32::MAX;
+
+fn activation_token(
+    f: &mut Fixture,
+    id: ClientId,
+    serial: Option<u32>,
+    surface: Option<&WlSurface>,
+) -> String {
+    let token = f.client(id).state.activation_token(serial, surface);
+    f.roundtrip(id);
+    token.get().unwrap().clone()
+}
+
+/// The client asks for a token with the serial and activates its surface with it.
+fn self_activate(f: &mut Fixture, id: ClientId, serial: Option<u32>, surface: &WlSurface) {
+    let token = activation_token(f, id, serial, Some(surface));
+    f.client(id).state.activate(&token, surface);
+    f.double_roundtrip(id);
+}
+
+fn focused_app_id(f: &mut Fixture) -> Option<String> {
+    let mapped = f.niri().layout.focus()?;
+    crate::utils::with_toplevel_role(mapped.toplevel(), |r| r.app_id.clone())
+}
+
+fn is_urgent(f: &mut Fixture, app_id: &str) -> bool {
+    let id = mapped_id(f, app_id);
+    f.niri().find_mapped_output_by_id(id).unwrap().0.is_urgent()
+}
+
+fn workspace_idx(f: &mut Fixture, app_id: &str) -> usize {
+    let w = window_of(f, app_id);
+    f.niri()
+        .layout
+        .workspaces()
+        .find(|(_, _, ws)| ws.has_window(&w))
+        .unwrap()
+        .1
+}
+
+/// `two_clients` with the owner's activation flag, plus window `c` of a third client, which
+/// the owner already runs.
+fn three_clients() -> (Fixture, ClientId, WlSurface, ClientId, WlSurface) {
+    three_clients_with(honor_invalid_serial())
+}
+
+fn three_clients_with(config: Config) -> (Fixture, ClientId, WlSurface, ClientId, WlSurface) {
+    let (mut f, human, _, agent, b) = two_clients_with(config);
+    let other = f.add_client();
+    let c = map_window(&mut f, other, "c");
+    focus_for_owner(&mut f, "a");
+    f.double_roundtrip(human);
+    f.double_roundtrip(other);
+    (f, agent, b, other, c)
+}
+
+fn physical_key_event(f: &mut Fixture, state: KeyState) {
+    f.niri_state()
+        .process_input_event(InputEvent::<TestInputBackend>::Keyboard {
+            event: TestKeyboardKeyEvent {
+                time: InputTime::from_micros(0),
+                // KEY_A.
+                code: Keycode::new(38),
+                state,
+                count: 1,
+            },
+        });
+}
+
+fn physical_key(f: &mut Fixture) {
+    physical_key_event(f, KeyState::Pressed);
+    physical_key_event(f, KeyState::Released);
+}
+
+/// The agent clicks B; returns the serial of the button press.
+fn agent_click_serial(f: &mut Fixture, agent: ClientId, b: &WlSurface) -> u32 {
+    let id = captured_target(f, agent, b);
+    pointer_now(f, id, click(10., 10.)).unwrap();
+    pointer_events(f, agent, b)
+        .into_iter()
+        .find_map(|e| match e {
+            PointerEvent::Button { serial, .. } => Some(serial),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn agent_serial_token_rejected() {
+    let (mut f, _, _, agent, b) = two_clients_with(honor_invalid_serial());
+    let serial = agent_click_serial(&mut f, agent, &b);
+    self_activate(&mut f, agent, Some(serial), &b);
+
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+    assert!(!is_urgent(&mut f, "agent-b"));
+}
+
+#[test]
+fn handoff_activation_is_urgent_only() {
+    let (mut f, agent, b, other, c) = three_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+
+    self_activate(&mut f, other, Some(BOGUS_SERIAL), &c);
+
+    assert!(is_urgent(&mut f, "c"));
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+}
+
+#[test]
+fn handoff_guard_beats_focus_rule() {
+    let config = format!(r#"{HONOR_INVALID_SERIAL}; window-rule {{ on-xdg-activate "focus"; }}"#);
+    let (mut f, agent, b, other, c) = three_clients_with(Config::parse_mem(&config).unwrap());
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+
+    // Without a serial: also covers tokens that skip the serial checks.
+    self_activate(&mut f, other, None, &c);
+
+    assert!(is_urgent(&mut f, "c"));
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+}
+
+#[test]
+fn virtual_input_keeps_handoff_guard() {
+    let (mut f, agent, b, other, c) = three_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+
+    let pointer = f.client(other).state.virtual_pointer();
+    pointer.axis(0, Axis::VerticalScroll, 10.);
+    pointer.frame();
+    f.roundtrip(other);
+    self_activate(&mut f, other, Some(BOGUS_SERIAL), &c);
+
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+}
+
+#[test]
+fn owner_input_restores_activation() {
+    let (mut f, agent, b, other, c) = three_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+
+    physical_key(&mut f);
+    self_activate(&mut f, other, Some(BOGUS_SERIAL), &c);
+
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("c"));
+}
+
+#[test]
+fn held_key_release_keeps_handoff_guard() {
+    let (mut f, agent, b, other, c) = three_clients();
+    physical_key_event(&mut f, KeyState::Pressed);
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+
+    // Releasing a key held since before the burst isn't the owner acting after the agent.
+    physical_key_event(&mut f, KeyState::Released);
+    self_activate(&mut f, other, Some(BOGUS_SERIAL), &c);
+
+    assert!(is_urgent(&mut f, "c"));
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+}
+
+#[test]
+fn spawn_token_after_agent_burst_is_urgent_only() {
+    let (mut f, agent, b, other, c) = three_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+
+    // `spawn` hands the child a token niri makes itself, which never passes `token_created`.
+    // kitty activates its new window with it after mapping (harness, 2026-11-20).
+    let token = f
+        .niri()
+        .activation_state
+        .create_external_token(None)
+        .0
+        .clone();
+    f.client(other).state.activate(token.as_str(), &c);
+    f.double_roundtrip(other);
+
+    assert!(is_urgent(&mut f, "c"));
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+}
+
+#[test]
+fn agent_window_spawn_token_is_urgent_only() {
+    let (mut f, _, _, agent, b) = two_clients();
+    // The owner acted last, so the handoff guard is off.
+    physical_key(&mut f);
+
+    // `niri msg action spawn` hands the agent app a token niri makes itself.
+    let token = f
+        .niri()
+        .activation_state
+        .create_external_token(None)
+        .0
+        .clone();
+    f.client(agent).state.activate(token.as_str(), &b);
+    f.double_roundtrip(agent);
+
+    assert!(is_urgent(&mut f, "agent-b"));
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+
+    // The owner can still focus it by keybind.
+    let id = mapped_id(&mut f, "agent-b");
+    f.niri_state().do_action(
+        niri_config::Action::FocusWindow(id.get()),
+        false,
+        InputTime::from_micros(0),
+    );
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("agent-b"));
+}
+
+#[test]
+fn agent_window_mapping_with_spawn_token_not_focused() {
+    let (mut f, ..) = two_clients();
+    physical_key(&mut f);
+    let spawned = f.add_client();
+    let token = f
+        .niri()
+        .activation_state
+        .create_external_token(None)
+        .0
+        .clone();
+
+    map_window_with(&mut f, spawned, "agent-c", |f, surface| {
+        f.client(spawned).state.activate(token.as_str(), surface);
+        f.roundtrip(spawned);
+    });
+
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+}
+
+#[test]
+fn guarded_token_on_unmapped_window_stays_urgent_only() {
+    let (mut f, agent, b, other, _) = three_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+
+    map_window_with(&mut f, other, "c2", |f, surface| {
+        let token = activation_token(f, other, Some(BOGUS_SERIAL), Some(surface));
+        f.client(other).state.activate(&token, surface);
+        f.roundtrip(other);
+        // The owner acting after the token was made doesn't lift its guard.
+        physical_key(f);
+    });
+
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+    assert!(is_urgent(&mut f, "c2"));
+}
+
+#[test]
+fn new_window_from_agent_client_stays_put() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+    // Holds even when the owner acted after the agent, and for a window with a valid token.
+    physical_key(&mut f);
+    let token = activation_token(&mut f, agent, None, None);
+
+    map_window_with(&mut f, agent, "b2", |f, surface| {
+        f.client(agent).state.activate(&token, surface);
+    });
+
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+    assert_eq!(workspace_idx(&mut f, "b2"), 1);
+}
+
+#[test]
+fn new_window_from_owner_focused_agent_client_focuses() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+    focus_for_owner(&mut f, "agent-b");
+    physical_key(&mut f);
+
+    map_window(&mut f, agent, "b2");
+
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("b2"));
+}
+
+#[test]
+fn handoff_new_window_not_focused() {
+    let (mut f, agent, b, other, _) = three_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+
+    map_window(&mut f, other, "c2");
+
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+}
+
+#[test]
+fn owner_launch_still_focuses() {
+    let (mut f, _, _, other, _) = three_clients();
+    map_window(&mut f, other, "c2");
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("c2"));
+}
+
+/// B opens a popup that grabs with the serial.
+fn open_popup(
+    f: &mut Fixture,
+    agent: ClientId,
+    b: &WlSurface,
+    serial: Option<u32>,
+) -> (WlSurface, XdgPopup) {
+    let parent = f.client(agent).window(b).xdg_surface.clone();
+    let popup = f.client(agent).state.create_popup(&parent, serial);
+    f.double_roundtrip(agent);
+    popup
+}
+
+/// The agent clicks B, and B opens a menu that grabs with that click.
+fn agent_popup(f: &mut Fixture, agent: ClientId, b: &WlSurface) -> (WlSurface, XdgPopup) {
+    let serial = agent_click_serial(f, agent, b);
+    open_popup(f, agent, b, Some(serial))
+}
+
+fn popup_done(f: &mut Fixture, agent: ClientId, popup: &XdgPopup) -> bool {
+    f.double_roundtrip(agent);
+    f.client(agent).state.popups_done.contains(popup)
+}
+
+fn physical_click(f: &mut Fixture) {
+    use smithay::backend::input::ButtonState;
+    for state in [ButtonState::Pressed, ButtonState::Released] {
+        let event = TestPointerButtonEvent {
+            button: 0x110,
+            state,
+        };
+        f.niri_state()
+            .process_input_event(InputEvent::<TestInputBackend>::PointerButton { event });
+    }
+}
+
+/// The compositor side of the window's surface.
+fn server_surface(
+    f: &mut Fixture,
+    app_id: &str,
+) -> smithay::reexports::wayland_server::protocol::wl_surface::WlSurface {
+    window_of(f, app_id)
+        .toplevel()
+        .unwrap()
+        .wl_surface()
+        .clone()
+}
+
+#[test]
+fn agent_popup_survives() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let (_, popup) = agent_popup(&mut f, agent, &b);
+
+    assert!(!popup_done(&mut f, agent, &popup));
+    assert!(f.niri().popup_grab.is_none());
+    let a = server_surface(&mut f, "a");
+    assert_eq!(f.niri().keyboard_focus.surface(), Some(&a));
+    let keyboard = f.niri().seat.get_keyboard().unwrap();
+    assert_eq!(keyboard.current_focus(), Some(a));
+}
+
+#[test]
+fn agent_keys_go_to_popup() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "a").unwrap();
+    events(&mut f, agent, &b);
+    let (menu, _) = agent_popup(&mut f, agent, &b);
+
+    type_now(&mut f, id, "x").unwrap();
+
+    assert_eq!(events(&mut f, agent, &b), "leave");
+    assert_snapshot!(events(&mut f, agent, &menu), @"
+    enter: []
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    key pressed: 45
+    key released: 45
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+}
+
+#[test]
+fn keys_return_to_window_after_popup_closes() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+    let (menu, popup) = agent_popup(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+    events(&mut f, agent, &menu);
+
+    popup.destroy();
+    f.double_roundtrip(agent);
+    type_now(&mut f, id, "y").unwrap();
+
+    assert_eq!(events(&mut f, agent, &menu), "leave");
+    assert_snapshot!(events(&mut f, agent, &b), @"
+    enter: []
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    key pressed: 21
+    key released: 21
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+}
+
+/// Moves B next to A, on the owner's workspace, keeping A focused.
+fn b_on_owner_workspace(f: &mut Fixture, human: ClientId) {
+    let w = window_of(f, "agent-b");
+    f.niri()
+        .layout
+        .move_to_workspace(Some(&w), 0, ActivateWindow::No);
+    focus_for_owner(f, "a");
+    f.double_roundtrip(human);
+}
+
+#[test]
+fn owner_click_dismisses_visible_popup() {
+    let (mut f, human, _, agent, b) = two_clients();
+    b_on_owner_workspace(&mut f, human);
+    let (_, popup) = agent_popup(&mut f, agent, &b);
+    assert!(!popup_done(&mut f, agent, &popup));
+
+    physical_click(&mut f);
+
+    assert!(popup_done(&mut f, agent, &popup));
+    let a = server_surface(&mut f, "a");
+    assert_eq!(f.niri().keyboard_focus.surface(), Some(&a));
+}
+
+#[test]
+fn owner_focusing_window_dismisses() {
+    let (mut f, human, _, agent, b) = two_clients();
+    b_on_owner_workspace(&mut f, human);
+    let (_, popup) = agent_popup(&mut f, agent, &b);
+    assert!(!popup_done(&mut f, agent, &popup));
+
+    focus_for_owner(&mut f, "agent-b");
+
+    assert!(popup_done(&mut f, agent, &popup));
+}
+
+#[test]
+fn owner_click_keeps_hidden_popup() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let (_, popup) = agent_popup(&mut f, agent, &b);
+
+    physical_click(&mut f);
+
+    assert!(!popup_done(&mut f, agent, &popup));
+}
+
+#[test]
+fn owner_switch_to_workspace_dismisses() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let (_, popup) = agent_popup(&mut f, agent, &b);
+    assert!(!popup_done(&mut f, agent, &popup));
+
+    f.niri().layout.switch_workspace(1);
+
+    assert!(popup_done(&mut f, agent, &popup));
+}
+
+#[test]
+fn overview_showing_popup_dismisses() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let (_, popup) = agent_popup(&mut f, agent, &b);
+    assert!(!popup_done(&mut f, agent, &popup));
+
+    // The overview shows workspace 2 without focusing B.
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+
+    assert!(popup_done(&mut f, agent, &popup));
+    let b = server_surface(&mut f, "agent-b");
+    assert_ne!(f.niri().keyboard_focus.surface(), Some(&b));
+}
+
+#[test]
+fn idle_release_dismisses_popups() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let (_, popup) = agent_popup(&mut f, agent, &b);
+    assert!(!popup_done(&mut f, agent, &popup));
+
+    f.niri()
+        .agent
+        .release_if_idle(Instant::now() + Duration::from_secs(11));
+
+    assert!(popup_done(&mut f, agent, &popup));
+}
+
+#[test]
+fn non_agent_grab_still_dismissed_when_unfocused() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let (_, popup) = open_popup(&mut f, agent, &b, Some(BOGUS_SERIAL));
+    assert!(popup_done(&mut f, agent, &popup));
+}
+
+const OWNER_BINDS: &str = r#"
+binds {
+    Mod+Alt+A { toggle-agent-input; }
+    Mod+Alt+G { toggle-window-agent-input; }
+}
+"#;
+
+/// Presses and releases Mod+Alt+`key` (evdev code + 8) on the physical keyboard.
+fn owner_bind(f: &mut Fixture, key: u32) {
+    // Super_L and Alt_L.
+    let keys = [133, 64, key];
+    for (keys, state) in [
+        (keys.to_vec(), KeyState::Pressed),
+        (keys.into_iter().rev().collect(), KeyState::Released),
+    ] {
+        for code in keys {
+            f.niri_state()
+                .process_input_event(InputEvent::<TestInputBackend>::Keyboard {
+                    event: TestKeyboardKeyEvent {
+                        time: InputTime::from_micros(0),
+                        code: Keycode::new(code),
+                        state,
+                        count: 1,
+                    },
+                });
+        }
+    }
+}
+
+const KEY_A: u32 = 38;
+const KEY_G: u32 = 42;
+
+#[test]
+fn owner_bind_config_parses() {
+    let config = Config::parse_mem(&format!(
+        "{OWNER_BINDS}\nwindow-rule {{ match is-agent-granted=true is-agent-active=false; }}"
+    ))
+    .unwrap();
+    assert_eq!(config.binds.0.len(), 2);
+    let rule = &config.window_rules[0];
+    assert_eq!(rule.matches[0].is_agent_granted, Some(true));
+    assert_eq!(rule.matches[0].is_agent_active, Some(false));
+}
+
+#[test]
+fn agent_bind_allowed_rejects_virtual() {
+    use niri_config::Action;
+
+    use crate::input::agent_bind_allowed;
+    assert!(!agent_bind_allowed(&Action::ToggleAgentInput, true));
+    assert!(!agent_bind_allowed(&Action::ToggleWindowAgentInput, true));
+    assert!(agent_bind_allowed(&Action::ToggleAgentInput, false));
+    assert!(agent_bind_allowed(&Action::Spawn(vec![]), true));
+}
+
+#[test]
+fn physical_bind_pauses() {
+    let (mut f, ..) = two_clients_with(Config::parse_mem(OWNER_BINDS).unwrap());
+    owner_bind(&mut f, KEY_A);
+    assert!(f.niri().agent.paused);
+    owner_bind(&mut f, KEY_A);
+    assert!(!f.niri().agent.paused);
+}
+
+#[test]
+fn pause_mid_type_stops_and_releases() {
+    let (mut f, _, _, agent, b) = two_clients_with(Config::parse_mem(OWNER_BINDS).unwrap());
+    let (menu, popup) = agent_popup(&mut f, agent, &b);
+    let id = agent_target(&mut f, agent, &b);
+
+    // The chunks go to the open menu, which holds the shadow focus.
+    let rx = start_type(&mut f, id, &"a".repeat(2500));
+    owner_bind(&mut f, KEY_A);
+    step_chunk(&mut f);
+
+    assert_eq!(
+        rx.try_recv().unwrap().unwrap_err(),
+        AgentError::Interrupted {
+            error: Box::new(AgentError::Paused),
+            typed: 1000
+        }
+    );
+    let events = events(&mut f, agent, &menu);
+    assert_eq!(events.matches("key pressed").count(), 1000);
+    let (_, after_leave) = events.split_once("leave").unwrap();
+    assert!(!after_leave.contains("key"), "{after_leave}");
+    assert!(popup_done(&mut f, agent, &popup));
+}
+
+#[test]
+fn grant_bind_grants_focused() {
+    let (mut f, human, ..) = two_clients_with(Config::parse_mem(OWNER_BINDS).unwrap());
+    map_window(&mut f, human, "d");
+    let id = mapped_id(&mut f, "d");
+    focus_for_owner(&mut f, "d");
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::NotGranted)
+    );
+
+    owner_bind(&mut f, KEY_G);
+
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::HumanFocused)
+    );
+    owner_bind(&mut f, KEY_G);
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::NotGranted)
+    );
+}
+
+#[test]
+fn grant_bind_revokes_agent_window() {
+    let (mut f, ..) = two_clients_with(Config::parse_mem(OWNER_BINDS).unwrap());
+    let id = mapped_id(&mut f, "agent-b");
+
+    focus_for_owner(&mut f, "agent-b");
+    owner_bind(&mut f, KEY_G);
+    focus_for_owner(&mut f, "a");
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::NotGranted)
+    );
+
+    focus_for_owner(&mut f, "agent-b");
+    owner_bind(&mut f, KEY_G);
+    focus_for_owner(&mut f, "a");
+    assert!(check_target(f.niri(), id, OpKind::Keyboard).is_ok());
+}
+
+const OPACITY_RULE: &str = r#"
+window-rule {
+    match is-agent-granted=true
+    opacity 0.5
+}
+"#;
+
+fn opacity_of(f: &mut Fixture, app_id: &str) -> Option<f32> {
+    let id = mapped_id(f, app_id);
+    f.niri()
+        .layout
+        .windows()
+        .find(|(_, m)| m.id() == id)
+        .unwrap()
+        .1
+        .rules()
+        .opacity
+}
+
+#[test]
+fn matcher_is_agent_granted() {
+    let (mut f, human, _, agent, _) = two_clients_with(Config::parse_mem(OPACITY_RULE).unwrap());
+    assert_eq!(opacity_of(&mut f, "agent-b"), Some(0.5));
+    assert_eq!(opacity_of(&mut f, "a"), None);
+
+    // The keybind source follows too, and an app id change updates the flag.
+    map_window(&mut f, human, "c");
+    assert_eq!(opacity_of(&mut f, "c"), None);
+    let c = mapped_id(&mut f, "c");
+    f.niri().agent.granted.insert(c, true);
+    f.niri_state().refresh_and_flush_clients();
+    assert_eq!(opacity_of(&mut f, "c"), Some(0.5));
+    f.niri().agent.granted.remove(&c);
+
+    let surface = map_window(&mut f, agent, "plain");
+    assert_eq!(opacity_of(&mut f, "plain"), None);
+    f.client(agent).window(&surface).set_app_id("agent-plain");
+    f.client(agent).window(&surface).commit();
+    f.double_roundtrip(agent);
+    assert_eq!(opacity_of(&mut f, "agent-plain"), Some(0.5));
+}
+
+#[test]
+fn pause_clears_is_agent_granted() {
+    let config = format!("{OWNER_BINDS}{OPACITY_RULE}");
+    let (mut f, ..) = two_clients_with(Config::parse_mem(&config).unwrap());
+    assert_eq!(opacity_of(&mut f, "agent-b"), Some(0.5));
+
+    owner_bind(&mut f, KEY_A);
+    f.niri_state().refresh_and_flush_clients();
+    assert_eq!(opacity_of(&mut f, "agent-b"), None);
+
+    owner_bind(&mut f, KEY_A);
+    f.niri_state().refresh_and_flush_clients();
+    assert_eq!(opacity_of(&mut f, "agent-b"), Some(0.5));
+}
+
+#[test]
+fn matcher_is_agent_active_expires() {
+    let config = "window-rule {\n match is-agent-active=true\n opacity 0.5\n}";
+    let (mut f, _, _, agent, b) = two_clients_with(Config::parse_mem(config).unwrap());
+    let id = agent_target(&mut f, agent, &b);
+    assert_eq!(opacity_of(&mut f, "agent-b"), None);
+
+    type_now(&mut f, id, "x").unwrap();
+    f.niri_state().refresh_and_flush_clients();
+    assert_eq!(opacity_of(&mut f, "agent-b"), Some(0.5));
+
+    f.niri().agent.active_until.insert(id, Instant::now());
+    f.niri_state().refresh_and_flush_clients();
+    assert_eq!(opacity_of(&mut f, "agent-b"), None);
+}

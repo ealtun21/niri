@@ -71,6 +71,7 @@ use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
 
+use crate::agent::AgentGuardMarker;
 pub use crate::handlers::xdg_shell::KdeDecorationsModeState;
 use crate::input::click_grab::ClickGrab;
 use crate::layout::workspace::WorkspaceId;
@@ -768,6 +769,20 @@ impl XdgActivationHandler for State {
     }
 
     fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        // Agent guards, before the debug flag below, which would accept any serial. Clients such
+        // as Chromium ask for several tokens per click; each of them lands here.
+        let agent = &self.niri.agent;
+        if let Some((serial, _)) = &data.serial {
+            if agent.is_agent_serial(*serial) {
+                return false;
+            }
+        }
+        if agent.agent_acted_last() {
+            data.user_data.insert_if_missing(|| AgentGuardMarker);
+            data.user_data.insert_if_missing(|| UrgentOnlyMarker);
+            return true;
+        }
+
         // Tokens without a serial are urgency-only. This is not specified, but it seems to be the
         // common client behavior.
         //
@@ -816,7 +831,19 @@ impl XdgActivationHandler for State {
         if token_data.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT {
             if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&surface) {
                 let window = mapped.window.clone();
-                match mapped.rules().on_xdg_activate {
+                // The agent guard comes before the window rules, so that a focus rule can't
+                // override it. Checking at request time also covers the tokens niri makes itself
+                // (spawn), which never pass token_created(). Agent windows never take focus by
+                // themselves; the owner focuses them by click or keybind.
+                let guarded = token_data.user_data.get::<AgentGuardMarker>().is_some()
+                    || self.niri.agent.agent_acted_last()
+                    || crate::agent::has_agent_app_id(mapped);
+                let on_xdg_activate = if guarded {
+                    Some(niri_config::OnXdgActivate::SetUrgent)
+                } else {
+                    mapped.rules().on_xdg_activate
+                };
+                match on_xdg_activate {
                     Some(niri_config::OnXdgActivate::Ignore) => {}
                     Some(niri_config::OnXdgActivate::SetUrgent) => {
                         mapped.set_urgent(true);

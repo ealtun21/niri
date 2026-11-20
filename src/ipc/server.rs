@@ -17,8 +17,8 @@ use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, Fu
 use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
-    Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
-    Timestamp, WindowLayout, Workspace,
+    Action, AgentOp, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request,
+    Response, Timestamp, WindowLayout, Workspace,
 };
 use smithay::backend::input::InputTime;
 use smithay::desktop::layer_map_for_output;
@@ -37,6 +37,7 @@ use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
 use crate::utils::{version, with_toplevel_role};
+use crate::window::mapped::MappedId;
 use crate::window::Mapped;
 
 // If an event stream client fails to read events fast enough that we accumulate more than this
@@ -458,6 +459,46 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let state = ctx.event_stream_state.borrow();
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
+        }
+        Request::CaptureWindow {
+            id,
+            path,
+            max_edge,
+            settle_ms,
+        } => {
+            // Relative paths would resolve against the compositor's working directory.
+            if !Path::new(&path).is_absolute() {
+                return Err(format!("path must be absolute: {path}"));
+            }
+
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                crate::agent::capture::capture_window(state, id, path, max_edge, settle_ms, tx);
+            });
+            let result = rx.recv().await;
+            let capture = result.map_err(|_| String::from("error capturing window"))??;
+            Response::WindowCapture(capture)
+        }
+        Request::Agent { id, op } => {
+            let id = MappedId::specific(id);
+            let (tx, rx) = async_channel::bounded(1);
+            match op {
+                AgentOp::Key { chord, repeat } => ctx.event_loop.insert_idle(move |state| {
+                    crate::agent::keyboard::key(state, id, &chord, repeat, tx);
+                }),
+                AgentOp::Type { text } => ctx.event_loop.insert_idle(move |state| {
+                    crate::agent::keyboard::type_text(state, id, &text, tx);
+                }),
+                op @ (AgentOp::Click { .. }
+                | AgentOp::Move { .. }
+                | AgentOp::Scroll { .. }
+                | AgentOp::Drag { .. }) => ctx.event_loop.insert_idle(move |state| {
+                    crate::agent::pointer::pointer(state, id, &op, tx);
+                }),
+            };
+            let result = rx.recv().await;
+            let done = result.map_err(|_| String::from("error running agent op"))?;
+            Response::AgentDone(done.map_err(|err| err.to_string())?)
         }
     };
 

@@ -122,6 +122,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 
 #[cfg(feature = "dbus")]
 use crate::a11y::A11y;
+use crate::agent::AgentState;
 use crate::animation::Clock;
 use crate::backend::tty::SurfaceDmabufFeedback;
 use crate::backend::{Backend, Headless, RenderResult, Tty, Winit};
@@ -205,6 +206,10 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+
+/// A rendered window: image size, pixels, and the image's top-left corner in physical pixels
+/// relative to the main surface's buffer origin.
+pub type WindowRender = (Size<i32, Physical>, Vec<u8>, Point<i32, Physical>);
 
 /// Parts of the seat keyboard state that get reset when its keymap is replaced.
 #[derive(Debug, Clone, Copy, Default)]
@@ -458,6 +463,8 @@ pub struct Niri {
 
     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
     pub pick_color: Option<async_channel::Sender<Option<niri_ipc::PickedColor>>>,
+
+    pub agent: AgentState,
 
     pub debug_draw_opaque_regions: bool,
     pub debug_draw_damage: bool,
@@ -881,6 +888,7 @@ impl State {
 
         // Needs to be called after updating the keyboard focus.
         self.niri.refresh_layout();
+        crate::agent::refresh_popups(&mut self.niri);
 
         self.niri.cursor_manager.check_cursor_image_surface_alive();
         self.niri.refresh_pointer_outputs();
@@ -897,6 +905,7 @@ impl State {
         // Should happen before refresh_window_rules(), but after anything that can start or stop
         // screencasts.
         self.niri.refresh_mapped_cast_window_rules();
+        crate::agent::refresh_flags(&mut self.niri);
         self.ipc_refresh_casts();
 
         self.niri.refresh_window_rules();
@@ -1517,6 +1526,8 @@ impl State {
             {
                 if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(surface) {
                     mapped.set_is_focused(true);
+                    // The owner takes over the window: close the menus agents left open on it.
+                    self.niri.agent.dismiss_popups(mapped.id());
 
                     // If `mapped` does not have a focus timestamp, then the window is newly
                     // created/mapped and a timestamp is unconditionally created.
@@ -1571,6 +1582,14 @@ impl State {
                     );
                     self.niri.popup_grab = None;
                 }
+            }
+
+            // The agent's shadow focus must leave before set_focus() below enters its client.
+            if focus
+                .surface()
+                .is_some_and(|s| self.niri.agent.is_sticky_client(s))
+            {
+                self.niri.agent.release_sticky();
             }
 
             if self.niri.config.borrow().input.keyboard.track_layout == TrackLayout::Window {
@@ -3046,6 +3065,8 @@ impl Niri {
 
             pick_window: None,
             pick_color: None,
+
+            agent: AgentState::default(),
 
             debug_draw_opaque_regions: false,
             debug_draw_damage: false,
@@ -6605,10 +6626,38 @@ impl Niri {
                 mapped.rules().opacity.unwrap_or(1.).clamp(0., 1.)
             };
 
+        let pointer_output = show_pointer.then_some(output);
+        let (size, pixels, _) =
+            self.render_window(renderer, mapped, scale, alpha, pointer_output)?;
+
+        self.save_screenshot(size, pixels, write_to_disk, path)
+            .context("error saving screenshot")
+    }
+
+    /// Renders the window with its popups, opaque and without the pointer.
+    pub fn render_window_capture(
+        &self,
+        renderer: &mut GlesRenderer,
+        mapped: &Mapped,
+        scale: Scale<f64>,
+    ) -> anyhow::Result<WindowRender> {
+        self.render_window(renderer, mapped, scale, 1., None)
+    }
+
+    /// Places the main surface's buffer origin at physical (0, 0), then shifts everything by the
+    /// returned location so the image starts at the top-left of the window's bounding box.
+    fn render_window(
+        &self,
+        renderer: &mut GlesRenderer,
+        mapped: &Mapped,
+        scale: Scale<f64>,
+        alpha: f32,
+        pointer_output: Option<&Output>,
+    ) -> anyhow::Result<WindowRender> {
         let mut elements: Vec<WindowScreenshotRenderElement<GlesRenderer>> = Vec::new();
 
         // Add pointer if requested and it's over this window.
-        if show_pointer {
+        if let Some(output) = pointer_output {
             if let Some((_, win_pos)) = self.pointer_pos_for_window_cast(mapped) {
                 // Pointer elements are at output-local physical coords.
                 // Relocate by -win_pos to make them window-relative.
@@ -6623,7 +6672,7 @@ impl Niri {
 
         let ctx = RenderCtx {
             renderer,
-            target,
+            target: RenderTarget::ScreenCapture,
             xray: None,
         };
         mapped.render(
@@ -6650,8 +6699,7 @@ impl Niri {
             elements,
         )?;
 
-        self.save_screenshot(geo.size, pixels, write_to_disk, path)
-            .context("error saving screenshot")
+        Ok((geo.size, pixels, geo.loc))
     }
 
     pub fn save_screenshot(

@@ -119,6 +119,24 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Capture a window to a PNG file.
+    CaptureWindow {
+        /// Id of the window.
+        id: u64,
+        /// Absolute path of the PNG file to write.
+        path: String,
+        /// Longest edge of the image in pixels; larger captures are scaled down.
+        max_edge: Option<u32>,
+        /// Milliseconds to wait for the window to settle before capturing.
+        settle_ms: Option<u32>,
+    },
+    /// Perform an agent input operation on a window.
+    Agent {
+        /// Id of the window.
+        id: u64,
+        /// The operation.
+        op: AgentOp,
+    },
 }
 
 /// Reply from niri to client.
@@ -165,6 +183,10 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// Result of a window capture.
+    WindowCapture(WindowCapture),
+    /// Result of an agent operation.
+    AgentDone(AgentDone),
 }
 
 /// Overview information.
@@ -182,6 +204,200 @@ pub struct PickedColor {
     /// Color values as red, green, blue, each ranging from 0.0 to 1.0.
     pub rgb: [f64; 3],
 }
+
+/// Operation an agent performs on a window.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum AgentOp {
+    /// Click at a point in the last capture's pixel coordinates.
+    Click {
+        /// X coordinate.
+        x: f64,
+        /// Y coordinate.
+        y: f64,
+        /// Mouse button.
+        button: AgentButton,
+        /// Number of clicks.
+        count: u8,
+        /// Modifiers held during the click.
+        mods: Vec<AgentMod>,
+    },
+    /// Move the pointer.
+    Move {
+        /// X coordinate.
+        x: f64,
+        /// Y coordinate.
+        y: f64,
+    },
+    /// Scroll at a point.
+    Scroll {
+        /// X coordinate.
+        x: f64,
+        /// Y coordinate.
+        y: f64,
+        /// Horizontal scroll amount.
+        dx: f64,
+        /// Vertical scroll amount.
+        dy: f64,
+    },
+    /// Drag from one point to another.
+    Drag {
+        /// Start X coordinate.
+        x0: f64,
+        /// Start Y coordinate.
+        y0: f64,
+        /// End X coordinate.
+        x1: f64,
+        /// End Y coordinate.
+        y1: f64,
+        /// Number of intermediate motion steps, at most 1000.
+        steps: u16,
+    },
+    /// Press a key chord such as `ctrl+l`.
+    Key {
+        /// The chord.
+        chord: String,
+        /// Number of times to press it.
+        repeat: u16,
+    },
+    /// Type text.
+    Type {
+        /// The text.
+        text: String,
+    },
+}
+
+/// Mouse button for agent clicks.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum AgentButton {
+    /// Left button.
+    Left,
+    /// Right button.
+    Right,
+    /// Middle button.
+    Middle,
+}
+
+/// Modifier key for agent clicks.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum AgentMod {
+    /// Control.
+    Ctrl,
+    /// Shift.
+    Shift,
+    /// Alt.
+    Alt,
+    /// Super.
+    Super,
+}
+
+/// Result of a window capture.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WindowCapture {
+    /// Id of the window.
+    pub id: u64,
+    /// Path of the written PNG.
+    pub path: String,
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// Scale of the capture relative to logical pixels.
+    pub scale: f64,
+    /// Origin of the capture in window surface coordinates.
+    pub origin: (f64, f64),
+    /// Location of the window geometry in window surface coordinates, in logical pixels.
+    pub geometry_loc: (f64, f64),
+    /// Window geometry size in logical pixels.
+    pub window_size: (i32, i32),
+    /// Whether the window's workspace was visible.
+    pub workspace_visible: bool,
+    /// App id of the window.
+    pub app_id: Option<String>,
+    /// Title of the window.
+    pub title: Option<String>,
+}
+
+/// Result of an agent operation.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct AgentDone {
+    /// Id of the window.
+    pub id: u64,
+    /// App id of the window.
+    pub app_id: Option<String>,
+    /// Title of the window.
+    pub title: Option<String>,
+    /// Age of the capture the operation was based on, in milliseconds.
+    pub capture_age_ms: Option<u64>,
+}
+
+/// Error from an agent operation.
+///
+/// Sent over IPC as the `Display` string, which starts with the snake_case code.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentError {
+    /// The window no longer exists.
+    WindowGone,
+    /// The window is not granted to agents.
+    NotGranted,
+    /// Agent input is paused.
+    Paused,
+    /// The owner focused the window.
+    HumanFocused,
+    /// The window shares a client with the owner's focused or hovered window.
+    SameClient,
+    /// X11 windows are not supported.
+    X11Unsupported,
+    /// There is no capture to base the operation on.
+    NoCapture,
+    /// The capture is stale.
+    StaleCapture,
+    /// A character cannot be typed with the current keymap.
+    UnmappableChar(char),
+    /// Pasting is not supported.
+    PasteUnsupported,
+    /// A `block-out-from` window rule blocks the window out from capture.
+    BlockedOut,
+    /// The key chord could not be parsed.
+    BadChord(String),
+    /// The operation was interrupted partway through typing.
+    Interrupted {
+        /// Why it was interrupted.
+        error: Box<AgentError>,
+        /// Characters typed before the interruption.
+        typed: usize,
+    },
+}
+
+impl std::fmt::Display for AgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WindowGone => f.write_str("window_gone"),
+            Self::NotGranted => f.write_str("not_granted"),
+            Self::Paused => f.write_str("paused"),
+            Self::HumanFocused => f.write_str("human_focused"),
+            Self::SameClient => f.write_str("same_client"),
+            Self::X11Unsupported => f.write_str("x11_unsupported"),
+            Self::NoCapture => f.write_str("no_capture"),
+            Self::StaleCapture => f.write_str("stale_capture"),
+            Self::UnmappableChar(c) => write!(f, "unmappable_char: {c:?}"),
+            Self::PasteUnsupported => f.write_str("paste_unsupported"),
+            Self::BlockedOut => f.write_str("blocked_out"),
+            Self::BadChord(chord) => write!(f, "bad_chord: {chord}"),
+            Self::Interrupted { error, typed } => {
+                write!(f, "{error}: interrupted after {typed} characters typed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AgentError {}
 
 /// Actions that niri can perform.
 // Variants in this enum should match the spelling of the ones in niri-config. Most, but not all,
@@ -2234,6 +2450,36 @@ fn default_position_change() -> PositionChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_error_codes() {
+        assert_eq!(AgentError::NotGranted.to_string(), "not_granted");
+        assert!(AgentError::UnmappableChar('日')
+            .to_string()
+            .starts_with("unmappable_char: "));
+        let e = AgentError::Interrupted {
+            error: Box::new(AgentError::Paused),
+            typed: 1000,
+        };
+        assert!(e.to_string().starts_with("paused: "));
+        assert!(e.to_string().contains("1000"));
+    }
+
+    #[test]
+    fn agent_request_roundtrip() {
+        let r = Request::Agent {
+            id: 7,
+            op: AgentOp::Type { text: "ğx".into() },
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Request>(&s).unwrap(),
+            Request::Agent {
+                id: 7,
+                op: AgentOp::Type { .. }
+            }
+        ));
+    }
 
     #[test]
     fn parse_size_change() {

@@ -1,6 +1,6 @@
 use smithay::backend::input::{
-    Device, DeviceCapability, Event, InputBackend, InputTime, KeyState, KeyboardKeyEvent, Keycode,
-    UnusedEvent,
+    ButtonState, Device, DeviceCapability, Event, InputBackend, InputTime, KeyState,
+    KeyboardKeyEvent, Keycode, PointerButtonEvent, UnusedEvent,
 };
 use smithay::output::Output;
 
@@ -18,12 +18,17 @@ pub struct TestKeyboardKeyEvent {
     pub count: u32,
 }
 
+pub struct TestPointerButtonEvent {
+    pub button: u32,
+    pub state: ButtonState,
+}
+
 impl InputBackend for TestInputBackend {
     type Device = TestInputDevice;
 
     type KeyboardKeyEvent = TestKeyboardKeyEvent;
     type PointerAxisEvent = UnusedEvent;
-    type PointerButtonEvent = UnusedEvent;
+    type PointerButtonEvent = TestPointerButtonEvent;
     type PointerMotionEvent = UnusedEvent;
     type PointerMotionAbsoluteEvent = UnusedEvent;
 
@@ -100,5 +105,25 @@ impl KeyboardKeyEvent<TestInputBackend> for TestKeyboardKeyEvent {
 
     fn count(&self) -> u32 {
         self.count
+    }
+}
+
+impl Event<TestInputBackend> for TestPointerButtonEvent {
+    fn time(&self) -> InputTime {
+        InputTime::from_micros(0)
+    }
+
+    fn device(&self) -> <TestInputBackend as InputBackend>::Device {
+        TestInputDevice
+    }
+}
+
+impl PointerButtonEvent<TestInputBackend> for TestPointerButtonEvent {
+    fn button_code(&self) -> u32 {
+        self.button
+    }
+
+    fn state(&self) -> ButtonState {
+        self.state
     }
 }

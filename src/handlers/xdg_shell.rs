@@ -330,6 +330,14 @@ impl XdgShellHandler for State {
             return;
         };
 
+        // A menu that an agent click opened on a window the owner may not be focusing: keep it,
+        // without a grab, so the owner's focus stays put.
+        if self.niri.agent.is_agent_serial(serial)
+            && crate::agent::add_popup(&mut self.niri, &root, popup.clone())
+        {
+            return;
+        }
+
         // We need to hand out the grab in a way consistent with what update_keyboard_focus()
         // thinks the current focus is, otherwise it will desync and cause weird issues with
         // keyboard focus being at the wrong place.

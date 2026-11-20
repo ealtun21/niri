@@ -7,12 +7,12 @@ use anyhow::{anyhow, bail, Context};
 use niri_config::OutputName;
 use niri_ipc::socket::Socket;
 use niri_ipc::{
-    Action, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode, Output,
-    OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
+    Action, AgentOp, Cast, CastKind, CastTarget, Event, KeyboardLayouts, LogicalOutput, Mode,
+    Output, OutputConfigChanged, Overview, Request, Response, Transform, Window, WindowLayout,
 };
 use serde_json::json;
 
-use crate::cli::Msg;
+use crate::cli::{AgentCmd, Msg};
 use crate::utils::version;
 
 pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Result<()> {
@@ -27,6 +27,10 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
         if let Some(path) = path {
             ensure_absolute_path(path).context("error making the path absolute")?;
         }
+    }
+
+    if let Msg::CaptureWindow { path, .. } = &mut msg {
+        ensure_absolute_path(path).context("error making the path absolute")?;
     }
 
     let request = match &msg {
@@ -49,6 +53,60 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
         Msg::RequestError => Request::ReturnError,
         Msg::OverviewState => Request::OverviewState,
         Msg::Casts => Request::Casts,
+        Msg::CaptureWindow {
+            id,
+            path,
+            max_edge,
+            settle_ms,
+        } => Request::CaptureWindow {
+            id: *id,
+            path: path.clone(),
+            max_edge: *max_edge,
+            settle_ms: *settle_ms,
+        },
+        Msg::Agent { id, op } => Request::Agent {
+            id: *id,
+            op: match op {
+                AgentCmd::Click {
+                    x,
+                    y,
+                    button,
+                    count,
+                    mods,
+                } => AgentOp::Click {
+                    x: *x,
+                    y: *y,
+                    button: *button,
+                    count: *count,
+                    mods: mods.clone(),
+                },
+                AgentCmd::Move { x, y } => AgentOp::Move { x: *x, y: *y },
+                AgentCmd::Scroll { x, y, dx, dy } => AgentOp::Scroll {
+                    x: *x,
+                    y: *y,
+                    dx: *dx,
+                    dy: *dy,
+                },
+                AgentCmd::Drag {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    steps,
+                } => AgentOp::Drag {
+                    x0: *x0,
+                    y0: *y0,
+                    x1: *x1,
+                    y1: *y1,
+                    steps: *steps,
+                },
+                AgentCmd::Key { chord, repeat } => AgentOp::Key {
+                    chord: chord.clone(),
+                    repeat: *repeat,
+                },
+                AgentCmd::Type { text } => AgentOp::Type { text: text.clone() },
+            },
+        },
         Msg::RawRequest => {
             let mut buf = Vec::new();
             let mut stdin = std::io::stdin().lock();
@@ -568,6 +626,36 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                 print_cast(&cast);
                 println!();
             }
+        }
+        Msg::CaptureWindow { .. } => {
+            let Response::WindowCapture(capture) = response else {
+                bail!("unexpected response: expected WindowCapture, got {response:?}");
+            };
+
+            if json {
+                let capture =
+                    serde_json::to_string(&capture).context("error formatting response")?;
+                println!("{capture}");
+                return Ok(());
+            }
+
+            println!(
+                "Captured window {}: {} ({}x{})",
+                capture.id, capture.path, capture.width, capture.height
+            );
+        }
+        Msg::Agent { .. } => {
+            let Response::AgentDone(done) = response else {
+                bail!("unexpected response: expected AgentDone, got {response:?}");
+            };
+
+            if json {
+                let done = serde_json::to_string(&done).context("error formatting response")?;
+                println!("{done}");
+                return Ok(());
+            }
+
+            println!("ok");
         }
         Msg::RawRequest => {
             let output = serde_json::to_string(&response).context("error formatting response")?;

@@ -160,7 +160,7 @@ impl CompositorHandler for State {
                     let activate = activate.unwrap_or_else(|| {
                         // Check the token timestamp again in case the window took a while between
                         // requesting activation and mapping.
-                        let token = activation_token_data.filter(|token| {
+                        let token = activation_token_data.as_ref().filter(|token| {
                             token.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
                         });
                         if token.is_some() {
@@ -194,11 +194,18 @@ impl CompositorHandler for State {
                     // The mapped pre-commit hook deals with dma-bufs on its own.
                     self.remove_default_dmabuf_pre_commit_hook(surface);
                     let hook = add_mapped_toplevel_pre_commit_hook(toplevel);
-                    let mapped = {
+                    let mut mapped = {
                         let config = self.niri.config.borrow();
                         Mapped::new(window, rules, hook, &config)
                     };
                     let window = mapped.window.clone();
+                    let (activate, workspace_id) = crate::agent::guard_new_window(
+                        &self.niri,
+                        &mut mapped,
+                        activation_token_data.as_ref(),
+                        activate,
+                        workspace_id,
+                    );
 
                     let target = if let Some(p) = &parent {
                         // Open dialogs next to their parent window.

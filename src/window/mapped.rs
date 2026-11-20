@@ -99,6 +99,8 @@ pub struct Mapped {
 
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
+    is_agent_granted: bool,
+    is_agent_active: bool,
 
     /// Whether this window should ignore opacity set through window rules.
     ignore_opacity_window_rule: bool,
@@ -294,6 +296,8 @@ impl Mapped {
             is_active_in_column: true,
             is_floating: false,
             is_window_cast_target: false,
+            is_agent_granted: false,
+            is_agent_active: false,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
             blur_config: config.blur,
@@ -387,6 +391,14 @@ impl Mapped {
         self.is_window_cast_target
     }
 
+    pub fn is_agent_granted(&self) -> bool {
+        self.is_agent_granted
+    }
+
+    pub fn is_agent_active(&self) -> bool {
+        self.is_agent_active
+    }
+
     pub fn toggle_ignore_opacity_window_rule(&mut self) {
         self.ignore_opacity_window_rule = !self.ignore_opacity_window_rule;
     }
@@ -408,6 +420,20 @@ impl Mapped {
 
         self.is_window_cast_target = value;
         self.need_to_recompute_rules = true;
+    }
+
+    pub fn set_is_agent_granted(&mut self, value: bool) {
+        if self.is_agent_granted != value {
+            self.is_agent_granted = value;
+            self.need_to_recompute_rules = true;
+        }
+    }
+
+    pub fn set_is_agent_active(&mut self, value: bool) {
+        if self.is_agent_active != value {
+            self.is_agent_active = value;
+            self.need_to_recompute_rules = true;
+        }
     }
 
     /// Renders a snapshot of the window without popups.
@@ -558,6 +584,11 @@ impl Mapped {
 
     pub fn set_focus_timestamp(&mut self, timestamp: Duration) {
         self.focus_timestamp.replace(timestamp);
+    }
+
+    /// Makes the next `send_frame()` reach every surface of this window, even a hidden one.
+    pub fn set_needs_frame_callback(&mut self) {
+        self.needs_frame_callback = true;
     }
 
     pub fn send_frame<T, F>(
