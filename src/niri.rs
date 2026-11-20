@@ -432,6 +432,10 @@ pub struct Niri {
     /// resolution mice.
     pub notified_activity_this_iteration: bool,
     pub pointer_inside_hot_corner: bool,
+    /// While the overview is open and the pointer has moved in it: the window that had focus at
+    /// the last pointer motion. Closing the overview then focuses the window under the pointer,
+    /// unless the keyboard moved the focus since.
+    pub overview_hover_focus: Option<Option<Window>>,
     pub pointer_constraint_position_hint: Option<Point<f64, Logical>>,
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
@@ -3034,6 +3038,7 @@ impl Niri {
             pointer_inactivity_timer_got_reset: false,
             notified_activity_this_iteration: false,
             pointer_inside_hot_corner: false,
+            overview_hover_focus: None,
             pointer_constraint_position_hint: None,
             tablet_cursor_location: None,
             gesture_swipe_3f_cumulative: None,
@@ -7305,6 +7310,30 @@ impl Niri {
 
         if let Err(err) = res {
             warn!("error spawning a thread to send MonitorsChanged: {err:?}");
+        }
+    }
+
+    pub fn note_overview_pointer_motion(&mut self) {
+        self.overview_hover_focus = self
+            .layout
+            .is_overview_open()
+            .then(|| self.layout.focus().map(|mapped| mapped.window.clone()));
+    }
+
+    /// Call right before closing the overview: focuses the window under the pointer if the
+    /// pointer moved after the last keyboard focus change, so the last thing the owner did wins.
+    pub fn focus_overview_hover(&mut self) {
+        let Some(focus_at_motion) = self.overview_hover_focus.take() else {
+            return;
+        };
+        if !self.layout.is_overview_open()
+            || self.layout.focus().map(|mapped| &mapped.window) != focus_at_motion.as_ref()
+        {
+            return;
+        }
+        let location = self.seat.get_pointer().unwrap().current_location();
+        if let Some((window, _)) = self.contents_under(location).window {
+            self.layout.activate_window(&window);
         }
     }
 

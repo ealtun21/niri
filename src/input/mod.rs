@@ -2631,6 +2631,7 @@ impl State {
                 self.niri.stop_cast(CastSessionId::from(session_id));
             }
             Action::ToggleOverview => {
+                self.niri.focus_overview_hover();
                 self.niri.layout.toggle_overview();
                 self.niri.queue_redraw_all();
             }
@@ -2640,6 +2641,7 @@ impl State {
                 }
             }
             Action::CloseOverview => {
+                self.niri.focus_overview_hover();
                 if self.niri.layout.close_overview() {
                     self.niri.queue_redraw_all();
                 }
@@ -3007,6 +3009,7 @@ impl State {
             }
         }
 
+        self.niri.note_overview_pointer_motion();
         self.niri.handle_focus_follows_mouse(&under);
 
         self.niri.pointer_contents.clone_from(&under);
@@ -3108,6 +3111,7 @@ impl State {
 
         let under = self.niri.contents_under(pos);
 
+        self.niri.note_overview_pointer_motion();
         self.niri.handle_focus_follows_mouse(&under);
 
         self.niri.pointer_contents.clone_from(&under);

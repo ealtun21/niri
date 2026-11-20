@@ -2527,3 +2527,79 @@ fn overview_wheel_zooms_and_mod_wheel_switches_workspace() {
     run_f(&mut f, id, &surface, "-LWIN");
     assert_eq!(ws_idx(&mut f), 1, "Mod+wheel down switches workspace");
 }
+
+#[test]
+fn closing_overview_focuses_hovered_window_unless_keyboard_moved_last() {
+    use smithay::desktop::Window;
+    use smithay::utils::Point;
+
+    // Three 400x400 windows: big enough to hover in the zoomed-out overview.
+    let (mut f, id, a_surface) = set_up("");
+    let window = f.client(id).window(&a_surface);
+    window.set_size(400, 400);
+    window.commit();
+    f.roundtrip(id);
+    for _ in 0..2 {
+        let window = f.client(id).create_window();
+        let surface = window.surface.clone();
+        window.commit();
+        f.roundtrip(id);
+        let window = f.client(id).window(&surface);
+        window.attach_new_buffer();
+        window.set_size(400, 400);
+        window.ack_last_and_commit();
+        f.roundtrip(id);
+    }
+    // Columns A B C, C focused (last opened).
+    let focused = |f: &mut Fixture| f.niri().layout.focus().unwrap().window.clone();
+    let c = focused(&mut f);
+    let act = |f: &mut Fixture, action: Action| {
+        f.niri_state()
+            .do_action(action, false, InputTime::from_micros(0));
+        f.niri_complete_animations();
+    };
+    act(&mut f, Action::FocusColumnLeft);
+    let b = focused(&mut f);
+    act(&mut f, Action::FocusColumnLeft);
+    let a = focused(&mut f);
+
+    let hover = |f: &mut Fixture, target: &Window| {
+        let niri = f.niri();
+        let point = (0..1920)
+            .step_by(16)
+            .flat_map(|x| (0..1080).step_by(16).map(move |y| (x, y)))
+            .find(|&(x, y)| {
+                let pos = Point::from((f64::from(x), f64::from(y)));
+                niri.contents_under(pos)
+                    .window
+                    .is_some_and(|(w, _)| &w == target)
+            })
+            .expect("window visible in the overview");
+        let pointer = f.client(id).state.virtual_pointer();
+        pointer.motion_absolute(0, point.0, point.1, 1920, 1080);
+        pointer.frame();
+        f.roundtrip(id);
+    };
+
+    // Hover B, close: B gets focus.
+    act(&mut f, Action::ToggleOverview);
+    hover(&mut f, &b);
+    act(&mut f, Action::ToggleOverview);
+    assert!(focused(&mut f) == b, "hovered window is focused on close");
+
+    // Hover C, then the keyboard selects A: the keyboard came last, so A stays.
+    act(&mut f, Action::ToggleOverview);
+    hover(&mut f, &c);
+    act(&mut f, Action::FocusColumnLeft);
+    act(&mut f, Action::ToggleOverview);
+    assert!(
+        focused(&mut f) == a,
+        "keyboard selection made after hovering wins"
+    );
+
+    // No pointer motion in this overview session: focus stays put even though the pointer
+    // may be over another window.
+    act(&mut f, Action::ToggleOverview);
+    act(&mut f, Action::ToggleOverview);
+    assert!(focused(&mut f) == a, "no motion, no change");
+}
