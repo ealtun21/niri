@@ -276,7 +276,7 @@ pub enum AgentButton {
     Left,
     /// Right button.
     Right,
-    /// Middle button.
+    /// Middle button. Agent clicks with it are refused (`paste_unsupported`).
     Middle,
 }
 
@@ -360,7 +360,8 @@ pub enum AgentError {
     StaleCapture,
     /// A character cannot be typed with the current keymap.
     UnmappableChar(char),
-    /// Pasting is not supported.
+    /// Pasting is not supported: paste chords and middle-click (primary-selection paste) are
+    /// refused.
     PasteUnsupported,
     /// A `block-out-from` window rule blocks the window out from capture.
     BlockedOut,

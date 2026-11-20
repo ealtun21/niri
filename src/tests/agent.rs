@@ -695,6 +695,27 @@ fn captured_target(f: &mut Fixture, agent: ClientId, b: &WlSurface) -> MappedId 
 }
 
 #[test]
+fn middle_click_is_refused_and_sends_nothing() {
+    // Middle-click pastes the primary selection, which can hold the owner's text.
+    let (mut f, _human, _a, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+    pointer_events(&mut f, agent, &b);
+
+    let op = AgentOp::Click {
+        x: 10.,
+        y: 10.,
+        button: AgentButton::Middle,
+        count: 1,
+        mods: Vec::new(),
+    };
+    assert_eq!(
+        pointer_now(&mut f, id, op).unwrap_err(),
+        AgentError::PasteUnsupported
+    );
+    assert_eq!(pointer_events(&mut f, agent, &b), []);
+}
+
+#[test]
 fn click_reaches_target_only() {
     let (mut f, human, a, agent, b) = two_clients();
     let id = captured_target(&mut f, agent, &b);

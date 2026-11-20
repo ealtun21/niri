@@ -48,6 +48,16 @@ pub fn pointer(
     // A focus bind earlier in this loop pass hasn't reached keyboard_focus yet.
     state.update_keyboard_focus();
     let result = check_target(&state.niri, id, OpKind::Pointer).and_then(|target| {
+        // Middle-click pastes the primary selection, which can hold the owner's text.
+        if matches!(
+            op,
+            AgentOp::Click {
+                button: AgentButton::Middle,
+                ..
+            }
+        ) {
+            return Err(AgentError::PasteUnsupported);
+        }
         let rec = *state
             .niri
             .agent
