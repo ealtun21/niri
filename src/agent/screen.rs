@@ -375,7 +375,6 @@ fn screen_op(state: &mut State, name: Option<&str>, op: &AgentOp) -> Result<Scre
         return Err(AgentError::StaleCapture);
     }
 
-    move_cursor(niri, &output, local);
     let origin = output_geo.loc.to_f64();
     let to_global = |x, y| to_output(x, y) + origin;
     let pos = to_global(x, y);
@@ -461,11 +460,13 @@ fn screen_op(state: &mut State, name: Option<&str>, op: &AgentOp) -> Result<Scre
         }
     };
 
-    // A drag stays on the surface it started on; the cursor shows where it ended.
+    // The op passed its guards: the cursor shows where it went. A drag stays on the surface it
+    // started on; the cursor shows where it ended.
+    move_cursor(&mut state.niri, &output, local, None);
     if let (AgentOp::Drag { x1, y1, .. }, ScreenHit::Window { .. } | ScreenHit::Layer { .. }) =
         (op, &hit)
     {
-        move_cursor(&mut state.niri, &output, to_output(*x1, *y1));
+        move_cursor(&mut state.niri, &output, to_output(*x1, *y1), None);
     }
     Ok(hit)
 }

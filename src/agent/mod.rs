@@ -117,7 +117,8 @@ pub fn pause(niri: &mut Niri) {
 /// that the owner can see close, since toolkits send keys to an open menu whichever surface has
 /// the keyboard; hidden ones stay, as they do on the owner's click. A client whose keyboard the
 /// agent moved off the seat's surface gets it back, so the owner's keys don't go to another window
-/// of that client.
+/// of that client. The agent pointer leaves, so nothing stays entered on the owner's windows, and
+/// a cursor placed by a screen op hides; one on an agent window shows while that window does.
 pub fn end_handover(niri: &mut Niri) {
     if !niri.agent.handed_over {
         return;
@@ -127,6 +128,10 @@ pub fn end_handover(niri: &mut Niri) {
     let agent = &mut niri.agent;
     if agent.sticky.as_ref().is_some_and(|s| s.restore.is_some()) {
         agent.release_sticky();
+    }
+    agent.release_pointer();
+    if agent.cursor.as_ref().is_some_and(|c| c.window.is_none()) {
+        cursor::hide_cursor(niri);
     }
 }
 

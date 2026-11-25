@@ -2966,6 +2966,19 @@ fn cursor_hidden_for_offscreen_window() {
     assert_eq!(cursor_location(f.niri(), &output), None);
 }
 
+#[test]
+fn cursor_hides_when_its_window_leaves_the_screen() {
+    let (mut f, id, output) = on_screen_b();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    assert!(cursor_location(f.niri(), &output).is_some());
+    let w = window_of(&mut f, "agent-b");
+    f.niri()
+        .layout
+        .move_to_workspace(Some(&w), 1, ActivateWindow::No);
+    f.niri_complete_animations();
+    assert_eq!(cursor_location(f.niri(), &output), None);
+}
+
 fn redraw_queued(f: &mut Fixture, output: &smithay::output::Output) -> bool {
     use crate::niri::RedrawState;
     matches!(
@@ -3523,6 +3536,44 @@ fn screen_click_refuses_blocked_out_window() {
         screen_click(&mut f, &record, center(&record, id)),
         Err(AgentError::BlockedOut)
     );
+}
+
+#[test]
+fn refused_screen_click_leaves_the_cursor_alone() {
+    let (mut f, id) = set_up_blocked_out("screen-capture");
+    f.niri().agent.hand_over();
+    let output = active_output(&mut f);
+    let record = look(&mut f, &output);
+    assert!(screen_click(&mut f, &record, center(&record, id)).is_err());
+    assert!(f.niri().agent.cursor.is_none());
+}
+
+#[test]
+fn handover_end_hides_screen_cursor_and_releases_agent_pointer() {
+    let (mut f, _, _, agent, b, output) = screen_setup();
+    let record = look(&mut f, &output);
+    let id = mapped_id(&mut f, "agent-b");
+    screen_click(&mut f, &record, center(&record, id)).unwrap();
+    pointer_events(&mut f, agent, &b);
+    assert!(cursor_location(f.niri(), &output).is_some());
+
+    crate::agent::end_handover(f.niri());
+
+    assert_eq!(cursor_location(f.niri(), &output), None);
+    assert!(f.niri().agent.pointer_focus.is_none());
+    assert_eq!(
+        pointer_events(&mut f, agent, &b),
+        [PointerEvent::Leave, PointerEvent::Frame]
+    );
+}
+
+#[test]
+fn handover_end_keeps_cursor_on_agent_window() {
+    let (mut f, id, output) = on_screen_b();
+    f.niri().agent.hand_over();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    crate::agent::end_handover(f.niri());
+    assert!(cursor_location(f.niri(), &output).is_some());
 }
 
 #[test]

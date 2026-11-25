@@ -20,6 +20,9 @@ pub struct AgentCursor {
     pub output: Output,
     pub from: Point<f64, Logical>,
     pub to: Point<f64, Logical>,
+    /// The window the cursor points at, for a window op: the cursor hides once it is off screen.
+    /// `None` for a screen op.
+    pub window: Option<MappedId>,
     /// Eased 0 to 1 from `from` to `to`.
     pub glide: Animation,
     /// When the agent last placed the cursor.
@@ -35,8 +38,14 @@ impl AgentCursor {
     }
 }
 
-/// Glides the cursor to `to` on `output`, or shows it there if it was hidden or elsewhere.
-pub fn move_cursor(niri: &mut Niri, output: &Output, to: Point<f64, Logical>) {
+/// Glides the cursor to `to` on `output`, or shows it there if it was hidden or elsewhere. `window`
+/// is the window a window op points at.
+pub fn move_cursor(
+    niri: &mut Niri,
+    output: &Output,
+    to: Point<f64, Logical>,
+    window: Option<MappedId>,
+) {
     let from = cursor_location(niri, output).unwrap_or(to);
     let old = niri.agent.cursor.take();
     if let Some(old) = old.filter(|old| old.output != *output) {
@@ -46,6 +55,7 @@ pub fn move_cursor(niri: &mut Niri, output: &Output, to: Point<f64, Logical>) {
         output: output.clone(),
         from,
         to,
+        window,
         glide: Animation::ease(
             niri.clock.clone(),
             0.,
@@ -94,6 +104,7 @@ pub fn cursor_location(niri: &Niri, output: &Output) -> Option<Point<f64, Logica
         || cursor.last_op.elapsed() > IDLE_RELEASE
         // Windows are scaled in the overview, so the point would be wrong.
         || (!niri.agent.handed_over && niri.layout.is_overview_open())
+        || cursor.window.is_some_and(|id| !is_on_screen(niri, id))
     {
         return None;
     }
@@ -104,7 +115,7 @@ pub fn cursor_location(niri: &Niri, output: &Output) -> Option<Point<f64, Logica
 /// isn't on screen.
 pub fn place_on_window(niri: &mut Niri, id: MappedId, local: Point<f64, Logical>) {
     match window_point(niri, id, local) {
-        Some((output, at)) => move_cursor(niri, &output, at),
+        Some((output, at)) => move_cursor(niri, &output, at, Some(id)),
         None => hide_cursor(niri),
     }
 }
