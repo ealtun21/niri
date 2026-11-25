@@ -2091,7 +2091,7 @@ fn ffm_suspended_while_handed_over() {
     physical_motion(&mut f, over_c.0, over_c.1);
     assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
 
-    f.niri().agent.end_handover();
+    crate::agent::end_handover(f.niri());
     physical_motion(&mut f, over_a.0, over_a.1);
     physical_motion(&mut f, over_c.0, over_c.1);
     assert_eq!(focused_app_id(&mut f).as_deref(), Some("c"));
@@ -2231,7 +2231,7 @@ fn paste_stops_when_handover_ends() {
         tx,
     );
     f.client(agent).dispatch();
-    f.niri().agent.end_handover();
+    crate::agent::end_handover(f.niri());
     step_chunk(&mut f);
     assert!(matches!(
         rx.try_recv().unwrap(),
@@ -4083,15 +4083,17 @@ fn owner_focus_change_gives_agent_menu_keyboard_back_first() {
 #[test]
 fn handover_end_gives_agent_menu_keyboard_back() {
     let (mut f, human, a, _, _, output) = screen_setup();
-    let (menu, _) = agent_menu_on_a(&mut f, human, &a, &output);
+    let (menu, popup) = agent_menu_on_a(&mut f, human, &a, &output);
     screen_keys_now(&mut f, key_op("Down")).unwrap();
     events(&mut f, human, &a);
     events(&mut f, human, &menu);
 
-    // The owner's key ends the hand-over and is swallowed; their next one goes to `a`.
+    // The owner's key ends the hand-over and is swallowed; their next one goes to `a`. The menu
+    // closes, as toolkits send keys to an open menu whichever surface has the keyboard.
     physical_key(&mut f);
     physical_key(&mut f);
 
+    assert!(popup_done(&mut f, human, &popup));
     assert_eq!(events(&mut f, human, &menu), "leave");
     assert_snapshot!(events(&mut f, human, &a), @"
     enter: []
@@ -4122,4 +4124,38 @@ fn handover_end_gives_keyboard_back_from_other_window_of_owner_client() {
     key pressed: 30
     key released: 30
     ");
+}
+
+#[test]
+fn screen_keys_go_to_owner_menu_holding_the_grab() {
+    let (mut f, human, a, ..) = two_clients_with(handover_config());
+    // The owner opens a menu on `a` with their click.
+    let window = window_of(&mut f, "a");
+    let point = point_over(&mut f, &window);
+    physical_motion(&mut f, point.0, point.1);
+    pointer_events(&mut f, human, &a);
+    physical_click(&mut f);
+    let serial = press_serial(&pointer_events(&mut f, human, &a));
+    let (menu, _) = open_popup(&mut f, human, &a, Some(serial));
+    assert!(f.niri().popup_grab.is_some());
+    // Mod+Alt reach the grab, which moves the keyboard to the menu; D hands over.
+    owner_bind(&mut f, KEY_D);
+    assert!(f.niri().agent.handed_over);
+    assert!(events(&mut f, human, &menu).starts_with("enter"));
+    events(&mut f, human, &a);
+    let id = mapped_id(&mut f, "a");
+
+    assert_eq!(
+        screen_keys_now(&mut f, type_op("x")),
+        Ok(ScreenHit::Window { id: id.get() })
+    );
+
+    // The menu already has the keyboard: no `leave` nor `enter`.
+    assert_snapshot!(events(&mut f, human, &menu), @"
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    key pressed: 45
+    key released: 45
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+    assert_eq!(events(&mut f, human, &a), "");
 }

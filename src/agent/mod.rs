@@ -115,6 +115,23 @@ pub fn pause(niri: &mut Niri) {
     cursor::hide_cursor(niri);
 }
 
+/// Takes the controls back from the agent, if handed over; it stays unpaused. The agent's menus
+/// that the owner can see close, since toolkits send keys to an open menu whichever surface has
+/// the keyboard; hidden ones stay, as they do on the owner's click. A client whose keyboard the
+/// agent moved off the seat's surface gets it back, so the owner's keys don't go to another window
+/// of that client.
+pub fn end_handover(niri: &mut Niri) {
+    if !niri.agent.handed_over {
+        return;
+    }
+    niri.agent.handed_over = false;
+    dismiss_visible_popups(niri);
+    let agent = &mut niri.agent;
+    if agent.sticky.as_ref().is_some_and(|s| s.restore.is_some()) {
+        agent.release_sticky();
+    }
+}
+
 /// Runs a niri action for the agent during a hand-over, without warping the owner's pointer.
 pub fn run_action(state: &mut State, action: niri_ipc::Action) -> Result<(), AgentError> {
     if !state.niri.agent.handed_over {
@@ -213,17 +230,6 @@ impl AgentState {
     pub fn hand_over(&mut self) {
         self.handed_over = true;
         self.paused = false;
-    }
-
-    /// Takes the controls back from the agent; it stays unpaused. Agents reach layer surfaces only
-    /// while handed over, so their menus close. A client whose keyboard the agent moved off the
-    /// seat's surface gets it back, so the owner's keys don't go to another window of that client.
-    pub fn end_handover(&mut self) {
-        self.handed_over = false;
-        self.dismiss_layer_popups();
-        if self.sticky.as_ref().is_some_and(|s| s.restore.is_some()) {
-            self.release_sticky();
-        }
     }
 
     /// Takes the next serial and remembers it as an agent serial.
@@ -476,7 +482,8 @@ fn is_visible(layout: &Layout<Mapped>, id: MappedId) -> bool {
     })
 }
 
-/// Dismisses the agent popups the owner could see. Runs on the owner's button presses.
+/// Dismisses the agent popups the owner could see. Runs on the owner's button presses and when a
+/// hand-over ends.
 pub fn dismiss_visible_popups(niri: &mut Niri) {
     let layout = &niri.layout;
     let agent = &mut niri.agent;

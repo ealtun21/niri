@@ -7048,7 +7048,7 @@ impl Niri {
     }
 
     pub fn lock(&mut self, confirmation: SessionLocker) {
-        self.agent.end_handover();
+        crate::agent::end_handover(self);
 
         // Check if another client is in the process of locking.
         if matches!(
@@ -7140,7 +7140,7 @@ impl Niri {
                 self.event_loop.remove(deadline_token);
 
                 // The owner could hand over while the lock waited for its surfaces.
-                self.agent.end_handover();
+                crate::agent::end_handover(self);
                 self.screenshot_ui.close();
                 self.cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());

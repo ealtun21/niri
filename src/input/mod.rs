@@ -206,7 +206,7 @@ impl State {
             }
         }
         if crate::agent::ends_handover(&event) {
-            self.niri.agent.end_handover();
+            crate::agent::end_handover(&mut self.niri);
         }
 
         if should_reset_pointer_inactivity_timer(&event) {
@@ -528,7 +528,7 @@ impl State {
             !keysym.is_modifier_key()
         };
         if ends_handover {
-            self.niri.agent.end_handover();
+            crate::agent::end_handover(&mut self.niri);
         }
 
         // Accessibility modifier grabs should override XKB state changes (e.g. Caps Lock), so we
@@ -1136,7 +1136,7 @@ impl State {
             }
             Action::ToggleAgentHandover => {
                 if self.niri.agent.handed_over {
-                    self.niri.agent.end_handover();
+                    crate::agent::end_handover(&mut self.niri);
                 } else if !self.niri.is_locked() {
                     self.niri.agent.hand_over();
                 }

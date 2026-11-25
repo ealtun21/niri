@@ -493,13 +493,22 @@ fn focus_target(niri: &Niri) -> Option<(Target, ScreenHit)> {
 }
 
 /// The checks a screen `key` or `type` runs before each chunk: the hand-over goes on, and the
-/// window passes its guards, or the layer surface is still mapped and not blocked out.
+/// window passes its guards, or the layer surface is still mapped and not blocked out. Returns
+/// where the keys go: the seat's focus within the target's client, else the target's surface.
 fn check_focus_target(niri: &Niri, target: &Target) -> Result<Target, AgentError> {
     if !niri.agent.handed_over {
         return Err(AgentError::NotHandedOver);
     }
     if let Some(id) = target.id {
-        return check_target(niri, id, OpKind::Screen);
+        let mut target = check_target(niri, id, OpKind::Screen)?;
+        // A menu of the window that holds the owner's popup grab has the seat's focus.
+        let focus = niri.seat.get_keyboard().unwrap().current_focus();
+        if let Some(focus) =
+            focus.filter(|s| s.client().is_some_and(|c| c.id() == target.client.id()))
+        {
+            target.surface = focus;
+        }
+        return Ok(target);
     }
     let mapped = niri
         .mapped_layer_surfaces
