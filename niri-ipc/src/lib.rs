@@ -146,6 +146,13 @@ pub enum Request {
         /// The operation.
         op: AgentOp,
     },
+    /// Run a niri action for the agent during a hand-over, without moving the owner's pointer.
+    ///
+    /// Refused unless the owner handed over the controls, and for `quit`.
+    AgentAction {
+        /// The action to run.
+        action: Action,
+    },
 }
 
 /// Reply from niri to client.
@@ -405,6 +412,10 @@ pub enum AgentError {
     NotVisible,
     /// Agent input is paused.
     Paused,
+    /// The owner has not handed over the controls.
+    NotHandedOver,
+    /// The action is not allowed for agents.
+    ActionRefused(String),
     /// The owner focused the window.
     HumanFocused,
     /// The window shares a client with the owner's focused or hovered window.
@@ -440,6 +451,8 @@ impl std::fmt::Display for AgentError {
             Self::NotGranted => f.write_str("not_granted"),
             Self::NotVisible => f.write_str("not_visible"),
             Self::Paused => f.write_str("paused"),
+            Self::NotHandedOver => f.write_str("not_handed_over"),
+            Self::ActionRefused(name) => write!(f, "action_refused: {name}"),
             Self::HumanFocused => f.write_str("human_focused"),
             Self::SameClient => f.write_str("same_client"),
             Self::X11Unsupported => f.write_str("x11_unsupported"),

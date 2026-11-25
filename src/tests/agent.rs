@@ -2273,3 +2273,79 @@ fn handover_agent_serial_token_activates() {
 
     assert_eq!(focused_app_id(&mut f).as_deref(), Some("b"));
 }
+
+const WARP_CONFIG: &str = "input { warp-mouse-to-focus; }";
+
+/// Two columns "a" and "b", "b" focused, with the pointer parked at the top-left corner.
+fn warp_setup() -> Fixture {
+    let mut f = Fixture::with_config(Config::parse_mem(WARP_CONFIG).unwrap());
+    f.add_output(1, (1920, 1080));
+    for app_id in ["a", "b"] {
+        let id = f.add_client();
+        map_window(&mut f, id, app_id);
+    }
+    f.niri_state().update_keyboard_focus();
+    f.niri_state().move_cursor(Point::from((0., 0.)));
+    f
+}
+
+fn pointer_location(f: &mut Fixture) -> Point<f64, smithay::utils::Logical> {
+    f.niri().seat.get_pointer().unwrap().current_location()
+}
+
+fn focus_left() -> niri_ipc::Action {
+    niri_ipc::Action::FocusColumnLeft {}
+}
+
+#[test]
+fn agent_action_needs_handover() {
+    let mut f = warp_setup();
+    let r = crate::agent::run_action(f.niri_state(), focus_left());
+    assert_eq!(r, Err(AgentError::NotHandedOver));
+}
+
+#[test]
+fn agent_action_quit_refused() {
+    let mut f = warp_setup();
+    f.niri().agent.hand_over();
+    let r = crate::agent::run_action(
+        f.niri_state(),
+        niri_ipc::Action::Quit {
+            skip_confirmation: true,
+        },
+    );
+    assert_eq!(r, Err(AgentError::ActionRefused("quit".into())));
+}
+
+#[test]
+fn agent_action_focus_does_not_warp() {
+    let mut f = warp_setup();
+    f.niri().agent.hand_over();
+    let before = pointer_location(&mut f);
+    crate::agent::run_action(f.niri_state(), focus_left()).unwrap();
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+    assert_eq!(pointer_location(&mut f), before);
+    assert!(!f.niri().agent.suppress_warp);
+}
+
+#[test]
+fn owner_action_still_warps() {
+    let mut f = warp_setup();
+    let before = pointer_location(&mut f);
+    f.niri_state().do_action(
+        niri_config::Action::FocusColumnLeft,
+        false,
+        InputTime::from_micros(0),
+    );
+    assert_ne!(pointer_location(&mut f), before);
+}
+
+#[test]
+fn agent_action_focus_monitor_does_not_move_pointer() {
+    let mut f = warp_setup();
+    f.add_output(2, (1920, 1080));
+    f.niri().agent.hand_over();
+    let before = pointer_location(&mut f);
+    crate::agent::run_action(f.niri_state(), niri_ipc::Action::FocusMonitorRight {}).unwrap();
+    assert_eq!(pointer_location(&mut f), before);
+}

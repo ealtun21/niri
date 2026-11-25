@@ -528,6 +528,18 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let capture = result.map_err(|_| String::from("error capturing window"))??;
             Response::WindowCapture(capture)
         }
+        Request::AgentAction { action } => {
+            validate_action(&action)?;
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                state.niri.advance_animations();
+                let _ = tx.send_blocking(crate::agent::run_action(state, action));
+            });
+            let result = rx.recv().await;
+            let done = result.map_err(|_| String::from("error running agent action"))?;
+            done.map_err(|err| err.to_string())?;
+            Response::Handled
+        }
         Request::Agent { id, op } => {
             let id = MappedId::specific(id);
             let (tx, rx) = async_channel::bounded(1);

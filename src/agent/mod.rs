@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use calloop::timer::{TimeoutAction, Timer};
 use niri_ipc::{AgentDone, AgentError, AgentStatus, AgentWindow};
 use smithay::backend::input::{
-    ButtonState, Event as _, InputBackend, InputEvent, KeyState, KeyboardKeyEvent as _,
+    ButtonState, Event as _, InputBackend, InputEvent, InputTime, KeyState, KeyboardKeyEvent as _,
     PointerButtonEvent as _, TabletToolTipEvent as _, TabletToolTipState,
 };
 use smithay::desktop::{PopupKind, PopupManager};
@@ -31,7 +31,7 @@ use smithay::wayland::xdg_activation::XdgActivationTokenData;
 use self::capture::capture_precheck;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::{ActivateWindow, Layout};
-use crate::niri::{KeyboardFocus, Niri};
+use crate::niri::{KeyboardFocus, Niri, State};
 use crate::utils::{get_credentials_for_surface, get_monotonic_time, with_toplevel_role};
 use crate::window::mapped::{Mapped, MappedId};
 
@@ -60,6 +60,8 @@ pub struct AgentState {
     pub paused: bool,
     /// Whether the owner handed the controls over to the agent.
     pub handed_over: bool,
+    /// Set while an agent action runs: the cursor warps that follow focus changes are skipped.
+    pub suppress_warp: bool,
     /// Last capture of each window.
     // ponytail: records of closed windows are never pruned (ids are never reused); prune on
     // window close if agents ever capture enough windows for this to matter.
@@ -90,6 +92,22 @@ pub struct AgentState {
     /// Popups that agent clicks opened, kept without a grab, topmost last; with whether their
     /// window's workspace was visible at the last check.
     popups: HashMap<MappedId, Vec<(PopupKind, bool)>>,
+}
+
+/// Runs a niri action for the agent during a hand-over, without warping the owner's pointer.
+pub fn run_action(state: &mut State, action: niri_ipc::Action) -> Result<(), AgentError> {
+    if !state.niri.agent.handed_over {
+        return Err(AgentError::NotHandedOver);
+    }
+    if matches!(action, niri_ipc::Action::Quit { .. }) {
+        return Err(AgentError::ActionRefused(String::from("quit")));
+    }
+
+    state.niri.agent.suppress_warp = true;
+    state.do_action(action.into(), false, InputTime::now());
+    state.update_keyboard_focus();
+    state.niri.agent.suppress_warp = false;
+    Ok(())
 }
 
 /// Marks an xdg-activation token made while an agent acted last: it only sets urgency, whatever
