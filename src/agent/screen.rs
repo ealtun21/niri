@@ -11,6 +11,8 @@ use niri_ipc::{
     ScreenWindow,
 };
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::utils::RescaleRenderElement;
+use smithay::backend::renderer::element::Element;
 use smithay::desktop::layer_map_for_output;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::Resource as _;
@@ -263,13 +265,15 @@ fn render(
             };
             // No pointer: neither the owner's nor the agent's cursor is in the image.
             let elements = niri.render_to_vec(ctx, &output, false);
+            let (scale, elements) =
+                to_capture_scale(elements.iter().rev(), record.output_scale, record.scale);
             render_to_vec(
                 renderer,
                 record.size,
-                Scale::from(record.scale),
+                scale,
                 Transform::Normal,
                 Fourcc::Abgr8888,
-                elements.iter().rev(),
+                elements,
             )
         })
         .context("no renderer")?
@@ -287,6 +291,23 @@ fn render(
     };
     state.niri.agent.screens.insert(output.name(), record);
     Ok((capture, pixels))
+}
+
+/// The scale to render output elements at, and the elements scaled to a capture's `scale`.
+///
+/// `Niri::render` places elements in physical px of the output scale; rendered at another scale,
+/// surfaces would keep that place and change only their size. So they are rendered at the output
+/// scale and rescaled, places and sizes alike.
+fn to_capture_scale<E: Element>(
+    elements: impl IntoIterator<Item = E>,
+    output_scale: f64,
+    scale: f64,
+) -> (Scale<f64>, impl Iterator<Item = RescaleRenderElement<E>>) {
+    let factor = scale / output_scale;
+    let elements = elements
+        .into_iter()
+        .map(move |elem| RescaleRenderElement::from_element(elem, Point::from((0, 0)), factor));
+    (Scale::from(output_scale), elements)
 }
 
 /// Handles `Request::AgentScreen` pointer ops, in pixels of the output's last capture: hit-tests
@@ -569,4 +590,36 @@ fn write_png(capture: &OutputCapture, pixels: &[u8]) -> anyhow::Result<()> {
     write_png_rgba8(&mut buf, capture.width, capture.height, pixels)
         .context("error encoding PNG")?;
     std::fs::write(&capture.path, buf).context("error writing PNG")
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+    use smithay::backend::renderer::element::{Id, Kind};
+    use smithay::backend::renderer::utils::CommitCounter;
+
+    use super::*;
+
+    #[test]
+    fn scaled_capture_moves_elements_with_their_size() {
+        // A window at logical (962, 16), 932x1040, as `Niri::render` places it on outputs of scale
+        // 1 and 2, in a capture of scale 0.82: it lands at its rect in the image.
+        for output_scale in [1., 2.] {
+            let at = |v: i32| (f64::from(v) * output_scale).round() as i32;
+            let elem = SolidColorRenderElement::new(
+                Id::new(),
+                Rectangle::new((at(962), at(16)).into(), (at(932), at(1040)).into()),
+                CommitCounter::default(),
+                [0., 0., 0., 1.],
+                Kind::Unspecified,
+            );
+            let (scale, mut elems) = to_capture_scale([&elem], output_scale, 0.82);
+            let geo = elems.next().unwrap().geometry(scale);
+            assert_eq!(
+                geo,
+                Rectangle::new((789, 13).into(), (764, 853).into()),
+                "output scale {output_scale}"
+            );
+        }
+    }
 }
