@@ -17,12 +17,12 @@ fn window_arg(args: &Value) -> Result<u64, ToolOutcome> {
         .ok_or_else(|| ToolOutcome::error("bad_window: window must be a window id"))
 }
 
-fn bad(msg: impl std::fmt::Display) -> ToolOutcome {
+pub(super) fn bad(msg: impl std::fmt::Display) -> ToolOutcome {
     ToolOutcome::error(format!("bad_args: {msg}"))
 }
 
 /// niri's own error (it starts with a code). An older running niri cannot parse newer requests.
-fn niri_error(e: String) -> ToolOutcome {
+pub(super) fn niri_error(e: String) -> ToolOutcome {
     if e == "error parsing request" {
         return ToolOutcome::error(
             "niri_refused: the running niri is older than `niri mcp` and does not know this \
@@ -32,7 +32,7 @@ fn niri_error(e: String) -> ToolOutcome {
     ToolOutcome::error(e)
 }
 
-fn unreachable(e: std::io::Error) -> ToolOutcome {
+pub(super) fn unreachable(e: std::io::Error) -> ToolOutcome {
     ToolOutcome::error(format!("niri_unreachable: cannot reach niri: {e}"))
 }
 
@@ -334,7 +334,19 @@ fn key_tool(s: &mut Server, args: &Value) -> ToolOutcome {
     )
 }
 
-pub const TOOLS: [Tool; 6] = [
+fn hover_tool(s: &mut Server, args: &Value) -> ToolOutcome {
+    let id = match window_arg(args) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    let (x, y) = match point(s, id, args, "element", "x", "y") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    send(s, id, AgentOp::Move { x, y })
+}
+
+pub const TOOLS: [Tool; 7] = [
     Tool {
         name: "look",
         description: "Capture a window: returns its image and a numbered list of clickable elements. Use it first, and again after every action, before you act on a window.",
@@ -346,6 +358,12 @@ pub const TOOLS: [Tool; 6] = [
         description: "Click in a window. Give an element number from the last look when there is one, otherwise x and y pixels of the last image. Look again afterwards.",
         schema: r#"{"type":"object","properties":{"window":{"type":"integer"},"element":{"type":"integer","description":"element number from the last look"},"x":{"type":"number"},"y":{"type":"number"},"button":{"type":"string","enum":["left","right"]},"count":{"type":"integer","description":"1 to 3, 2 is a double click"},"mods":{"type":"array","items":{"type":"string","enum":["ctrl","shift","alt","super"]}}},"required":["window"]}"#,
         handler: click_tool,
+    },
+    Tool {
+        name: "hover",
+        description: "Move the agent cursor over an element number from the last look, or x and y pixels of the last image, without clicking. Use it for tooltips and hover menus. Look again afterwards.",
+        schema: r#"{"type":"object","properties":{"window":{"type":"integer"},"element":{"type":"integer","description":"element number from the last look"},"x":{"type":"number"},"y":{"type":"number"}},"required":["window"]}"#,
+        handler: hover_tool,
     },
     Tool {
         name: "type",
@@ -515,6 +533,22 @@ mod tests {
         let o = look_tool(&mut s, &json!({"window": 7}));
         assert!(o.is_error && text(&o).starts_with("paused"));
         assert_eq!(log.borrow().len(), 1);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn hover_sends_move() {
+        let (mut s, log, dir) = server(done());
+        look_tool(&mut s, &json!({"window": 7}));
+        let o = hover_tool(&mut s, &json!({"window": 7, "element": 2}));
+        assert_eq!(text(&o), "ok (capture_age_ms=12)");
+        assert!(!hover_tool(&mut s, &json!({"window": 7, "x": 3, "y": 4})).is_error);
+        assert!(matches!(
+            &agent_ops(&log)[..],
+            [AgentOp::Move { x: x0, y: y0 }, AgentOp::Move { x: 3., y: 4. }]
+                if *x0 == 110. && *y0 == 15.
+        ));
+        assert!(hover_tool(&mut s, &json!({"window": 7})).is_error);
         let _ = std::fs::remove_dir(&dir);
     }
 
