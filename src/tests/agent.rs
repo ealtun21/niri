@@ -2277,7 +2277,7 @@ fn paste_stops_when_handover_ends() {
     assert!(matches!(
         rx.try_recv().unwrap(),
         Err(AgentError::Interrupted { error, typed: TYPE_CHUNK_CHARS })
-            if *error == AgentError::PasteUnsupported
+            if *error == AgentError::NotHandedOver
     ));
     let events = events(&mut f, agent, &b);
     assert_eq!(events.matches("key pressed: 47").count(), TYPE_CHUNK_CHARS);

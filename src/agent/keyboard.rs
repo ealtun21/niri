@@ -154,8 +154,8 @@ pub fn with_keymap<T>(state: &mut State, mut f: impl FnMut(&Keymap) -> T) -> T {
 pub fn key(state: &mut State, id: MappedId, chord: &str, repeat: u16, reply: Reply) {
     let allow_paste = state.niri.agent.handed_over;
     let strokes = chord_strokes(state, chord, repeat, allow_paste);
-    // Paste chords stop when the hand-over ends.
-    let handover = allow_paste.then_some(AgentError::PasteUnsupported);
+    // A key op started in a hand-over, which allows paste chords, stops when it ends.
+    let handover = allow_paste.then_some(AgentError::NotHandedOver);
     start(state, strokes, window_op(id, handover, reply));
 }
 
