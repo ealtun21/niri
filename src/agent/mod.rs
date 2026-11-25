@@ -587,10 +587,11 @@ where
     !is_virtual_device(&device)
 }
 
-/// Whether the event ends a hand-over: a button press, scroll, touch-down, touchpad gesture start
-/// (swipe, pinch or hold), tablet tip-down or tablet tool button press from a physical device. Keys
-/// are decided in `on_keyboard`, which knows the modifiers and binds. Tablet pad buttons never get
-/// here: smithay's libinput backend drops pad events.
+/// Whether the event ends a hand-over: a button press, scroll, touch-down, touchpad swipe or pinch
+/// start, tablet tip-down or tablet tool button press from a physical device. Keys are decided in
+/// `on_keyboard`, which knows the modifiers and binds. A touchpad hold doesn't count: libinput
+/// sends one when a finger rests or the pointer pauses, which is pointing. Tablet pad buttons never
+/// get here: smithay's libinput backend drops pad events.
 pub fn ends_handover<I: InputBackend>(event: &InputEvent<I>) -> bool
 where
     I::Device: 'static,
@@ -602,7 +603,6 @@ where
         InputEvent::PointerAxis { event } => event.device(),
         InputEvent::GestureSwipeBegin { event } => event.device(),
         InputEvent::GesturePinchBegin { event } => event.device(),
-        InputEvent::GestureHoldBegin { event } => event.device(),
         InputEvent::TouchDown { event } => event.device(),
         InputEvent::TabletToolTip { event } if event.tip_state() == TabletToolTipState::Down => {
             event.device()

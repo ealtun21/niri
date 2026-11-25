@@ -2141,14 +2141,11 @@ fn owner_scroll_ends_handover() {
 #[test]
 fn owner_touchpad_gestures_end_handover() {
     let (mut f, ..) = two_clients_with(handover_config());
-    let gestures: [fn(u32) -> InputEvent<TestInputBackend>; 3] = [
+    let gestures: [fn(u32) -> InputEvent<TestInputBackend>; 2] = [
         |fingers| InputEvent::GestureSwipeBegin {
             event: TestGestureBeginEvent { fingers },
         },
         |fingers| InputEvent::GesturePinchBegin {
-            event: TestGestureBeginEvent { fingers },
-        },
-        |fingers| InputEvent::GestureHoldBegin {
             event: TestGestureBeginEvent { fingers },
         },
     ];
@@ -2157,6 +2154,17 @@ fn owner_touchpad_gestures_end_handover() {
         f.niri_state().process_input_event(gesture(3));
         assert!(!f.niri().agent.handed_over, "gesture {i}");
     }
+}
+
+#[test]
+fn owner_touchpad_hold_keeps_handover() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    // libinput sends a one-finger hold when a finger rests or the pointer pauses on a touchpad.
+    let event = TestGestureBeginEvent { fingers: 1 };
+    f.niri_state()
+        .process_input_event(InputEvent::<TestInputBackend>::GestureHoldBegin { event });
+    assert!(f.niri().agent.handed_over);
 }
 
 #[test]
