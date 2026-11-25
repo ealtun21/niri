@@ -107,6 +107,9 @@ pub struct Workspace<W: LayoutElement> {
     /// Optional name of this workspace.
     pub(super) name: Option<String>,
 
+    /// Whether this named workspace goes away when empty (`on-demand` in its config).
+    pub(super) on_demand: bool,
+
     /// Layout config overrides for this workspace.
     layout_config: Option<niri_config::LayoutPart>,
 
@@ -273,6 +276,7 @@ impl<W: LayoutElement> Workspace<W> {
             clock,
             base_options,
             options,
+            on_demand: config.as_ref().is_some_and(|c| c.on_demand),
             name: config.map(|c| c.name.0),
             layout_config,
             id: WorkspaceId::next(),
@@ -335,6 +339,7 @@ impl<W: LayoutElement> Workspace<W> {
             clock,
             base_options,
             options,
+            on_demand: config.as_ref().is_some_and(|c| c.on_demand),
             name: config.map(|c| c.name.0),
             layout_config,
             id: WorkspaceId::next(),
@@ -358,7 +363,7 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn has_windows_or_name(&self) -> bool {
-        self.has_windows() || self.name.is_some()
+        self.has_windows() || (self.name.is_some() && !self.on_demand)
     }
 
     pub fn scale(&self) -> smithay::output::Scale {

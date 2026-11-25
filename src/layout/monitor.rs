@@ -764,6 +764,25 @@ impl<W: LayoutElement> Monitor<W> {
         self.clean_up_workspaces();
     }
 
+    /// Inserts a workspace right above the last empty one, without cleaning up empty workspaces
+    /// afterwards, so that the caller can add a window to it first.
+    pub(super) fn insert_workspace_above_last(&mut self, mut ws: Workspace<W>) {
+        ws.set_output(Some(self.output.clone()));
+        ws.update_config(self.options.clone());
+
+        // Like insert_workspace(), stop a switch whose indices are about to shift, and clean up the
+        // way the finished switch would have.
+        if self.workspace_switch.take().is_some() {
+            self.clean_up_workspaces();
+        }
+
+        let idx = self.workspaces.len() - 1;
+        self.workspaces.insert(idx, ws);
+        if idx <= self.active_workspace_idx {
+            self.active_workspace_idx += 1;
+        }
+    }
+
     pub fn append_workspaces(&mut self, mut workspaces: Vec<Workspace<W>>) {
         if workspaces.is_empty() {
             return;

@@ -901,6 +901,7 @@ impl Op {
                         .map(|name| format!("output{name}"))
                         .collect(),
                     layout: layout_config.map(|x| niri_config::WorkspaceLayoutPart(*x)),
+                    on_demand: false,
                 });
             }
             Op::UnnameWorkspace { ws_name } => {

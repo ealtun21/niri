@@ -1231,6 +1231,19 @@ impl State {
         // Set the tiled state for the initial configure.
         update_tiled_state(toplevel, config.prefer_no_csd, rules.tiled_state);
 
+        // A missing on-demand workspace is created when the window maps, so keep its name.
+        let workspace_name = rules
+            .open_on_workspace
+            .clone()
+            .filter(|name| {
+                self.niri.layout.find_workspace_by_name(name).is_none()
+                    && config
+                        .workspaces
+                        .iter()
+                        .any(|ws| ws.on_demand && ws.name.0 == *name)
+            })
+            .or_else(|| ws.and_then(|w| w.name().cloned()));
+
         // Set the configured settings.
         *state = InitialConfigureState::Configured {
             rules,
@@ -1240,7 +1253,7 @@ impl State {
             floating_height,
             is_full_width,
             output,
-            workspace_name: ws.and_then(|w| w.name().cloned()),
+            workspace_name,
             is_pending_maximized,
         };
 

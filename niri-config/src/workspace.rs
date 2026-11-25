@@ -10,6 +10,9 @@ pub struct Workspace {
     pub open_on_output: Vec<String>,
     #[knuffel(child)]
     pub layout: Option<WorkspaceLayoutPart>,
+    /// Created when a window opens on it and removed once empty, like an unnamed workspace.
+    #[knuffel(child)]
+    pub on_demand: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

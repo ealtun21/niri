@@ -719,6 +719,28 @@ impl RenderLayer {
     }
 }
 
+/// The monitor a named workspace from the config opens on.
+fn named_workspace_monitor_idx<W: LayoutElement>(
+    monitors: &[Monitor<W>],
+    primary_idx: usize,
+    active_monitor_idx: usize,
+    ws_config: &WorkspaceConfig,
+) -> usize {
+    if ws_config.open_on_output.is_empty() {
+        return active_monitor_idx;
+    }
+
+    ws_config
+        .open_on_output
+        .iter()
+        .find_map(|name| {
+            monitors
+                .iter()
+                .position(|monitor| output_matches_name(&monitor.output, name))
+        })
+        .unwrap_or(primary_idx)
+}
+
 impl<W: LayoutElement> Layout<W> {
     pub fn new(clock: Clock, config: &Config) -> Self {
         Self::with_options_and_workspaces(clock, config, Options::from_config(config))
@@ -746,6 +768,7 @@ impl<W: LayoutElement> Layout<W> {
         let workspaces = config
             .workspaces
             .iter()
+            .filter(|ws| !ws.on_demand)
             .map(|ws| {
                 Workspace::new_with_config_no_outputs(Some(ws.clone()), clock.clone(), opts.clone())
             })
@@ -2963,7 +2986,7 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn ensure_named_workspace(&mut self, ws_config: &WorkspaceConfig) {
-        if self.find_workspace_by_name(&ws_config.name.0).is_some() {
+        if ws_config.on_demand || self.find_workspace_by_name(&ws_config.name.0).is_some() {
             return;
         }
 
@@ -2976,19 +2999,12 @@ impl<W: LayoutElement> Layout<W> {
                 primary_idx,
                 active_monitor_idx,
             } => {
-                let mon_idx = if ws_config.open_on_output.is_empty() {
-                    *active_monitor_idx
-                } else {
-                    ws_config
-                        .open_on_output
-                        .iter()
-                        .find_map(|name| {
-                            monitors
-                                .iter()
-                                .position(|monitor| output_matches_name(&monitor.output, name))
-                        })
-                        .unwrap_or(*primary_idx)
-                };
+                let mon_idx = named_workspace_monitor_idx(
+                    monitors,
+                    *primary_idx,
+                    *active_monitor_idx,
+                    ws_config,
+                );
                 let mon = &mut monitors[mon_idx];
 
                 let ws = Workspace::new_with_config(
@@ -3007,11 +3023,54 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
+    /// Adds an `on-demand` named workspace above the last empty one of its monitor, for a window
+    /// about to open on it.
+    ///
+    /// Unlike `ensure_named_workspace()`, this skips the empty workspace clean-up, which would
+    /// remove the new workspace before the window gets there.
+    pub fn add_on_demand_workspace(&mut self, ws_config: &WorkspaceConfig) -> WorkspaceId {
+        let clock = self.clock.clone();
+        let options = self.options.clone();
+
+        match &mut self.monitor_set {
+            MonitorSet::Normal {
+                monitors,
+                primary_idx,
+                active_monitor_idx,
+            } => {
+                let mon_idx = named_workspace_monitor_idx(
+                    monitors,
+                    *primary_idx,
+                    *active_monitor_idx,
+                    ws_config,
+                );
+                let mon = &mut monitors[mon_idx];
+                let ws = Workspace::new_with_config(
+                    mon.output.clone(),
+                    Some(ws_config.clone()),
+                    clock,
+                    options,
+                );
+                let id = ws.id();
+                mon.insert_workspace_above_last(ws);
+                id
+            }
+            MonitorSet::NoOutputs { workspaces } => {
+                let ws =
+                    Workspace::new_with_config_no_outputs(Some(ws_config.clone()), clock, options);
+                let id = ws.id();
+                workspaces.push(ws);
+                id
+            }
+        }
+    }
+
     pub fn update_config(&mut self, config: &Config) {
         // Update workspace-specific config for all named workspaces.
         for ws in self.workspaces_mut() {
             let Some(name) = ws.name() else { continue };
             if let Some(config) = config.workspaces.iter().find(|w| &w.name.0 == name) {
+                ws.on_demand = config.on_demand;
                 ws.update_layout_config(config.layout.clone().map(|x| x.0));
             }
         }

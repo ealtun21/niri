@@ -97,6 +97,7 @@ impl CompositorHandler for State {
                         is_full_width,
                         output,
                         workspace_id,
+                        on_demand,
                         is_pending_maximized,
                     ) = if let InitialConfigureState::Configured {
                         rules,
@@ -120,6 +121,18 @@ impl CompositorHandler for State {
                             .and_then(|n| self.niri.layout.find_workspace_by_name(n))
                             .map(|(_, ws)| ws.id());
 
+                        // Or it's an on-demand workspace that doesn't exist (yet or anymore).
+                        let on_demand =
+                            workspace_name
+                                .filter(|_| workspace_id.is_none())
+                                .and_then(|name| {
+                                    let config = self.niri.config.borrow();
+                                    let mut workspaces = config.workspaces.iter();
+                                    workspaces
+                                        .find(|ws| ws.on_demand && ws.name.0 == name)
+                                        .cloned()
+                                });
+
                         (
                             rules,
                             width,
@@ -127,6 +140,7 @@ impl CompositorHandler for State {
                             is_full_width,
                             output,
                             workspace_id,
+                            on_demand,
                             is_pending_maximized,
                         )
                     } else {
@@ -138,6 +152,7 @@ impl CompositorHandler for State {
                             None,
                             None,
                             false,
+                            None,
                             None,
                             None,
                             false,
@@ -206,6 +221,15 @@ impl CompositorHandler for State {
                         activate,
                         workspace_id,
                     );
+
+                    // Create a missing on-demand workspace only now, right before the window lands
+                    // on it, so that it never sits empty.
+                    let workspace_id = match (workspace_id, on_demand) {
+                        (None, Some(ws_config)) if parent.is_none() => {
+                            Some(self.niri.layout.add_on_demand_workspace(&ws_config))
+                        }
+                        (id, _) => id,
+                    };
 
                     let target = if let Some(p) = &parent {
                         // Open dialogs next to their parent window.
