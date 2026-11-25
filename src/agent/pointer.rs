@@ -20,7 +20,7 @@ use smithay::reexports::wayland_server::{Client, Resource as _};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use super::cursor::place_on_window;
-use super::keyboard::{enter_keyboards, finish_burst, with_keymap};
+use super::keyboard::{enter_keyboards, finish_burst, rest_modifiers, with_keymap};
 use super::{
     agent_done, check_target, CaptureRecord, OpKind, PointerFocus, Target, MAX_DRAG_STEPS,
 };
@@ -124,25 +124,26 @@ pub fn deliver_pointer(
     let Some((x, y)) = start_point(op) else {
         return Ok(());
     };
+    let id = target.id.ok_or(AgentError::WindowGone)?;
     // Look the window up again: it may have closed or been replaced since the checks.
     let window = state
         .niri
-        .find_mapped_output_by_id(target.id)
+        .find_mapped_output_by_id(id)
         .map(|(mapped, _)| mapped.window.clone())
         .ok_or(AgentError::WindowGone)?;
     let buf = capture_to_buffer(x, y, rec);
     let (surface, offset) = match window.surface_under(buf, WindowSurfaceType::ALL) {
         Some((surface, offset)) => (surface, offset.to_f64()),
-        None => (target.toplevel.clone(), Point::default()),
+        None => (target.surface.clone(), Point::default()),
     };
 
     let to_local = |x, y| capture_to_buffer(x, y, rec) - offset;
     deliver_window(state, target, &surface, &to_local, op)?;
 
     let niri = &mut state.niri;
-    place_on_window(niri, target.id, buf);
+    place_on_window(niri, id, buf);
     if let AgentOp::Drag { x1, y1, .. } = op {
-        place_on_window(niri, target.id, capture_to_buffer(*x1, *y1, rec));
+        place_on_window(niri, id, capture_to_buffer(*x1, *y1, rec));
     }
     Ok(())
 }
@@ -167,7 +168,7 @@ pub(super) fn deliver_window(
 }
 
 /// Like `deliver_to_surface`, with a click's modifiers held on the keyboards that `enter` gives the
-/// shadow focus, and cleared after. Also returns whether modifiers went out.
+/// shadow focus, and at rest after (see `rest_modifiers`). Also returns whether modifiers went out.
 pub(super) fn deliver_with_mods(
     state: &mut State,
     client: &Client,
@@ -201,10 +202,7 @@ pub(super) fn deliver_with_mods(
 
     let result = deliver_to_surface(state, client, surface, to_local, op);
 
-    for keyboard in &keyboards {
-        let serial = state.niri.agent.next_serial().into();
-        keyboard.modifiers(serial, 0, 0, 0, group);
-    }
+    rest_modifiers(&mut state.niri, client, &keyboards, group);
     (result, !keyboards.is_empty())
 }
 

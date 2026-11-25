@@ -164,12 +164,14 @@ pub enum Request {
         /// The action to run.
         action: Action,
     },
-    /// Perform an agent pointer operation anywhere on an output during a hand-over.
+    /// Perform an agent operation anywhere on screen during a hand-over.
     ///
-    /// Coordinates are pixels of the output's last [`Request::CaptureOutput`]. Refused unless the
+    /// Pointer coordinates are pixels of the output's last [`Request::CaptureOutput`]. Keys and
+    /// text go to whatever has the keyboard focus, never through niri binds. Refused unless the
     /// owner handed over the controls.
     AgentScreen {
-        /// Name of the output. Defaults to the agent cursor's output, else the active one.
+        /// Name of the output for pointer operations. Defaults to the agent cursor's output, else
+        /// the active one.
         output: Option<String>,
         /// The operation.
         op: AgentOp,
@@ -226,7 +228,7 @@ pub enum Response {
     OutputCapture(OutputCapture),
     /// Result of an agent operation.
     AgentDone(AgentDone),
-    /// Result of an agent screen operation: what was under the point.
+    /// Result of an agent screen operation: what was under the point, or what took the keys.
     AgentScreenDone(ScreenHit),
     /// The agent status.
     AgentState(AgentStatus),
@@ -494,7 +496,8 @@ pub enum ScreenHit {
     },
     /// The overview.
     Overview,
-    /// Nothing: an empty spot, or a hot corner.
+    /// Nothing: an empty spot, a hot corner, or, for keys, no window or layer surface has the
+    /// keyboard focus.
     Nothing,
 }
 

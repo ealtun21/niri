@@ -1611,10 +1611,12 @@ impl State {
                 }
             }
 
-            // The agent's shadow focus must leave before set_focus() below enters its client.
-            if focus
-                .surface()
-                .is_some_and(|s| self.niri.agent.is_sticky_client(s))
+            // The agent's shadow focus must leave before set_focus() below enters or leaves its
+            // client.
+            if [focus.surface(), self.niri.keyboard_focus.surface()]
+                .into_iter()
+                .flatten()
+                .any(|s| self.niri.agent.is_sticky_client(s))
             {
                 self.niri.agent.release_sticky();
             }

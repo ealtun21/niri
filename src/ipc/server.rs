@@ -560,13 +560,13 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             Response::Handled
         }
         Request::AgentScreen { output, op } => {
-            // shortcut: keyboard ops for the screen come with the seat-focus delivery (Task 10).
-            if matches!(op, AgentOp::Key { .. } | AgentOp::Type { .. }) {
-                return Err(String::from("screen keyboard ops are not supported yet"));
-            }
             let (tx, rx) = async_channel::bounded(1);
             ctx.event_loop.insert_idle(move |state| {
-                crate::agent::screen::screen_pointer(state, output, &op, tx);
+                if matches!(op, AgentOp::Key { .. } | AgentOp::Type { .. }) {
+                    crate::agent::screen::screen_keys(state, &op, tx);
+                } else {
+                    crate::agent::screen::screen_pointer(state, output, &op, tx);
+                }
             });
             let result = rx.recv().await;
             let hit = result.map_err(|_| String::from("error running agent screen op"))?;

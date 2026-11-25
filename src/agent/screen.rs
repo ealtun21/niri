@@ -19,11 +19,13 @@ use smithay::wayland::shell::wlr_layer::Layer;
 
 use super::capture::{capture_popups, settle_time};
 use super::cursor::move_cursor;
-use super::keyboard::enter_keyboards_on;
+use super::keyboard::{
+    chord_strokes, enter_keyboards_on, finish_burst, start, text_strokes, ChunkedOp,
+};
 use super::pointer::{deliver_window, deliver_with_mods, start_point};
-use super::{boost_frames, capture_scale, check_target, OpKind, DEFAULT_MAX_EDGE};
+use super::{boost_frames, capture_scale, check_target, OpKind, Target, DEFAULT_MAX_EDGE};
 use crate::input::move_grab::overview_activate;
-use crate::niri::{Niri, PointContents, State};
+use crate::niri::{KeyboardFocus, Niri, PointContents, State};
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
 use crate::utils::{get_credentials_for_surface, write_png_rgba8};
 use crate::window::mapped::MappedId;
@@ -363,15 +365,18 @@ fn screen_op(state: &mut State, name: Option<&str>, op: &AgentOp) -> Result<Scre
                     state.niri.focus_layer_surface_if_on_demand(Some(layer));
                 });
             }
-            let client = surface.client().ok_or(AgentError::WindowGone)?;
+            let target = Target {
+                id: None,
+                surface: layer.wl_surface().clone(),
+                client: surface.client().ok_or(AgentError::WindowGone)?,
+            };
             let to_local = |x, y| to_global(x, y) - *surface_pos;
-            let main = layer.wl_surface().clone();
-            let enter = |niri: &mut Niri| enter_keyboards_on(niri, &client, main);
+            let main = target.surface.clone();
+            let enter = |niri: &mut Niri| enter_keyboards_on(niri, &target.client, main);
             let (result, sent_mods) =
-                deliver_with_mods(state, &client, surface, &to_local, op, enter);
+                deliver_with_mods(state, &target.client, surface, &to_local, op, enter);
             if result.is_ok() || sent_mods {
-                // No window to note the burst on, but the idle release needs its time.
-                state.niri.agent.last_agent_burst = Some(Instant::now());
+                finish_burst(&mut state.niri, &target);
             }
             result?;
             ScreenHit::Layer {
@@ -429,6 +434,83 @@ fn screen_op(state: &mut State, name: Option<&str>, op: &AgentOp) -> Result<Scre
         move_cursor(&mut state.niri, &output, to_output(*x1, *y1));
     }
     Ok(hit)
+}
+
+/// Handles `Request::AgentScreen` keyboard ops: the keys go where the seat's keyboard focus is, as
+/// the owner's would, but straight to the client, so they never trigger niri binds. That is a
+/// window, through the hand-over guards, or a layer surface; nothing for niri's own UI.
+pub fn screen_keys(state: &mut State, op: &AgentOp, reply: Sender<Result<ScreenHit, AgentError>>) {
+    if !state.niri.agent.handed_over {
+        let _ = reply.send_blocking(Err(AgentError::NotHandedOver));
+        return;
+    }
+    // A focus change earlier in this loop pass hasn't reached keyboard_focus yet.
+    state.update_keyboard_focus();
+    let Some((target, hit)) = focus_target(&state.niri) else {
+        let _ = reply.send_blocking(Ok(ScreenHit::Nothing));
+        return;
+    };
+    let strokes = match op {
+        AgentOp::Key { chord, repeat } => chord_strokes(state, chord, *repeat, true),
+        AgentOp::Type { text } => text_strokes(state, text),
+        // Pointer ops go to `screen_pointer`.
+        _ => Ok(Vec::new()),
+    };
+    let op = ChunkedOp {
+        check: Box::new(move |state| check_focus_target(&state.niri, &target)),
+        done: Box::new(move |_| hit),
+        reply,
+    };
+    start(state, strokes, op);
+}
+
+/// What holds the seat's keyboard focus, as a key target, and the hit to report.
+fn focus_target(niri: &Niri) -> Option<(Target, ScreenHit)> {
+    let (id, surface, hit) = match &niri.keyboard_focus {
+        KeyboardFocus::Layout {
+            surface: Some(surface),
+        } => {
+            let (mapped, _) = niri.layout.find_window_and_output(surface)?;
+            let id = mapped.id();
+            (Some(id), surface, ScreenHit::Window { id: id.get() })
+        }
+        KeyboardFocus::LayerShell { surface } => {
+            let layer = niri
+                .mapped_layer_surfaces
+                .keys()
+                .find(|layer| layer.wl_surface() == surface)?;
+            let namespace = layer.namespace().to_owned();
+            (None, surface, ScreenHit::Layer { namespace })
+        }
+        _ => return None,
+    };
+    let target = Target {
+        id,
+        surface: surface.clone(),
+        client: surface.client()?,
+    };
+    Some((target, hit))
+}
+
+/// The checks a screen `key` or `type` runs before each chunk: the hand-over goes on, and the
+/// window passes its guards, or the layer surface is still mapped and not blocked out.
+fn check_focus_target(niri: &Niri, target: &Target) -> Result<Target, AgentError> {
+    if !niri.agent.handed_over {
+        return Err(AgentError::NotHandedOver);
+    }
+    if let Some(id) = target.id {
+        return check_target(niri, id, OpKind::Screen);
+    }
+    let mapped = niri
+        .mapped_layer_surfaces
+        .iter()
+        .find(|(layer, _)| *layer.wl_surface() == target.surface)
+        .map(|(_, mapped)| mapped)
+        .ok_or(AgentError::WindowGone)?;
+    if mapped.rules().block_out_from.is_some() {
+        return Err(AgentError::BlockedOut);
+    }
+    Ok(target.clone())
 }
 
 /// The topmost of the windows, listed topmost first, whose rect holds `at`.

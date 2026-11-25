@@ -10,9 +10,10 @@ use async_channel::Sender;
 use calloop::timer::{TimeoutAction, Timer};
 use niri_ipc::{AgentDone, AgentError};
 use smithay::input::keyboard::xkb::{self, Keymap, Keysym};
+use smithay::input::keyboard::SerializedMods;
 use smithay::reexports::wayland_server::protocol::wl_keyboard::{KeyState, WlKeyboard};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::Client;
+use smithay::reexports::wayland_server::{Client, Resource as _};
 
 use super::{
     agent_done, boost_frames, check_target, OpKind, Sticky, Target, ACTIVE_INDICATOR, BURST_BOOST,
@@ -25,7 +26,17 @@ use crate::window::mapped::MappedId;
 /// How often to check for an idle shadow keyboard focus.
 const IDLE_CHECK: Duration = Duration::from_secs(1);
 
-type Reply = Sender<Result<AgentDone, AgentError>>;
+type Reply<T = AgentDone> = Sender<Result<T, AgentError>>;
+
+/// Runs a `key` or `type` op's checks and returns where the next chunk goes.
+pub type Check = Box<dyn Fn(&mut State) -> Result<Target, AgentError>>;
+
+/// What a `key` or `type` op checks before each chunk, and its reply once every stroke went out.
+pub struct ChunkedOp<T> {
+    pub check: Check,
+    pub done: Box<dyn FnOnce(&Niri) -> T>,
+    pub reply: Reply<T>,
+}
 
 /// A key press with the layout and modifiers it needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,20 +153,32 @@ pub fn with_keymap<T>(state: &mut State, mut f: impl FnMut(&Keymap) -> T) -> T {
 /// Handles the `key` op: presses the chord `repeat` times.
 pub fn key(state: &mut State, id: MappedId, chord: &str, repeat: u16, reply: Reply) {
     let allow_paste = state.niri.agent.handed_over;
-    match with_keymap(state, |keymap| parse_chord(keymap, chord, allow_paste)) {
-        Ok(stroke) => {
-            let strokes = vec![stroke; usize::from(repeat.max(1))];
-            deliver_chunked(state, id, strokes, 0, allow_paste, reply);
-        }
-        Err(err) => {
-            let _ = reply.send_blocking(Err(err));
-        }
-    }
+    let strokes = chord_strokes(state, chord, repeat, allow_paste);
+    // Paste chords stop when the hand-over ends.
+    let handover = allow_paste.then_some(AgentError::PasteUnsupported);
+    start(state, strokes, window_op(id, handover, reply));
 }
 
-/// Handles the `type` op. Fails without typing anything if a character has no key.
+/// Handles the `type` op.
 pub fn type_text(state: &mut State, id: MappedId, text: &str, reply: Reply) {
-    let strokes = with_keymap(state, |keymap| {
+    let strokes = text_strokes(state, text);
+    start(state, strokes, window_op(id, None, reply));
+}
+
+/// The strokes that press the chord `repeat` times.
+pub fn chord_strokes(
+    state: &mut State,
+    chord: &str,
+    repeat: u16,
+    allow_paste: bool,
+) -> Result<Vec<KeyStroke>, AgentError> {
+    let stroke = with_keymap(state, |keymap| parse_chord(keymap, chord, allow_paste))?;
+    Ok(vec![stroke; usize::from(repeat.max(1))])
+}
+
+/// The strokes that type the text. Fails if a character has no key.
+pub fn text_strokes(state: &mut State, text: &str) -> Result<Vec<KeyStroke>, AgentError> {
+    with_keymap(state, |keymap| {
         // Each lookup scans the whole keymap; text repeats few characters many times.
         let mut found = HashMap::new();
         text.chars()
@@ -164,36 +187,51 @@ pub fn type_text(state: &mut State, id: MappedId, text: &str, reply: Reply) {
                 stroke.ok_or(AgentError::UnmappableChar(ch))
             })
             .collect::<Result<Vec<_>, _>>()
-    });
+    })
+}
+
+/// A window `key` or `type`: the window's guards before each chunk, then, when `handover` is
+/// set, that the hand-over goes on, failing with `handover` once it ended.
+fn window_op(id: MappedId, handover: Option<AgentError>, reply: Reply) -> ChunkedOp<AgentDone> {
+    ChunkedOp {
+        check: Box::new(move |state| {
+            let target = check_target(&state.niri, id, OpKind::Keyboard)?;
+            match &handover {
+                Some(error) if !state.niri.agent.handed_over => Err(error.clone()),
+                _ => Ok(target),
+            }
+        }),
+        done: Box::new(move |niri| agent_done(niri, id)),
+        reply,
+    }
+}
+
+/// Delivers the strokes of a `key` or `type` op, or replies with the error that made none.
+pub fn start<T: 'static>(
+    state: &mut State,
+    strokes: Result<Vec<KeyStroke>, AgentError>,
+    op: ChunkedOp<T>,
+) {
     match strokes {
-        Ok(strokes) => deliver_chunked(state, id, strokes, 0, false, reply),
+        Ok(strokes) => deliver_chunked(state, strokes, 0, op),
         Err(err) => {
-            let _ = reply.send_blocking(Err(err));
+            let _ = op.reply.send_blocking(Err(err));
         }
     }
 }
 
 /// Delivers `strokes[sent..]`, `TYPE_CHUNK_CHARS` at a time with `TYPE_CHUNK_INTERVAL` in
-/// between, re-checking the target before each chunk. `needs_handover` strokes may paste, so they
-/// stop when the hand-over ends.
-fn deliver_chunked(
+/// between, running the op's checks before each chunk.
+fn deliver_chunked<T: 'static>(
     state: &mut State,
-    id: MappedId,
     strokes: Vec<KeyStroke>,
     sent: usize,
-    needs_handover: bool,
-    reply: Reply,
+    op: ChunkedOp<T>,
 ) {
     // A focus bind earlier in this loop pass hasn't reached keyboard_focus yet; refresh does that
     // only after this callback.
     state.update_keyboard_focus();
-    let target = match check_target(&state.niri, id, OpKind::Keyboard).and_then(|target| {
-        if needs_handover && !state.niri.agent.handed_over {
-            Err(AgentError::PasteUnsupported)
-        } else {
-            Ok(target)
-        }
-    }) {
+    let target = match (op.check)(state) {
         Ok(target) => target,
         Err(error) => {
             let error = if sent == 0 {
@@ -204,7 +242,7 @@ fn deliver_chunked(
                     typed: sent,
                 }
             };
-            let _ = reply.send_blocking(Err(error));
+            let _ = op.reply.send_blocking(Err(error));
             return;
         }
     };
@@ -221,42 +259,45 @@ fn deliver_chunked(
         // kernel, about 16k strokes at 76 bytes each) and is disconnected. That can be any
         // granted window, including an owner window granted by keybind. Upgrade: wait for the
         // target's commit between chunks.
-        let mut next = Some((strokes, reply));
+        let mut next = Some((strokes, op));
         let timer = Timer::from_duration(TYPE_CHUNK_INTERVAL);
         state
             .niri
             .event_loop
             .insert_source(timer, move |_, _, state| {
-                if let Some((strokes, reply)) = next.take() {
-                    deliver_chunked(state, id, strokes, end, needs_handover, reply);
+                if let Some((strokes, op)) = next.take() {
+                    deliver_chunked(state, strokes, end, op);
                 }
                 TimeoutAction::Drop
             })
             .unwrap();
     } else {
-        let _ = reply.send_blocking(Ok(agent_done(&state.niri, id)));
+        let ChunkedOp { done, reply, .. } = op;
+        let _ = reply.send_blocking(Ok(done(&state.niri)));
     }
 }
 
 /// Gives the target's keyboards the shadow focus, sending `enter` to those that lack it, and
-/// returns them. The focus goes to the target's topmost agent popup, as its grab would send it,
-/// or else to the toplevel. Leaves any other surface's shadow focus first.
+/// returns them. The focus goes to the window's topmost agent popup, as its grab would send it,
+/// or else to the target's surface. Leaves any other surface's shadow focus first.
 pub fn enter_keyboards(niri: &mut Niri, target: &Target) -> Vec<WlKeyboard> {
-    let surface = niri
-        .agent
-        .topmost_popup(target.id)
-        .unwrap_or_else(|| target.toplevel.clone());
+    let surface = target
+        .id
+        .and_then(|id| niri.agent.topmost_popup(id))
+        .unwrap_or_else(|| target.surface.clone());
     enter_keyboards_on(niri, &target.client, surface)
 }
 
 /// Gives `surface` the shadow focus of its client's keyboards, sending `enter` to those that lack
 /// it, and returns them. Leaves any other surface's shadow focus first. When the seat focuses
 /// `surface`, its keyboards are already entered: they get no `enter` and no shadow focus, so the
-/// agent never sends the `leave` that is the seat's to send.
+/// agent never sends the `leave` that is the seat's to send. When the seat focuses another
+/// surface of the client, that one gets `leave` first, as when a popup grab takes the keyboard,
+/// so the client never has two surfaces entered; the release gives it back.
 pub fn enter_keyboards_on(niri: &mut Niri, client: &Client, surface: WlSurface) -> Vec<WlKeyboard> {
     let seat_keyboard = niri.seat.get_keyboard().unwrap();
     let keyboards: Vec<WlKeyboard> = seat_keyboard.client_keyboards(client).collect();
-    let seat_focused = seat_keyboard.current_focus().as_ref() == Some(&surface);
+    let seat_focus = seat_keyboard.current_focus();
     let agent = &mut niri.agent;
 
     if agent
@@ -266,14 +307,23 @@ pub fn enter_keyboards_on(niri: &mut Niri, client: &Client, surface: WlSurface) 
     {
         agent.release_sticky();
     }
-    if seat_focused {
+    if seat_focus.as_ref() == Some(&surface) {
         agent.sticky = None;
         return keyboards;
     }
-    let entered = agent
-        .sticky
-        .take()
-        .map_or_else(Vec::new, |sticky| sticky.keyboards);
+    let (entered, restore) = match agent.sticky.take() {
+        Some(sticky) => (sticky.keyboards, sticky.restore),
+        None => {
+            let restore = seat_focus.filter(|s| s.client().is_some_and(|c| c.id() == client.id()));
+            if let Some(seat_surface) = &restore {
+                let serial = agent.next_serial().into();
+                for keyboard in &keyboards {
+                    keyboard.leave(serial, seat_surface);
+                }
+            }
+            (Vec::new(), restore.map(|s| (s, seat_keyboard)))
+        }
+    };
     let serial = agent.next_serial().into();
     // Also catches keyboards the client made after the first enter.
     for keyboard in keyboards.iter().filter(|k| !entered.contains(k)) {
@@ -282,12 +332,45 @@ pub fn enter_keyboards_on(niri: &mut Niri, client: &Client, surface: WlSurface) 
     agent.sticky = Some(Sticky {
         surface,
         keyboards: keyboards.clone(),
+        restore,
     });
     keyboards
 }
 
+/// Ends an agent burst into the client's keyboards. While the seat focuses the client, they get
+/// the seat's modifiers back, since the seat sends its own only when they change; otherwise none,
+/// in `layout`, until the seat's `enter` sends the real ones.
+pub fn rest_modifiers(niri: &mut Niri, client: &Client, keyboards: &[WlKeyboard], layout: u32) {
+    if keyboards.is_empty() {
+        return;
+    }
+    let seat = niri.seat.get_keyboard().unwrap();
+    let seat_on_client = seat
+        .current_focus()
+        .and_then(|s| s.client())
+        .is_some_and(|c| c.id() == client.id());
+    let mods = if seat_on_client {
+        seat.modifier_state().serialized
+    } else {
+        SerializedMods {
+            layout_effective: layout,
+            ..SerializedMods::default()
+        }
+    };
+    let serial = niri.agent.next_serial().into();
+    for keyboard in keyboards {
+        keyboard.modifiers(
+            serial,
+            mods.depressed,
+            mods.latched,
+            mods.locked,
+            mods.layout_effective,
+        );
+    }
+}
+
 /// Sends the strokes to the target's keyboards, entering it first unless it already has the
-/// shadow focus. Every pressed key is released and modifiers are cleared at the end.
+/// shadow focus. Every pressed key is released, and the modifiers rest at the end.
 pub fn deliver_keys(state: &mut State, target: &Target, strokes: &[KeyStroke]) {
     let niri = &mut state.niri;
     let keyboards = enter_keyboards(niri, target);
@@ -306,20 +389,23 @@ pub fn deliver_keys(state: &mut State, target: &Target, strokes: &[KeyStroke]) {
         send(&|k, serial| k.key(serial, time, stroke.keycode, KeyState::Released));
     }
     let layout = strokes.last().map_or(0, |stroke| stroke.layout);
-    send(&|k, serial| k.modifiers(serial, 0, 0, 0, layout));
+    rest_modifiers(niri, &target.client, &keyboards, layout);
 
     finish_burst(niri, target);
 }
 
-/// Bookkeeping after an agent burst into the target: activity indicator, `last_*`, frame boost.
+/// Bookkeeping after an agent burst into the target: `last_agent_burst` and the idle release, and
+/// for a window the activity indicator, the other `last_*` and a frame boost.
 pub fn finish_burst(niri: &mut Niri, target: &Target) {
     let agent = &mut niri.agent;
     let now = Instant::now();
-    agent.active_until.insert(target.id, now + ACTIVE_INDICATOR);
-    agent.last_burst.insert(target.client.id(), now);
-    agent.last_target.insert(target.client.id(), target.id);
     agent.last_agent_burst = Some(now);
-    boost_frames(niri, target.id, now + BURST_BOOST);
+    if let Some(id) = target.id {
+        agent.active_until.insert(id, now + ACTIVE_INDICATOR);
+        agent.last_burst.insert(target.client.id(), now);
+        agent.last_target.insert(target.client.id(), id);
+        boost_frames(niri, id, now + BURST_BOOST);
+    }
     start_idle_timer(niri);
 }
 

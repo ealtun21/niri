@@ -18,6 +18,7 @@ use smithay::backend::input::{
     PointerButtonEvent as _, TabletToolTipEvent as _, TabletToolTipState,
 };
 use smithay::desktop::{PopupKind, PopupManager};
+use smithay::input::keyboard::KeyboardHandle;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::protocol::wl_keyboard::WlKeyboard;
@@ -139,6 +140,9 @@ pub struct AgentGuardMarker;
 pub struct Sticky {
     pub surface: WlSurface,
     pub keyboards: Vec<WlKeyboard>,
+    /// The surface of the same client that the seat focuses, which the keyboards left for this
+    /// one, and the seat's keyboard: the release enters it again, as when a popup grab ends.
+    pub restore: Option<(WlSurface, KeyboardHandle<State>)>,
 }
 
 /// A surface the agent pointer is entered on, and the pointers that got its `enter`.
@@ -176,11 +180,13 @@ pub fn window_view(mapped: &Mapped, output: Option<&Output>) -> (Size<i32, Logic
     )
 }
 
-/// A window an agent may act on.
+/// A window or layer surface an agent may act on.
 #[derive(Debug, Clone)]
 pub struct Target {
-    pub id: MappedId,
-    pub toplevel: WlSurface,
+    /// The window; `None` for a layer surface.
+    pub id: Option<MappedId>,
+    /// The window's toplevel surface, or the layer surface.
+    pub surface: WlSurface,
     pub client: Client,
 }
 
@@ -210,10 +216,14 @@ impl AgentState {
     }
 
     /// Takes the controls back from the agent; it stays unpaused. Agents reach layer surfaces only
-    /// while handed over, so their menus close.
+    /// while handed over, so their menus close. A client whose keyboard the agent moved off the
+    /// seat's surface gets it back, so the owner's keys don't go to another window of that client.
     pub fn end_handover(&mut self) {
         self.handed_over = false;
         self.dismiss_layer_popups();
+        if self.sticky.as_ref().is_some_and(|s| s.restore.is_some()) {
+            self.release_sticky();
+        }
     }
 
     /// Takes the next serial and remembers it as an agent serial.
@@ -249,17 +259,35 @@ impl AgentState {
             .is_some_and(|sticky| sticky.surface.id().same_client_as(&surface.id()))
     }
 
-    /// Sends `leave` for the shadow keyboard focus and drops it.
+    /// Sends `leave` for the shadow keyboard focus and drops it. The surface it left the seat's
+    /// focus for gets `enter` and the seat's modifiers again, unless the seat moved on.
     pub fn release_sticky(&mut self) {
         let Some(sticky) = self.sticky.take() else {
             return;
         };
-        if !sticky.surface.is_alive() {
+        if sticky.surface.is_alive() {
+            let serial = self.next_serial().into();
+            for keyboard in &sticky.keyboards {
+                keyboard.leave(serial, &sticky.surface);
+            }
+        }
+        let Some((surface, seat)) = sticky.restore else {
+            return;
+        };
+        if seat.current_focus().as_ref() != Some(&surface) {
             return;
         }
-        let serial = self.next_serial().into();
+        let mods = seat.modifier_state().serialized;
+        let (enter, modifiers) = (self.next_serial().into(), self.next_serial().into());
         for keyboard in &sticky.keyboards {
-            keyboard.leave(serial, &sticky.surface);
+            keyboard.enter(enter, &surface, Vec::new());
+            keyboard.modifiers(
+                modifiers,
+                mods.depressed,
+                mods.latched,
+                mods.locked,
+                mods.layout_effective,
+            );
         }
     }
 
@@ -305,8 +333,17 @@ impl AgentState {
         }
     }
 
-    /// Drops the popups that clients already destroyed.
+    /// Drops the popups that clients already destroyed. The agent's keys leave a closed one.
     fn prune_popups(&mut self) {
+        let sticky_closed = self.sticky.as_ref().is_some_and(|sticky| {
+            self.popups
+                .values()
+                .flatten()
+                .any(|(popup, _)| !popup.alive() && *popup.wl_surface() == sticky.surface)
+        });
+        if sticky_closed {
+            self.release_sticky();
+        }
         self.popups.retain(|_, popups| {
             popups.retain(|(popup, _)| popup.alive());
             !popups.is_empty()
@@ -720,8 +757,8 @@ pub fn check_target(niri: &Niri, id: MappedId, kind: OpKind) -> Result<Target, A
     }
 
     Ok(Target {
-        id,
-        toplevel,
+        id: Some(id),
+        surface: toplevel,
         client,
     })
 }

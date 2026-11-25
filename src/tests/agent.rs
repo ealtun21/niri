@@ -8,6 +8,7 @@ use smithay::backend::input::{InputEvent, InputTime, KeyState, Keycode};
 use smithay::desktop::Window;
 use smithay::input::keyboard::Layout;
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_popup::XdgPopup;
+use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
 use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::KeyboardInteractivity;
 use smithay::utils::{Logical, Point, Serial, Size};
 use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
@@ -17,7 +18,7 @@ use super::*;
 use crate::agent::capture::{capture_popups, capture_precheck, settle_time};
 use crate::agent::cursor::{cursor_location, CURSOR_GLIDE};
 use crate::agent::pointer::{self, capture_to_buffer};
-use crate::agent::screen::{describe, output_precheck, screen_pointer, ScreenRecord};
+use crate::agent::screen::{describe, output_precheck, screen_keys, screen_pointer, ScreenRecord};
 use crate::agent::{
     capture_scale, check_target, keyboard, status, CaptureRecord, OpKind, DEFAULT_MAX_EDGE,
     DEFAULT_SETTLE, IDLE_RELEASE, MAX_DRAG_STEPS, MAX_SETTLE, TYPE_CHUNK_CHARS,
@@ -3145,13 +3146,22 @@ fn map_bar_with(
     f: &mut Fixture,
     kb_interactivity: Option<KeyboardInteractivity>,
 ) -> (ClientId, WlSurface) {
-    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+    map_layer(f, Layer::Top, "bar", kb_interactivity)
+}
+
+/// A mapped layer surface on `layer`, 50 px tall along the top of the output.
+fn map_layer(
+    f: &mut Fixture,
+    layer: Layer,
+    namespace: &str,
+    kb_interactivity: Option<KeyboardInteractivity>,
+) -> (ClientId, WlSurface) {
     use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
 
     use crate::tests::client::LayerConfigureProps;
 
     let id = f.add_client();
-    let layer = f.client(id).create_layer(None, Layer::Top, "bar");
+    let layer = f.client(id).create_layer(None, layer, namespace);
     let surface = layer.surface.clone();
     layer.set_configure_props(LayerConfigureProps {
         anchor: Some(Anchor::Left | Anchor::Right | Anchor::Top),
@@ -3848,4 +3858,268 @@ fn screen_click_in_agent_menu_of_unfocused_window_keeps_it_open() {
     );
     assert!(!popup_done(&mut f, agent, &popup));
     assert!(pressed(&pointer_events(&mut f, agent, &menu)));
+}
+
+fn screen_keys_now(f: &mut Fixture, op: AgentOp) -> Result<ScreenHit, AgentError> {
+    let (tx, rx) = async_channel::bounded(1);
+    screen_keys(f.niri_state(), &op, tx);
+    rx.try_recv().unwrap()
+}
+
+fn type_op(text: &str) -> AgentOp {
+    AgentOp::Type {
+        text: text.to_owned(),
+    }
+}
+
+fn key_op(chord: &str) -> AgentOp {
+    AgentOp::Key {
+        chord: chord.to_owned(),
+        repeat: 1,
+    }
+}
+
+#[test]
+fn screen_type_goes_to_focused_window() {
+    let (mut f, human, a, agent, b, _) = screen_setup();
+    events(&mut f, human, &a);
+    events(&mut f, agent, &b);
+    let id = mapped_id(&mut f, "a");
+
+    assert_eq!(
+        screen_keys_now(&mut f, type_op("hi")),
+        Ok(ScreenHit::Window { id: id.get() })
+    );
+
+    // The seat already entered `a`, so there is no second `enter`.
+    assert_snapshot!(events(&mut f, human, &a), @"
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    key pressed: 35
+    key released: 35
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    key pressed: 23
+    key released: 23
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+    assert_eq!(events(&mut f, agent, &b), "");
+    let a_surface = server_surface(&mut f, "a");
+    let keyboard = f.niri().seat.get_keyboard().unwrap();
+    assert_eq!(keyboard.current_focus(), Some(a_surface));
+}
+
+#[test]
+fn screen_type_goes_to_focused_layer() {
+    let (mut f, human, a, ..) = screen_setup();
+    // An on-demand layer takes the keyboard focus when it maps.
+    let (launcher, surface) = map_layer(
+        &mut f,
+        Layer::Overlay,
+        "launcher",
+        Some(KeyboardInteractivity::OnDemand),
+    );
+    let layer = f
+        .niri()
+        .mapped_layer_surfaces
+        .keys()
+        .find(|l| l.namespace() == "launcher")
+        .unwrap()
+        .wl_surface()
+        .clone();
+    assert_eq!(f.niri().keyboard_focus.surface(), Some(&layer));
+    events(&mut f, launcher, &surface);
+    events(&mut f, human, &a);
+
+    assert_eq!(
+        screen_keys_now(&mut f, type_op("hi")),
+        Ok(ScreenHit::Layer {
+            namespace: String::from("launcher")
+        })
+    );
+    let keys = events(&mut f, launcher, &surface);
+    assert!(!keys.contains("enter"), "{keys}");
+    assert_eq!(keys.matches("key pressed").count(), 2, "{keys}");
+    assert_eq!(events(&mut f, human, &a), "");
+}
+
+#[test]
+fn screen_key_needs_handover() {
+    let (mut f, human, a, ..) = two_clients();
+    events(&mut f, human, &a);
+
+    let err = screen_keys_now(&mut f, key_op("a")).unwrap_err();
+
+    assert_eq!(err, AgentError::NotHandedOver);
+    assert_eq!(events(&mut f, human, &a), "");
+}
+
+#[test]
+fn screen_keys_never_trigger_binds() {
+    let (mut f, _, _, agent, b) = two_clients_with(handover_config());
+    // agent-b is on workspace 2, so the Mod+1 bind would switch away from it.
+    focus_for_owner(&mut f, "agent-b");
+    f.niri().agent.hand_over();
+    events(&mut f, agent, &b);
+    let workspace = f.niri().layout.active_workspace().unwrap().id();
+
+    screen_keys_now(&mut f, key_op("super+1")).unwrap();
+
+    assert_eq!(f.niri().layout.active_workspace().unwrap().id(), workspace);
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("agent-b"));
+    assert_snapshot!(events(&mut f, agent, &b), @"
+    modifiers: depressed=64, latched=0, locked=0, group=0
+    key pressed: 2
+    key released: 2
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+}
+
+#[test]
+fn screen_type_turkish_char() {
+    let (mut f, human, a, ..) = screen_setup_with(us_tr());
+    events(&mut f, human, &a);
+
+    screen_keys_now(&mut f, type_op("ğ")).unwrap();
+
+    // The burst ends on the seat's layout: the seat only sends its modifiers when they change, so
+    // the owner's next key would otherwise come out in layout 1.
+    assert_snapshot!(events(&mut f, human, &a), @"
+    modifiers: depressed=0, latched=0, locked=0, group=1
+    key pressed: 26
+    key released: 26
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+    assert_eq!(owner_layout(&mut f), 0);
+}
+
+#[test]
+fn handover_end_between_chunks_interrupts() {
+    let (mut f, human, a, ..) = screen_setup();
+    events(&mut f, human, &a);
+
+    let (tx, rx) = async_channel::bounded(1);
+    screen_keys(f.niri_state(), &type_op(&"a".repeat(2500)), tx);
+    // Read without dispatching the server, or the test socket fills up.
+    f.client(human).dispatch();
+    // The owner's key ends the hand-over and is swallowed.
+    physical_key(&mut f);
+    step_chunk(&mut f);
+
+    let err = rx.try_recv().unwrap().unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "not_handed_over: interrupted after 1000 characters typed"
+    );
+    let keys = events(&mut f, human, &a);
+    assert_eq!(keys.matches("key pressed").count(), 1000);
+}
+
+/// The agent screen-clicks the owner's focused `a`, and `a` opens a menu that grabs with that
+/// click.
+fn agent_menu_on_a(
+    f: &mut Fixture,
+    human: ClientId,
+    a: &WlSurface,
+    output: &Output,
+) -> (WlSurface, XdgPopup) {
+    let record = look(f, output);
+    let id = mapped_id(f, "a");
+    pointer_events(f, human, a);
+    screen_click(f, &record, center(&record, id)).unwrap();
+    let serial = press_serial(&pointer_events(f, human, a));
+    open_popup(f, human, a, Some(serial))
+}
+
+#[test]
+fn screen_keys_reach_agent_menu_of_focused_window_one_surface_at_a_time() {
+    let (mut f, human, a, _, _, output) = screen_setup_with(us_tr());
+    let (menu, popup) = agent_menu_on_a(&mut f, human, &a, &output);
+    assert!(f.niri().popup_grab.is_none());
+    events(&mut f, human, &a);
+
+    screen_keys_now(&mut f, type_op("ğ")).unwrap();
+
+    // `a` leaves before the menu enters, as when a popup grab takes the keyboard.
+    assert_eq!(events(&mut f, human, &a), "leave");
+    assert_snapshot!(events(&mut f, human, &menu), @"
+    enter: []
+    modifiers: depressed=0, latched=0, locked=0, group=1
+    key pressed: 26
+    key released: 26
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+
+    // The menu closes: `a` gets the keyboard back with the seat's modifiers.
+    popup.destroy();
+    f.double_roundtrip(human);
+    assert_eq!(events(&mut f, human, &menu), "leave");
+    assert_snapshot!(events(&mut f, human, &a), @"
+    enter: []
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    ");
+    let a_surface = server_surface(&mut f, "a");
+    let keyboard = f.niri().seat.get_keyboard().unwrap();
+    assert_eq!(keyboard.current_focus(), Some(a_surface));
+}
+
+#[test]
+fn owner_focus_change_gives_agent_menu_keyboard_back_first() {
+    let (mut f, human, a, _, _, output) = screen_setup();
+    let (menu, _) = agent_menu_on_a(&mut f, human, &a, &output);
+    screen_keys_now(&mut f, key_op("Down")).unwrap();
+    events(&mut f, human, &a);
+    events(&mut f, human, &menu);
+
+    focus_for_owner(&mut f, "agent-b");
+
+    // The client never has two surfaces entered, nor a `leave` for one it doesn't have.
+    assert_eq!(events(&mut f, human, &menu), "leave");
+    assert_snapshot!(events(&mut f, human, &a), @"
+    enter: []
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    leave
+    ");
+}
+
+#[test]
+fn handover_end_gives_agent_menu_keyboard_back() {
+    let (mut f, human, a, _, _, output) = screen_setup();
+    let (menu, _) = agent_menu_on_a(&mut f, human, &a, &output);
+    screen_keys_now(&mut f, key_op("Down")).unwrap();
+    events(&mut f, human, &a);
+    events(&mut f, human, &menu);
+
+    // The owner's key ends the hand-over and is swallowed; their next one goes to `a`.
+    physical_key(&mut f);
+    physical_key(&mut f);
+
+    assert_eq!(events(&mut f, human, &menu), "leave");
+    assert_snapshot!(events(&mut f, human, &a), @"
+    enter: []
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    key pressed: 30
+    key released: 30
+    ");
+}
+
+#[test]
+fn handover_end_gives_keyboard_back_from_other_window_of_owner_client() {
+    let (mut f, human, a, ..) = screen_setup();
+    let a2 = map_window(&mut f, human, "a2");
+    focus_for_owner(&mut f, "a");
+    f.niri_complete_animations();
+    let id = mapped_id(&mut f, "a2");
+    type_now(&mut f, id, "x").unwrap();
+    events(&mut f, human, &a);
+    events(&mut f, human, &a2);
+
+    physical_key(&mut f);
+    physical_key(&mut f);
+
+    assert_eq!(events(&mut f, human, &a2), "leave");
+    assert_snapshot!(events(&mut f, human, &a), @"
+    enter: []
+    modifiers: depressed=0, latched=0, locked=0, group=0
+    key pressed: 30
+    key released: 30
+    ");
 }
