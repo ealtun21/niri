@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use smithay::output::Output;
 use smithay::utils::{Logical, Point};
 
+use super::keyboard::start_idle_timer;
 use super::{is_on_screen, IDLE_RELEASE};
 use crate::animation::{Animation, Curve};
 use crate::niri::Niri;
@@ -37,6 +38,10 @@ impl AgentCursor {
 /// Glides the cursor to `to` on `output`, or shows it there if it was hidden or elsewhere.
 pub fn move_cursor(niri: &mut Niri, output: &Output, to: Point<f64, Logical>) {
     let from = cursor_location(niri, output).unwrap_or(to);
+    let old = niri.agent.cursor.take();
+    if let Some(old) = old.filter(|old| old.output != *output) {
+        redraw(niri, &old.output);
+    }
     niri.agent.cursor = Some(AgentCursor {
         output: output.clone(),
         from,
@@ -52,6 +57,33 @@ pub fn move_cursor(niri: &mut Niri, output: &Output, to: Point<f64, Logical>) {
         last_op: Instant::now(),
     });
     niri.queue_redraw(output);
+    start_idle_timer(niri);
+}
+
+fn redraw(niri: &mut Niri, output: &Output) {
+    // The output may be gone by now.
+    if niri.output_state.contains_key(output) {
+        niri.queue_redraw(output);
+    }
+}
+
+/// Hides the cursor and redraws the output it was on.
+pub fn hide_cursor(niri: &mut Niri) {
+    if let Some(cursor) = niri.agent.cursor.take() {
+        redraw(niri, &cursor.output);
+    }
+}
+
+/// Hides the cursor once the agent has been idle for `IDLE_RELEASE`.
+pub fn hide_if_idle(niri: &mut Niri) {
+    if niri
+        .agent
+        .cursor
+        .as_ref()
+        .is_some_and(|c| c.last_op.elapsed() > IDLE_RELEASE)
+    {
+        hide_cursor(niri);
+    }
 }
 
 /// Where to draw the agent cursor on `output`, if it shows there.
@@ -73,7 +105,7 @@ pub fn cursor_location(niri: &Niri, output: &Output) -> Option<Point<f64, Logica
 pub fn place_on_window(niri: &mut Niri, id: MappedId, local: Point<f64, Logical>) {
     match window_point(niri, id, local) {
         Some((output, at)) => move_cursor(niri, &output, at),
-        None => niri.agent.cursor = None,
+        None => hide_cursor(niri),
     }
 }
 

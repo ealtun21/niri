@@ -1128,11 +1128,10 @@ impl State {
                 }
             }
             Action::ToggleAgentInput => {
-                let agent = &mut self.niri.agent;
-                if agent.paused {
-                    agent.paused = false;
+                if self.niri.agent.paused {
+                    self.niri.agent.paused = false;
                 } else {
-                    agent.pause();
+                    crate::agent::pause(&mut self.niri);
                 }
             }
             Action::ToggleAgentHandover => {

@@ -322,7 +322,10 @@ pub(super) fn start_idle_timer(niri: &mut Niri) {
         .insert_source(Timer::from_duration(IDLE_CHECK), |_, _, state| {
             let agent = &mut state.niri.agent;
             agent.release_if_idle(Instant::now());
-            if agent.sticky.is_some()
+            super::cursor::hide_if_idle(&mut state.niri);
+            let agent = &mut state.niri.agent;
+            if agent.cursor.is_some()
+                || agent.sticky.is_some()
                 || agent.pointer_focus.is_some()
                 || !agent.popups.is_empty()
                 || !agent.active_until.is_empty()

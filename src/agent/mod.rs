@@ -103,6 +103,12 @@ pub struct AgentState {
     popups: HashMap<MappedId, Vec<(PopupKind, bool)>>,
 }
 
+/// Pauses the agent (see `AgentState::pause`) and takes its cursor off the screen.
+pub fn pause(niri: &mut Niri) {
+    niri.agent.pause();
+    cursor::hide_cursor(niri);
+}
+
 /// Runs a niri action for the agent during a hand-over, without warping the owner's pointer.
 pub fn run_action(state: &mut State, action: niri_ipc::Action) -> Result<(), AgentError> {
     if !state.niri.agent.handed_over {

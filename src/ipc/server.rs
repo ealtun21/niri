@@ -496,7 +496,8 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             Response::AgentState(status.map_err(|_| String::from("error getting agent status"))?)
         }
         Request::AgentPause => {
-            ctx.event_loop.insert_idle(|state| state.niri.agent.pause());
+            ctx.event_loop
+                .insert_idle(|state| crate::agent::pause(&mut state.niri));
             Response::Handled
         }
         Request::OverviewState => {

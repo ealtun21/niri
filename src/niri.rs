@@ -4832,7 +4832,9 @@ impl Niri {
         // The pointer goes on the top.
         if include_pointer && self.pointer_visibility.is_visible() {
             self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
-            // Under the owner's pointer.
+        }
+        // Under the owner's pointer, and shown even while that one hides: the owner is watching.
+        if include_pointer {
             self.render_agent_cursor(ctx.renderer, output, push);
         }
 

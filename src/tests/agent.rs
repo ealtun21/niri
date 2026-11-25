@@ -2855,12 +2855,75 @@ fn cursor_hidden_when_paused() {
 
 #[test]
 fn cursor_hidden_for_offscreen_window() {
-    // `agent-b` is on the other workspace.
-    let (mut f, _, _, agent, b) = two_clients();
-    let id = captured_target(&mut f, agent, &b);
-    let output = f.niri().output_state.keys().next().unwrap().clone();
+    let (mut f, id, output) = on_screen_b();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    assert!(cursor_location(f.niri(), &output).is_some());
+    // Move `agent-b` to the other workspace and click it there.
+    let w = window_of(&mut f, "agent-b");
+    f.niri()
+        .layout
+        .move_to_workspace(Some(&w), 1, ActivateWindow::No);
+    f.niri_complete_animations();
     pointer_now(&mut f, id, click(10., 10.)).unwrap();
     assert_eq!(cursor_location(f.niri(), &output), None);
+}
+
+fn redraw_queued(f: &mut Fixture, output: &smithay::output::Output) -> bool {
+    use crate::niri::RedrawState;
+    matches!(
+        f.niri().output_state[output].redraw_state,
+        RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+    )
+}
+
+/// Drops any queued redraw, as a rendered frame would.
+fn clear_redraw(f: &mut Fixture, output: &smithay::output::Output) {
+    f.niri().output_state.get_mut(output).unwrap().redraw_state = Default::default();
+    assert!(!redraw_queued(f, output));
+}
+
+#[test]
+fn cursor_idle_expiry_queues_redraw() {
+    let (mut f, id, output) = on_screen_b();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    clear_redraw(&mut f, &output);
+    f.niri().agent.cursor.as_mut().unwrap().last_op =
+        Instant::now() - IDLE_RELEASE - Duration::from_secs(1);
+    crate::agent::cursor::hide_if_idle(f.niri());
+    assert!(f.niri().agent.cursor.is_none());
+    assert!(redraw_queued(&mut f, &output));
+}
+
+#[test]
+fn cursor_pause_queues_redraw() {
+    let (mut f, id, output) = on_screen_b();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    clear_redraw(&mut f, &output);
+    crate::agent::pause(f.niri());
+    assert!(redraw_queued(&mut f, &output));
+    assert_eq!(cursor_location(f.niri(), &output), None);
+}
+
+#[test]
+fn cursor_offscreen_op_queues_redraw() {
+    let (mut f, id, output) = on_screen_b();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    let w = window_of(&mut f, "agent-b");
+    f.niri()
+        .layout
+        .move_to_workspace(Some(&w), 1, ActivateWindow::No);
+    f.niri_complete_animations();
+    clear_redraw(&mut f, &output);
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    assert!(redraw_queued(&mut f, &output));
+}
+
+#[test]
+fn cursor_shows_while_owner_pointer_hidden() {
+    let (mut f, id, output) = on_screen_b();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    f.niri().pointer_visibility = crate::niri::PointerVisibility::Hidden;
+    assert!(cursor_location(f.niri(), &output).is_some());
 }
 
 #[test]
