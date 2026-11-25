@@ -1,7 +1,9 @@
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
-    DeviceCapability, Event, InputBackend, InputTime, KeyState, KeyboardKeyEvent, Keycode,
-    PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent, UnusedEvent,
+    DeviceCapability, Event, GestureBeginEvent, GestureHoldBeginEvent, GesturePinchBeginEvent,
+    GestureSwipeBeginEvent, InputBackend, InputTime, KeyState, KeyboardKeyEvent, Keycode,
+    PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent, TabletToolButtonEvent,
+    TabletToolCapabilities, TabletToolDescriptor, TabletToolEvent, TabletToolType, UnusedEvent,
 };
 use smithay::output::Output;
 
@@ -35,6 +37,16 @@ pub struct TestPointerAxisEvent {
     pub dy: f64,
 }
 
+/// The start of a touchpad swipe, pinch or hold.
+pub struct TestGestureBeginEvent {
+    pub fingers: u32,
+}
+
+/// A stylus button of a tablet tool that the seat doesn't know.
+pub struct TestTabletToolButtonEvent {
+    pub state: ButtonState,
+}
+
 impl InputBackend for TestInputBackend {
     type Device = TestInputDevice;
 
@@ -44,13 +56,13 @@ impl InputBackend for TestInputBackend {
     type PointerMotionEvent = UnusedEvent;
     type PointerMotionAbsoluteEvent = TestPointerMotionAbsoluteEvent;
 
-    type GestureSwipeBeginEvent = UnusedEvent;
+    type GestureSwipeBeginEvent = TestGestureBeginEvent;
     type GestureSwipeUpdateEvent = UnusedEvent;
     type GestureSwipeEndEvent = UnusedEvent;
-    type GesturePinchBeginEvent = UnusedEvent;
+    type GesturePinchBeginEvent = TestGestureBeginEvent;
     type GesturePinchUpdateEvent = UnusedEvent;
     type GesturePinchEndEvent = UnusedEvent;
-    type GestureHoldBeginEvent = UnusedEvent;
+    type GestureHoldBeginEvent = TestGestureBeginEvent;
     type GestureHoldEndEvent = UnusedEvent;
 
     type TouchDownEvent = UnusedEvent;
@@ -61,7 +73,7 @@ impl InputBackend for TestInputBackend {
     type TabletToolAxisEvent = UnusedEvent;
     type TabletToolProximityEvent = UnusedEvent;
     type TabletToolTipEvent = UnusedEvent;
-    type TabletToolButtonEvent = UnusedEvent;
+    type TabletToolButtonEvent = TestTabletToolButtonEvent;
 
     type SwitchToggleEvent = UnusedEvent;
 
@@ -195,5 +207,100 @@ impl PointerAxisEvent<TestInputBackend> for TestPointerAxisEvent {
 
     fn relative_direction(&self, _axis: Axis) -> AxisRelativeDirection {
         AxisRelativeDirection::Identical
+    }
+}
+
+impl Event<TestInputBackend> for TestGestureBeginEvent {
+    fn time(&self) -> InputTime {
+        InputTime::from_micros(0)
+    }
+
+    fn device(&self) -> <TestInputBackend as InputBackend>::Device {
+        TestInputDevice
+    }
+}
+
+impl GestureBeginEvent<TestInputBackend> for TestGestureBeginEvent {
+    fn fingers(&self) -> u32 {
+        self.fingers
+    }
+}
+
+impl GestureSwipeBeginEvent<TestInputBackend> for TestGestureBeginEvent {}
+impl GesturePinchBeginEvent<TestInputBackend> for TestGestureBeginEvent {}
+impl GestureHoldBeginEvent<TestInputBackend> for TestGestureBeginEvent {}
+
+/// Trait methods that return zero or `false`.
+macro_rules! zeros {
+    ($($name:ident: $ty:ty),* $(,)?) => {
+        $(fn $name(&self) -> $ty { Default::default() })*
+    };
+}
+
+impl Event<TestInputBackend> for TestTabletToolButtonEvent {
+    fn time(&self) -> InputTime {
+        InputTime::from_micros(0)
+    }
+
+    fn device(&self) -> <TestInputBackend as InputBackend>::Device {
+        TestInputDevice
+    }
+}
+
+impl AbsolutePositionEvent<TestInputBackend> for TestTabletToolButtonEvent {
+    zeros!(x: f64, y: f64);
+
+    fn x_transformed(&self, _width: i32) -> f64 {
+        0.
+    }
+
+    fn y_transformed(&self, _height: i32) -> f64 {
+        0.
+    }
+}
+
+impl TabletToolEvent<TestInputBackend> for TestTabletToolButtonEvent {
+    fn tool(&self) -> TabletToolDescriptor {
+        TabletToolDescriptor {
+            tool_type: TabletToolType::Pen,
+            hardware_serial: 0,
+            hardware_id_wacom: 0,
+            capabilities: TabletToolCapabilities::empty(),
+        }
+    }
+
+    zeros!(
+        delta_x: f64,
+        delta_y: f64,
+        distance: f64,
+        distance_has_changed: bool,
+        pressure: f64,
+        pressure_has_changed: bool,
+        slider_position: f64,
+        slider_has_changed: bool,
+        tilt_x: f64,
+        tilt_x_has_changed: bool,
+        tilt_y: f64,
+        tilt_y_has_changed: bool,
+        rotation: f64,
+        rotation_has_changed: bool,
+        wheel_delta: f64,
+        wheel_delta_discrete: i32,
+        wheel_has_changed: bool,
+    );
+}
+
+impl TabletToolButtonEvent<TestInputBackend> for TestTabletToolButtonEvent {
+    fn button(&self) -> u32 {
+        // BTN_STYLUS.
+        0x14b
+    }
+
+    fn seat_button_count(&self) -> u32 {
+        u32::from(self.state == ButtonState::Pressed)
+    }
+
+    fn button_state(&self) -> ButtonState {
+        self.state
     }
 }

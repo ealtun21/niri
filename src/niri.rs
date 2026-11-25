@@ -3528,6 +3528,9 @@ impl Niri {
     }
 
     pub fn deactivate_monitors(&mut self, backend: &mut Backend) {
+        // The owner can't watch the agent with the monitors off.
+        crate::agent::end_handover(self);
+
         if !self.monitors_active {
             return;
         }

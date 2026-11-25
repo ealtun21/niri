@@ -15,7 +15,8 @@ use calloop::timer::{TimeoutAction, Timer};
 use niri_ipc::{AgentDone, AgentError, AgentStatus, AgentWindow};
 use smithay::backend::input::{
     ButtonState, Event as _, InputBackend, InputEvent, InputTime, KeyState, KeyboardKeyEvent as _,
-    PointerButtonEvent as _, TabletToolTipEvent as _, TabletToolTipState,
+    PointerButtonEvent as _, TabletToolButtonEvent as _, TabletToolTipEvent as _,
+    TabletToolTipState,
 };
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::keyboard::KeyboardHandle;
@@ -586,8 +587,10 @@ where
     !is_virtual_device(&device)
 }
 
-/// Whether the event ends a hand-over: a button press, scroll, touch-down or tablet tip-down from a
-/// physical device. Keys are decided in `on_keyboard`, which knows the modifiers and binds.
+/// Whether the event ends a hand-over: a button press, scroll, touch-down, touchpad gesture start
+/// (swipe, pinch or hold), tablet tip-down or tablet tool button press from a physical device. Keys
+/// are decided in `on_keyboard`, which knows the modifiers and binds. Tablet pad buttons never get
+/// here: smithay's libinput backend drops pad events.
 pub fn ends_handover<I: InputBackend>(event: &InputEvent<I>) -> bool
 where
     I::Device: 'static,
@@ -597,8 +600,14 @@ where
             event.device()
         }
         InputEvent::PointerAxis { event } => event.device(),
+        InputEvent::GestureSwipeBegin { event } => event.device(),
+        InputEvent::GesturePinchBegin { event } => event.device(),
+        InputEvent::GestureHoldBegin { event } => event.device(),
         InputEvent::TouchDown { event } => event.device(),
         InputEvent::TabletToolTip { event } if event.tip_state() == TabletToolTipState::Down => {
+            event.device()
+        }
+        InputEvent::TabletToolButton { event } if event.button_state() == ButtonState::Pressed => {
             event.device()
         }
         _ => return false,

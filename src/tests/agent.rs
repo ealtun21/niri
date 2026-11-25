@@ -27,8 +27,8 @@ use crate::agent::{
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::LockState;
 use crate::tests::test_input_backend::{
-    TestInputBackend, TestKeyboardKeyEvent, TestPointerAxisEvent, TestPointerButtonEvent,
-    TestPointerMotionAbsoluteEvent,
+    TestGestureBeginEvent, TestInputBackend, TestKeyboardKeyEvent, TestPointerAxisEvent,
+    TestPointerButtonEvent, TestPointerMotionAbsoluteEvent, TestTabletToolButtonEvent,
 };
 use crate::window::mapped::MappedId;
 
@@ -2135,6 +2135,54 @@ fn owner_scroll_ends_handover() {
     let (mut f, ..) = two_clients_with(handover_config());
     f.niri().agent.hand_over();
     physical_scroll(&mut f, 10.);
+    assert!(!f.niri().agent.handed_over);
+}
+
+#[test]
+fn owner_touchpad_gestures_end_handover() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    let gestures: [fn(u32) -> InputEvent<TestInputBackend>; 3] = [
+        |fingers| InputEvent::GestureSwipeBegin {
+            event: TestGestureBeginEvent { fingers },
+        },
+        |fingers| InputEvent::GesturePinchBegin {
+            event: TestGestureBeginEvent { fingers },
+        },
+        |fingers| InputEvent::GestureHoldBegin {
+            event: TestGestureBeginEvent { fingers },
+        },
+    ];
+    for (i, gesture) in gestures.into_iter().enumerate() {
+        f.niri().agent.hand_over();
+        f.niri_state().process_input_event(gesture(3));
+        assert!(!f.niri().agent.handed_over, "gesture {i}");
+    }
+}
+
+#[test]
+fn owner_tablet_button_press_ends_handover() {
+    use smithay::backend::input::ButtonState;
+
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    for state in [ButtonState::Released, ButtonState::Pressed] {
+        let event = TestTabletToolButtonEvent { state };
+        f.niri_state()
+            .process_input_event(InputEvent::<TestInputBackend>::TabletToolButton { event });
+        // Only the press ends it.
+        assert_eq!(f.niri().agent.handed_over, state == ButtonState::Released);
+    }
+}
+
+#[test]
+fn monitors_power_off_ends_handover() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    f.niri_state().do_action(
+        niri_config::Action::PowerOffMonitors,
+        false,
+        InputTime::from_micros(0),
+    );
     assert!(!f.niri().agent.handed_over);
 }
 
