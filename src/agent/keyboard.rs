@@ -250,14 +250,13 @@ pub fn enter_keyboards(niri: &mut Niri, target: &Target) -> Vec<WlKeyboard> {
 }
 
 /// Gives `surface` the shadow focus of its client's keyboards, sending `enter` to those that lack
-/// it, and returns them. Leaves any other surface's shadow focus first.
+/// it, and returns them. Leaves any other surface's shadow focus first. When the seat focuses
+/// `surface`, its keyboards are already entered: they get no `enter` and no shadow focus, so the
+/// agent never sends the `leave` that is the seat's to send.
 pub fn enter_keyboards_on(niri: &mut Niri, client: &Client, surface: WlSurface) -> Vec<WlKeyboard> {
-    let keyboards: Vec<WlKeyboard> = niri
-        .seat
-        .get_keyboard()
-        .unwrap()
-        .client_keyboards(client)
-        .collect();
+    let seat_keyboard = niri.seat.get_keyboard().unwrap();
+    let keyboards: Vec<WlKeyboard> = seat_keyboard.client_keyboards(client).collect();
+    let seat_focused = seat_keyboard.current_focus().as_ref() == Some(&surface);
     let agent = &mut niri.agent;
 
     if agent
@@ -266,6 +265,10 @@ pub fn enter_keyboards_on(niri: &mut Niri, client: &Client, surface: WlSurface) 
         .is_some_and(|sticky| sticky.surface != surface)
     {
         agent.release_sticky();
+    }
+    if seat_focused {
+        agent.sticky = None;
+        return keyboards;
     }
     let entered = agent
         .sticky

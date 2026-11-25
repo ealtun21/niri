@@ -392,7 +392,13 @@ fn screen_op(state: &mut State, name: Option<&str>, op: &AgentOp) -> Result<Scre
                 .map(|(_, mapped)| mapped.id())
                 .ok_or(AgentError::WindowGone)?;
             let target = check_target(&state.niri, id, OpKind::Screen)?;
-            if press {
+            // Activating the window would close the agent's own menu before the click lands.
+            let in_agent_popup = surface.as_ref().is_some_and(|(surface, _)| {
+                let niri = &state.niri;
+                let root = niri.root_surface.get(surface).unwrap_or(surface);
+                niri.agent.is_agent_popup(id, root)
+            });
+            if press && !in_agent_popup {
                 focus_without_warp(state, |state| {
                     state.niri.layout.activate_window(window);
                     state.niri.focus_layer_surface_if_on_demand(None);

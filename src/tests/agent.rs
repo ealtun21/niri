@@ -3736,3 +3736,116 @@ fn screen_click_focuses_on_demand_layer() {
     assert_eq!(f.niri().layer_shell_on_demand_focus, None);
     assert_eq!(focused_app_id(&mut f).as_deref(), Some("agent-b"));
 }
+
+fn ctrl_click(record: &ScreenRecord, local: Point<f64, Logical>) -> AgentOp {
+    let (x, y) = px(record, local);
+    AgentOp::Click {
+        x,
+        y,
+        button: AgentButton::Left,
+        count: 1,
+        mods: vec![niri_ipc::AgentMod::Ctrl],
+    }
+}
+
+/// Asserts the keyboard log has exactly one `enter`, and then, after the idle release and a pause,
+/// no `leave` while the seat still focuses the surface.
+fn assert_seat_keeps_keyboard(
+    f: &mut Fixture,
+    client: ClientId,
+    surface: &WlSurface,
+    keys: &str,
+    focused: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) {
+    let enters = keys.lines().filter(|l| l.starts_with("enter")).count();
+    assert_eq!(enters, 1, "{keys}");
+    assert!(keys.contains("depressed=4"), "{keys}");
+
+    f.niri()
+        .agent
+        .release_if_idle(Instant::now() + IDLE_RELEASE);
+    crate::agent::pause(f.niri());
+    let after = events(f, client, surface);
+    assert!(!after.contains("leave"), "{after}");
+    let keyboard = f.niri().seat.get_keyboard().unwrap();
+    assert_eq!(keyboard.current_focus().as_ref(), Some(focused));
+}
+
+#[test]
+fn screen_ctrl_click_on_unfocused_window_enters_its_keyboard_once() {
+    let (mut f, _, _, agent, b, output) = screen_setup();
+    events(&mut f, agent, &b);
+    let record = look(&mut f, &output);
+    let id = mapped_id(&mut f, "agent-b");
+
+    let hit = screen_now(&mut f, None, ctrl_click(&record, center(&record, id)));
+    assert_eq!(hit, Ok(ScreenHit::Window { id: id.get() }));
+    let keys = events(&mut f, agent, &b);
+    let focused = server_surface(&mut f, "agent-b");
+    assert_seat_keeps_keyboard(&mut f, agent, &b, &keys, &focused);
+}
+
+#[test]
+fn screen_ctrl_click_on_on_demand_layer_enters_its_keyboard_once() {
+    let (mut f, .., output) = screen_setup();
+    // A new on-demand layer gets the seat focus when it maps: its one enter is in this log.
+    let (bar_client, bar) = map_bar_with(&mut f, Some(KeyboardInteractivity::OnDemand));
+    let record = look(&mut f, &output);
+
+    let hit = screen_now(&mut f, None, ctrl_click(&record, Point::from((960., 25.))));
+    assert!(matches!(hit, Ok(ScreenHit::Layer { .. })), "{hit:?}");
+    let keys = events(&mut f, bar_client, &bar);
+    let layer = f
+        .niri()
+        .mapped_layer_surfaces
+        .keys()
+        .find(|l| l.namespace() == "bar")
+        .unwrap()
+        .wl_surface()
+        .clone();
+    assert_seat_keeps_keyboard(&mut f, bar_client, &bar, &keys, &layer);
+}
+
+#[test]
+fn screen_click_in_agent_menu_of_unfocused_window_keeps_it_open() {
+    let (mut f, _, _, agent, b, output) = screen_setup();
+    // The agent opens a menu on agent-b, which the owner isn't focusing.
+    let serial = agent_click_serial(&mut f, agent, &b);
+    let parent = f.client(agent).window(&b).xdg_surface.clone();
+    let (menu, popup) = f
+        .client(agent)
+        .state
+        .create_popup_at(&parent, Some(serial), (20, 30));
+    f.double_roundtrip(agent);
+    let (xdg_surface, configure) = f.client(agent).state.popup_configures.pop().unwrap();
+    xdg_surface.ack_configure(configure);
+    xdg_surface.set_window_geometry(0, 0, 10, 10);
+    let state = &f.client(agent).state;
+    let buffer = state
+        .spbm
+        .as_ref()
+        .unwrap()
+        .create_u32_rgba_buffer(0, 0, 0, 0, &state.qh, ());
+    menu.attach(Some(&buffer), 0, 0);
+    menu.commit();
+    f.double_roundtrip(agent);
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+
+    let id = mapped_id(&mut f, "agent-b");
+    let (mapped, _) = f.niri().find_mapped_output_by_id(id).unwrap();
+    let menu_pos = capture_popups(mapped)[0].clone();
+    let at = drawn_point(
+        &mut f,
+        id,
+        Point::from((menu_pos.x + 0.5, menu_pos.y + 0.5)),
+    );
+    let record = look(&mut f, &output);
+    pointer_events(&mut f, agent, &menu);
+
+    assert_eq!(
+        screen_click(&mut f, &record, at),
+        Ok(ScreenHit::Window { id: id.get() })
+    );
+    assert!(!popup_done(&mut f, agent, &popup));
+    assert!(pressed(&pointer_events(&mut f, agent, &menu)));
+}

@@ -321,6 +321,15 @@ impl AgentState {
         Some(popup.wl_surface().clone())
     }
 
+    /// Whether `surface` is one of the window's agent popups.
+    pub fn is_agent_popup(&self, id: MappedId, surface: &WlSurface) -> bool {
+        self.popups.get(&id).is_some_and(|popups| {
+            popups
+                .iter()
+                .any(|(popup, _)| popup.wl_surface() == surface)
+        })
+    }
+
     /// Sends `popup_done` to the window's agent popups, topmost first, and forgets them.
     pub fn dismiss_popups(&mut self, id: MappedId) {
         let popups = self.popups.remove(&id).into_iter().flatten();
