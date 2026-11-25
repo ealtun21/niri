@@ -143,7 +143,7 @@ pub fn key(state: &mut State, id: MappedId, chord: &str, repeat: u16, reply: Rep
     match with_keymap(state, |keymap| parse_chord(keymap, chord, allow_paste)) {
         Ok(stroke) => {
             let strokes = vec![stroke; usize::from(repeat.max(1))];
-            deliver_chunked(state, id, strokes, 0, reply);
+            deliver_chunked(state, id, strokes, 0, allow_paste, reply);
         }
         Err(err) => {
             let _ = reply.send_blocking(Err(err));
@@ -164,7 +164,7 @@ pub fn type_text(state: &mut State, id: MappedId, text: &str, reply: Reply) {
             .collect::<Result<Vec<_>, _>>()
     });
     match strokes {
-        Ok(strokes) => deliver_chunked(state, id, strokes, 0, reply),
+        Ok(strokes) => deliver_chunked(state, id, strokes, 0, false, reply),
         Err(err) => {
             let _ = reply.send_blocking(Err(err));
         }
@@ -172,18 +172,26 @@ pub fn type_text(state: &mut State, id: MappedId, text: &str, reply: Reply) {
 }
 
 /// Delivers `strokes[sent..]`, `TYPE_CHUNK_CHARS` at a time with `TYPE_CHUNK_INTERVAL` in
-/// between, re-checking the target before each chunk.
+/// between, re-checking the target before each chunk. `needs_handover` strokes may paste, so they
+/// stop when the hand-over ends.
 fn deliver_chunked(
     state: &mut State,
     id: MappedId,
     strokes: Vec<KeyStroke>,
     sent: usize,
+    needs_handover: bool,
     reply: Reply,
 ) {
     // A focus bind earlier in this loop pass hasn't reached keyboard_focus yet; refresh does that
     // only after this callback.
     state.update_keyboard_focus();
-    let target = match check_target(&state.niri, id, OpKind::Keyboard) {
+    let target = match check_target(&state.niri, id, OpKind::Keyboard).and_then(|target| {
+        if needs_handover && !state.niri.agent.handed_over {
+            Err(AgentError::PasteUnsupported)
+        } else {
+            Ok(target)
+        }
+    }) {
         Ok(target) => target,
         Err(error) => {
             let error = if sent == 0 {
@@ -218,7 +226,7 @@ fn deliver_chunked(
             .event_loop
             .insert_source(timer, move |_, _, state| {
                 if let Some((strokes, reply)) = next.take() {
-                    deliver_chunked(state, id, strokes, end, reply);
+                    deliver_chunked(state, id, strokes, end, needs_handover, reply);
                 }
                 TimeoutAction::Drop
             })

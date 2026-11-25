@@ -2171,7 +2171,72 @@ fn handover_allows_middle_click() {
         mods: Vec::new(),
     };
     pointer_now(&mut f, id, op).unwrap();
-    assert!(!pointer_events(&mut f, agent, &b).is_empty());
+    assert!(pointer_events(&mut f, agent, &b)
+        .iter()
+        .any(|e| matches!(e, PointerEvent::Button { button: 0x112, .. })));
+}
+
+#[test]
+fn handover_refuses_inactive_tab() {
+    let (mut f, human, _, agent, _) = two_clients_with(handover_config());
+    let (_, id) = plain_b(&mut f, human, agent);
+    let a = window_of(&mut f, "a");
+    let b = window_of(&mut f, "b");
+    f.niri().layout.consume_or_expel_window_left(Some(&b));
+    f.niri().layout.toggle_column_tabbed_display();
+    f.niri().layout.activate_window(&a);
+    f.niri_complete_animations();
+    f.niri().agent.hand_over();
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::NotVisible)
+    );
+}
+
+#[test]
+fn handover_refuses_offscreen_column() {
+    let (mut f, human, _, agent, _) = two_clients_with(handover_config());
+    plain_b(&mut f, human, agent);
+    // Windows are 100 px wide, so it takes this many columns to leave the 1920 px output.
+    for i in 0..20 {
+        map_window(&mut f, agent, &format!("c{i}"));
+    }
+    focus_for_owner(&mut f, "a");
+    f.niri_complete_animations();
+    f.niri().agent.hand_over();
+    let results: Vec<_> = (0..20)
+        .map(|i| {
+            let id = mapped_id(&mut f, &format!("c{i}"));
+            check_target(f.niri(), id, OpKind::Keyboard).err()
+        })
+        .collect();
+    assert!(results.contains(&Some(AgentError::NotVisible)));
+    assert!(results.contains(&None));
+}
+
+#[test]
+fn paste_stops_when_handover_ends() {
+    let (mut f, _, _, agent, b) = two_clients_with(handover_config());
+    let id = agent_target(&mut f, agent, &b);
+    f.niri().agent.hand_over();
+    let (tx, rx) = async_channel::bounded(1);
+    keyboard::key(
+        f.niri_state(),
+        id,
+        "ctrl+v",
+        2 * TYPE_CHUNK_CHARS as u16,
+        tx,
+    );
+    f.client(agent).dispatch();
+    f.niri().agent.end_handover();
+    step_chunk(&mut f);
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        Err(AgentError::Interrupted { error, typed: TYPE_CHUNK_CHARS })
+            if *error == AgentError::PasteUnsupported
+    ));
+    let events = events(&mut f, agent, &b);
+    assert_eq!(events.matches("key pressed: 47").count(), TYPE_CHUNK_CHARS);
 }
 
 #[test]

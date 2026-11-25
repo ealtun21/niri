@@ -515,20 +515,23 @@ fn is_x11(niri: &Niri, mapped: &Mapped) -> bool {
     !comm.is_empty() && name.starts_with(comm)
 }
 
-/// Whether the owner can see the window: its tile intersects its output on a shown workspace.
-/// In an open overview every window of a shown workspace counts.
+/// Whether the owner can see the window: its tile is drawn and intersects its output on a shown
+/// workspace, scaled by the overview zoom (1 when the overview is closed).
 pub fn is_on_screen(niri: &Niri, id: MappedId) -> bool {
-    let overview = niri.layout.is_overview_open();
     niri.layout.monitors().any(|mon| {
         let output = Rectangle::from_size(mon.view_size());
+        let zoom = mon.overview_zoom();
         mon.workspaces_with_render_geo().any(|(ws, ws_geo)| {
             ws.tiles_with_render_positions()
                 .filter(|(tile, ..)| tile.window().id() == id)
-                .any(|(tile, pos, _)| {
-                    overview
-                        || Rectangle::new(pos + ws_geo.loc, tile.tile_size())
-                            .intersection(output)
-                            .is_some()
+                .any(|(tile, pos, drawn)| {
+                    drawn
+                        && Rectangle::new(
+                            ws_geo.loc + pos.upscale(zoom),
+                            tile.tile_size().upscale(zoom),
+                        )
+                        .intersection(output)
+                        .is_some()
                 })
         })
     })
