@@ -16,6 +16,7 @@ use super::*;
 use crate::agent::capture::{capture_popups, capture_precheck, settle_time};
 use crate::agent::cursor::{cursor_location, CURSOR_GLIDE};
 use crate::agent::pointer::{self, capture_to_buffer};
+use crate::agent::screen::{describe, output_precheck};
 use crate::agent::{
     capture_scale, check_target, keyboard, status, CaptureRecord, OpKind, DEFAULT_SETTLE,
     IDLE_RELEASE, MAX_DRAG_STEPS, MAX_SETTLE, TYPE_CHUNK_CHARS, TYPE_CHUNK_INTERVAL,
@@ -2955,4 +2956,95 @@ fn cursor_glides() {
     let last = cursor_location(f.niri(), &output).unwrap();
     assert!(last.x > mid.x && last.y > mid.y, "{mid:?} {last:?}");
     assert!(near(last, first + Point::from((50., 30.))), "{last:?}");
+}
+
+fn active_output(f: &mut Fixture) -> smithay::output::Output {
+    f.niri().layout.active_output().unwrap().clone()
+}
+
+#[test]
+fn capture_output_while_paused_is_paused() {
+    let (mut f, _) = set_up(Config::default());
+    f.niri().agent.paused = true;
+    assert_eq!(output_precheck(f.niri(), None), Err(AgentError::Paused));
+}
+
+#[test]
+fn capture_output_bad_name() {
+    let (mut f, _) = set_up(Config::default());
+    let err = output_precheck(f.niri(), Some("nope")).unwrap_err();
+    assert_eq!(err.to_string(), "bad_output: nope");
+}
+
+#[test]
+fn capture_output_defaults_to_active_output() {
+    let (mut f, _) = set_up(Config::default());
+    let output = active_output(&mut f);
+    assert_eq!(output_precheck(f.niri(), None), Ok(output));
+}
+
+#[test]
+fn capture_output_lists_visible_windows() {
+    let (mut f, ..) = two_clients();
+    // Workspace 1 gets a second window; agent-b stays on workspace 2.
+    let human = f.add_client();
+    map_window(&mut f, human, "c");
+    let output = active_output(&mut f);
+
+    let (record, windows, _) = describe(f.niri(), &output, 1568);
+
+    let mut ids: Vec<_> = windows.iter().map(|w| w.id).collect();
+    ids.sort_unstable();
+    let mut want = vec![mapped_id(&mut f, "a").get(), mapped_id(&mut f, "c").get()];
+    want.sort_unstable();
+    assert_eq!(ids, want);
+    assert!(!ids.contains(&mapped_id(&mut f, "agent-b").get()));
+
+    let mon = f.niri().layout.monitors().next().unwrap();
+    for window in &windows {
+        let (tile, pos, _) = mon
+            .workspaces_with_render_geo()
+            .flat_map(|(ws, _)| ws.tiles_with_render_positions())
+            .find(|(tile, ..)| tile.window().id().get() == window.id)
+            .unwrap();
+        let size = tile.tile_size();
+        let got = window.rect;
+        let want = (
+            pos.x * record.scale,
+            pos.y * record.scale,
+            size.w * record.scale,
+            size.h * record.scale,
+        );
+        assert!(
+            (got.0 - want.0).abs() < 1.
+                && (got.1 - want.1).abs() < 1.
+                && (got.2 - want.2).abs() < 1.
+                && (got.3 - want.3).abs() < 1.,
+            "{got:?} vs {want:?}"
+        );
+    }
+}
+
+#[test]
+fn capture_output_reports_overview() {
+    let (mut f, _) = set_up(Config::default());
+    let output = active_output(&mut f);
+    assert!(!describe(f.niri(), &output, 1568).0.overview_open);
+
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+
+    let (record, windows, _) = describe(f.niri(), &output, 1568);
+    assert!(record.overview_open);
+    assert_eq!(windows.len(), 1);
+}
+
+#[test]
+fn capture_output_works_side_by_side() {
+    // No hand-over, and agent-b is granted by prefix but the owner holds focus elsewhere.
+    let (mut f, ..) = two_clients();
+    let output = active_output(&mut f);
+    assert!(!f.niri().agent.handed_over);
+    assert!(output_precheck(f.niri(), None).is_ok());
+    assert_eq!(describe(f.niri(), &output, 1568).1.len(), 1);
 }

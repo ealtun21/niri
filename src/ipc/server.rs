@@ -529,6 +529,24 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let capture = result.map_err(|_| String::from("error capturing window"))??;
             Response::WindowCapture(capture)
         }
+        Request::CaptureOutput {
+            output,
+            path,
+            max_edge,
+            settle_ms,
+        } => {
+            if !Path::new(&path).is_absolute() {
+                return Err(format!("path must be absolute: {path}"));
+            }
+
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                crate::agent::screen::capture_output(state, output, path, max_edge, settle_ms, tx);
+            });
+            let result = rx.recv().await;
+            let capture = result.map_err(|_| String::from("error capturing output"))??;
+            Response::OutputCapture(capture)
+        }
         Request::AgentAction { action } => {
             validate_action(&action)?;
             let (tx, rx) = async_channel::bounded(1);

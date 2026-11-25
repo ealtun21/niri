@@ -130,6 +130,17 @@ pub enum Request {
         /// Milliseconds to wait for the window to settle before capturing.
         settle_ms: Option<u32>,
     },
+    /// Capture a whole output to a PNG file, without any cursor.
+    CaptureOutput {
+        /// Name of the output. Defaults to the agent cursor's output, else the active one.
+        output: Option<String>,
+        /// Absolute path of the PNG file to write.
+        path: String,
+        /// Longest edge of the image in pixels; larger captures are scaled down.
+        max_edge: Option<u32>,
+        /// Milliseconds to wait for windows to settle before capturing.
+        settle_ms: Option<u32>,
+    },
     /// Request the agent status: pause state, granted windows and windows being acted on.
     AgentState,
     /// Like [`Request::AgentState`], then keep sending the status as it changes.
@@ -201,6 +212,8 @@ pub enum Response {
     Casts(Vec<Cast>),
     /// Result of a window capture.
     WindowCapture(WindowCapture),
+    /// Result of an output capture.
+    OutputCapture(OutputCapture),
     /// Result of an agent operation.
     AgentDone(AgentDone),
     /// The agent status.
@@ -385,6 +398,60 @@ pub struct WindowCapture {
     pub popups: Vec<CapturePopup>,
 }
 
+/// Result of an output capture. Rects and origins are in image pixels.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct OutputCapture {
+    /// Path of the written PNG.
+    pub path: String,
+    /// Image width in pixels.
+    pub width: u32,
+    /// Image height in pixels.
+    pub height: u32,
+    /// Scale of the capture relative to logical pixels.
+    pub scale: f64,
+    /// Name of the captured output.
+    pub output: String,
+    /// Whether the overview was open.
+    pub overview_open: bool,
+    /// Visible windows, topmost first.
+    pub windows: Vec<ScreenWindow>,
+    /// Visible layer surfaces, topmost first.
+    pub layers: Vec<ScreenLayer>,
+}
+
+/// A window visible in an output capture.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ScreenWindow {
+    /// Id of the window.
+    pub id: u64,
+    /// Tile rectangle as (x, y, width, height).
+    pub rect: (f64, f64, f64, f64),
+    /// Where the window's main surface origin lands in the image.
+    pub surface_origin: (f64, f64),
+    /// Location of the window geometry in window surface coordinates, in logical pixels.
+    pub geometry_loc: (f64, f64),
+    /// Window geometry size in logical pixels.
+    pub window_size: (i32, i32),
+    /// Popups of the window, topmost first, in image pixels relative to `surface_origin`.
+    pub popups: Vec<CapturePopup>,
+}
+
+/// A layer surface visible in an output capture.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ScreenLayer {
+    /// Namespace of the layer surface.
+    pub namespace: String,
+    /// Process id of the client, if known.
+    pub pid: Option<i32>,
+    /// Rectangle as (x, y, width, height).
+    pub rect: (f64, f64, f64, f64),
+    /// Where the surface origin lands in the image.
+    pub surface_origin: (f64, f64),
+}
+
 /// Result of an agent operation.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -433,6 +500,8 @@ pub enum AgentError {
     PasteUnsupported,
     /// A `block-out-from` window rule blocks the window out from capture.
     BlockedOut,
+    /// There is no output with this name.
+    BadOutput(String),
     /// The key chord could not be parsed.
     BadChord(String),
     /// The operation was interrupted partway through typing.
@@ -461,6 +530,7 @@ impl std::fmt::Display for AgentError {
             Self::UnmappableChar(c) => write!(f, "unmappable_char: {c:?}"),
             Self::PasteUnsupported => f.write_str("paste_unsupported"),
             Self::BlockedOut => f.write_str("blocked_out"),
+            Self::BadOutput(name) => write!(f, "bad_output: {name}"),
             Self::BadChord(chord) => write!(f, "bad_chord: {chord}"),
             Self::Interrupted { error, typed } => {
                 write!(f, "{error}: interrupted after {typed} characters typed")

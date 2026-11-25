@@ -4,6 +4,7 @@ pub mod capture;
 pub mod cursor;
 pub mod keyboard;
 pub mod pointer;
+pub mod screen;
 
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -68,6 +69,8 @@ pub struct AgentState {
     // ponytail: records of closed windows are never pruned (ids are never reused); prune on
     // window close if agents ever capture enough windows for this to matter.
     pub captures: HashMap<MappedId, CaptureRecord>,
+    /// Last whole-output capture of each output, by output name.
+    pub screens: HashMap<String, screen::ScreenRecord>,
     /// Windows the owner granted (true) or revoked (false) by keybind, overriding the app id
     /// prefix.
     pub granted: HashMap<MappedId, bool>,
