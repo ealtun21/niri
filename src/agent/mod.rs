@@ -182,11 +182,13 @@ pub struct Target {
     pub client: Client,
 }
 
-/// Kind of input op; pointer ops also need a fresh capture.
+/// Kind of input op; pointer ops also need a fresh capture of the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
     Keyboard,
     Pointer,
+    /// A screen op on the window: its staleness is checked against the screen look instead.
+    Screen,
 }
 
 impl AgentState {

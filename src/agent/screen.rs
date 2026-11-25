@@ -6,19 +6,28 @@ use std::time::Instant;
 use anyhow::Context as _;
 use async_channel::Sender;
 use calloop::timer::{TimeoutAction, Timer};
-use niri_ipc::{AgentError, CapturePopup, OutputCapture, ScreenLayer, ScreenWindow};
+use niri_ipc::{
+    AgentButton, AgentError, AgentOp, CapturePopup, OutputCapture, ScreenHit, ScreenLayer,
+    ScreenWindow,
+};
 use smithay::backend::allocator::Fourcc;
 use smithay::desktop::layer_map_for_output;
 use smithay::output::Output;
+use smithay::reexports::wayland_server::Resource as _;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::shell::wlr_layer::Layer;
 
 use super::capture::{capture_popups, settle_time};
-use super::{boost_frames, capture_scale, DEFAULT_MAX_EDGE};
-use crate::niri::{Niri, State};
+use super::cursor::move_cursor;
+use super::keyboard::enter_keyboards_on;
+use super::pointer::{deliver_window, deliver_with_mods, start_point};
+use super::{boost_frames, capture_scale, check_target, OpKind, DEFAULT_MAX_EDGE};
+use crate::input::move_grab::overview_activate;
+use crate::niri::{Niri, PointContents, State};
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
 use crate::utils::{get_credentials_for_surface, write_png_rgba8};
 use crate::window::mapped::MappedId;
+use crate::window::Mapped;
 
 /// What an output capture looked like: the visible windows' rects, to map its pixels back to them.
 #[derive(Debug, Clone)]
@@ -80,7 +89,11 @@ pub fn capture_output(
     let max_edge = max_edge.unwrap_or(DEFAULT_MAX_EDGE).max(1);
     let settle = settle_time(settle_ms);
     let until = Instant::now() + settle;
-    for (id, _) in describe(&state.niri, &output, max_edge).0.windows {
+    let ids: Vec<MappedId> = visible_tiles(&state.niri, &output)
+        .iter()
+        .map(|tile| tile.mapped.id())
+        .collect();
+    for id in ids {
         boost_frames(&mut state.niri, id, until);
     }
 
@@ -108,10 +121,43 @@ pub fn capture_output(
         .unwrap();
 }
 
+/// A window drawn on an output.
+struct VisibleTile<'a> {
+    mapped: &'a Mapped,
+    /// Tile rect local to the output.
+    rect: Rectangle<f64, Logical>,
+    /// Where the main surface origin is, local to the output.
+    origin: Point<f64, Logical>,
+    zoom: f64,
+}
+
+/// The drawn tiles that intersect `output`, scaled by the overview zoom, the same set as
+/// `is_on_screen`. Topmost first: floating ones come first, as they render above the tiled ones.
+fn visible_tiles<'a>(niri: &'a Niri, output: &Output) -> Vec<VisibleTile<'a>> {
+    let mut tiles = Vec::new();
+    for mon in niri.layout.monitors().filter(|mon| mon.output() == output) {
+        let on_output = Rectangle::from_size(mon.view_size());
+        let zoom = mon.overview_zoom();
+        for (ws, geo) in mon.workspaces_with_render_geo() {
+            for (tile, pos, drawn) in ws.tiles_with_render_positions() {
+                let rect =
+                    Rectangle::new(geo.loc + pos.upscale(zoom), tile.tile_size().upscale(zoom));
+                if drawn && rect.intersection(on_output).is_some() {
+                    tiles.push(VisibleTile {
+                        mapped: tile.window(),
+                        rect,
+                        origin: geo.loc + (pos + tile.buf_loc()).upscale(zoom),
+                        zoom,
+                    });
+                }
+            }
+        }
+    }
+    tiles
+}
+
 /// The record and the IPC lists of what is on `output` at the capture scale for `max_edge`.
-///
-/// Windows are the drawn tiles that intersect the output, scaled by the overview zoom, the same
-/// set as `is_on_screen`; floating ones come first, as they render above the tiled ones.
+/// Windows are the `visible_tiles`.
 pub fn describe(
     niri: &Niri,
     output: &Output,
@@ -137,40 +183,27 @@ pub fn describe(
 
     let mut rects = Vec::new();
     let mut windows = Vec::new();
-    let mons = niri.layout.monitors().filter(|mon| mon.output() == output);
-    for mon in mons {
-        let on_output = Rectangle::from_size(mon.view_size());
-        let zoom = mon.overview_zoom();
-        for (ws, geo) in mon.workspaces_with_render_geo() {
-            for (tile, pos, drawn) in ws.tiles_with_render_positions() {
-                let rect =
-                    Rectangle::new(geo.loc + pos.upscale(zoom), tile.tile_size().upscale(zoom));
-                if !drawn || rect.intersection(on_output).is_none() {
-                    continue;
-                }
-                let mapped = tile.window();
-                let geometry = mapped.window.geometry();
-                let origin = geo.loc + (pos + tile.buf_loc()).upscale(zoom);
-                let popup_scale = scale * zoom;
-                rects.push((mapped.id(), rect));
-                windows.push(ScreenWindow {
-                    id: mapped.id().get(),
-                    rect: px_rect(rect),
-                    surface_origin: px(origin),
-                    geometry_loc: (f64::from(geometry.loc.x), f64::from(geometry.loc.y)),
-                    window_size: (geometry.size.w, geometry.size.h),
-                    popups: capture_popups(mapped)
-                        .into_iter()
-                        .map(|p| CapturePopup {
-                            x: p.x * popup_scale,
-                            y: p.y * popup_scale,
-                            width: p.width * popup_scale,
-                            height: p.height * popup_scale,
-                        })
-                        .collect(),
-                });
-            }
-        }
+    for tile in visible_tiles(niri, output) {
+        let mapped = tile.mapped;
+        let geometry = mapped.window.geometry();
+        let popup_scale = scale * tile.zoom;
+        rects.push((mapped.id(), tile.rect));
+        windows.push(ScreenWindow {
+            id: mapped.id().get(),
+            rect: px_rect(tile.rect),
+            surface_origin: px(tile.origin),
+            geometry_loc: (f64::from(geometry.loc.x), f64::from(geometry.loc.y)),
+            window_size: (geometry.size.w, geometry.size.h),
+            popups: capture_popups(mapped)
+                .into_iter()
+                .map(|p| CapturePopup {
+                    x: p.x * popup_scale,
+                    y: p.y * popup_scale,
+                    width: p.width * popup_scale,
+                    height: p.height * popup_scale,
+                })
+                .collect(),
+        });
     }
 
     let map = layer_map_for_output(output);
@@ -249,6 +282,150 @@ fn render(
     };
     state.niri.agent.screens.insert(output.name(), record);
     Ok((capture, pixels))
+}
+
+/// Handles `Request::AgentScreen` pointer ops, in pixels of the output's last capture: hit-tests
+/// the point the way the owner's pointer is, then acts on what is there.
+pub fn screen_pointer(
+    state: &mut State,
+    output: Option<String>,
+    op: &AgentOp,
+    reply: Sender<Result<ScreenHit, AgentError>>,
+) {
+    let result = screen_op(state, output.as_deref(), op);
+    let _ = reply.send_blocking(result);
+}
+
+fn screen_op(state: &mut State, name: Option<&str>, op: &AgentOp) -> Result<ScreenHit, AgentError> {
+    let niri = &mut state.niri;
+    if !niri.agent.handed_over {
+        return Err(AgentError::NotHandedOver);
+    }
+    let output = output_precheck(niri, name)?;
+    let output_geo = niri
+        .global_space
+        .output_geometry(&output)
+        .ok_or_else(|| AgentError::BadOutput(output.name()))?;
+    let record = niri
+        .agent
+        .screens
+        .get(&output.name())
+        .ok_or(AgentError::NoCapture)?;
+    if record.output_scale != output.current_scale().fractional_scale()
+        || record.output_size != output_geo.size
+        || record.overview_open != niri.layout.is_overview_open()
+    {
+        return Err(AgentError::StaleCapture);
+    }
+    let Some((x, y)) = start_point(op) else {
+        return Ok(ScreenHit::Nothing);
+    };
+
+    let scale = record.scale;
+    let to_output = |x: f64, y: f64| Point::<f64, Logical>::from((x / scale, y / scale));
+    let local = to_output(x, y);
+    // Off the image is another output or nothing; either way not what the agent looked at.
+    if !Rectangle::from_size(output_geo.size.to_f64()).contains(local) {
+        return Ok(ScreenHit::Nothing);
+    }
+    let looked = window_at(record.windows.iter().copied(), local);
+    let now = visible_tiles(niri, &output)
+        .into_iter()
+        .map(|tile| (tile.mapped.id(), tile.rect));
+    if looked != window_at(now, local) {
+        return Err(AgentError::StaleCapture);
+    }
+
+    move_cursor(niri, &output, local);
+    let origin = output_geo.loc.to_f64();
+    let to_global = |x, y| to_output(x, y) + origin;
+    let pos = to_global(x, y);
+    let under = niri.contents_under(pos);
+
+    let hit = match (&under.surface, &under.window, &under.layer) {
+        (Some((surface, surface_pos)), _, Some(layer)) => {
+            let client = surface.client().ok_or(AgentError::WindowGone)?;
+            let to_local = |x, y| to_global(x, y) - *surface_pos;
+            let main = layer.wl_surface().clone();
+            let enter = |niri: &mut Niri| enter_keyboards_on(niri, &client, main);
+            let (result, sent_mods) =
+                deliver_with_mods(state, &client, surface, &to_local, op, enter);
+            if result.is_ok() || sent_mods {
+                // No window to note the burst on, but the idle release needs its time.
+                state.niri.agent.last_agent_burst = Some(Instant::now());
+            }
+            result?;
+            ScreenHit::Layer {
+                namespace: layer.namespace().to_owned(),
+            }
+        }
+        _ if under.hot_corner => ScreenHit::Nothing,
+        _ if under.overview => {
+            overview_op(state, &under, pos, op);
+            ScreenHit::Overview
+        }
+        (Some((surface, surface_pos)), Some((window, _)), None) => {
+            let id = state
+                .niri
+                .layout
+                .windows()
+                .find(|(_, mapped)| mapped.window == *window)
+                .map(|(_, mapped)| mapped.id())
+                .ok_or(AgentError::WindowGone)?;
+            let target = check_target(&state.niri, id, OpKind::Screen)?;
+            let to_local = |x, y| to_global(x, y) - *surface_pos;
+            deliver_window(state, &target, surface, &to_local, op)?;
+            ScreenHit::Window { id: id.get() }
+        }
+        _ => ScreenHit::Nothing,
+    };
+
+    // A drag stays on the surface it started on; the cursor shows where it ended.
+    if let (AgentOp::Drag { x1, y1, .. }, ScreenHit::Window { .. } | ScreenHit::Layer { .. }) =
+        (op, &hit)
+    {
+        move_cursor(&mut state.niri, &output, to_output(*x1, *y1));
+    }
+    Ok(hit)
+}
+
+/// The topmost of the windows, listed topmost first, whose rect holds `at`.
+fn window_at(
+    windows: impl IntoIterator<Item = (MappedId, Rectangle<f64, Logical>)>,
+    at: Point<f64, Logical>,
+) -> Option<MappedId> {
+    windows
+        .into_iter()
+        .find(|(_, rect)| rect.contains(at))
+        .map(|(id, _)| id)
+}
+
+/// Does what the owner's click or wheel at `pos` does in the overview.
+fn overview_op(state: &mut State, under: &PointContents, pos: Point<f64, Logical>, op: &AgentOp) {
+    match op {
+        AgentOp::Click {
+            button: AgentButton::Left,
+            ..
+        } => {
+            let niri = &mut state.niri;
+            if let Some((window, _)) = &under.window {
+                overview_activate(&mut niri.layout, window);
+            } else if let Some((output, ws_id)) = niri
+                .workspace_under(false, pos)
+                .map(|(output, ws)| (output, ws.id()))
+            {
+                if let Some((ws_idx, _)) = niri.layout.find_workspace_by_id(ws_id) {
+                    niri.layout.focus_output(&output);
+                    niri.layout.toggle_overview_to_workspace(ws_idx);
+                }
+            } else if let Some(output) = &under.output {
+                niri.layout.focus_output(output);
+            }
+            niri.queue_redraw_all();
+        }
+        AgentOp::Scroll { dy, .. } => state.overview_wheel(*dy),
+        _ => (),
+    }
 }
 
 fn write_png(capture: &OutputCapture, pixels: &[u8]) -> anyhow::Result<()> {

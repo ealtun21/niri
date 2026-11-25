@@ -11,6 +11,8 @@ use calloop::timer::{TimeoutAction, Timer};
 use niri_ipc::{AgentDone, AgentError};
 use smithay::input::keyboard::xkb::{self, Keymap, Keysym};
 use smithay::reexports::wayland_server::protocol::wl_keyboard::{KeyState, WlKeyboard};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Client;
 
 use super::{
     agent_done, boost_frames, check_target, OpKind, Sticky, Target, ACTIVE_INDICATOR, BURST_BOOST,
@@ -240,16 +242,23 @@ fn deliver_chunked(
 /// returns them. The focus goes to the target's topmost agent popup, as its grab would send it,
 /// or else to the toplevel. Leaves any other surface's shadow focus first.
 pub fn enter_keyboards(niri: &mut Niri, target: &Target) -> Vec<WlKeyboard> {
+    let surface = niri
+        .agent
+        .topmost_popup(target.id)
+        .unwrap_or_else(|| target.toplevel.clone());
+    enter_keyboards_on(niri, &target.client, surface)
+}
+
+/// Gives `surface` the shadow focus of its client's keyboards, sending `enter` to those that lack
+/// it, and returns them. Leaves any other surface's shadow focus first.
+pub fn enter_keyboards_on(niri: &mut Niri, client: &Client, surface: WlSurface) -> Vec<WlKeyboard> {
     let keyboards: Vec<WlKeyboard> = niri
         .seat
         .get_keyboard()
         .unwrap()
-        .client_keyboards(&target.client)
+        .client_keyboards(client)
         .collect();
     let agent = &mut niri.agent;
-    let surface = agent
-        .topmost_popup(target.id)
-        .unwrap_or_else(|| target.toplevel.clone());
 
     if agent
         .sticky

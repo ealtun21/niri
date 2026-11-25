@@ -11,6 +11,7 @@ use smithay::backend::input::InputTime;
 use smithay::desktop::WindowSurfaceType;
 use smithay::input::keyboard::xkb::{self, Keymap};
 use smithay::input::pointer::MotionEvent;
+use smithay::reexports::wayland_server::protocol::wl_keyboard::WlKeyboard;
 use smithay::reexports::wayland_server::protocol::wl_pointer::{
     Axis, AxisSource, ButtonState, WlPointer,
 };
@@ -23,7 +24,7 @@ use super::keyboard::{enter_keyboards, finish_burst, with_keymap};
 use super::{
     agent_done, check_target, CaptureRecord, OpKind, PointerFocus, Target, MAX_DRAG_STEPS,
 };
-use crate::niri::State;
+use crate::niri::{Niri, State};
 use crate::utils::get_monotonic_time;
 use crate::window::mapped::MappedId;
 
@@ -103,7 +104,7 @@ fn mod_mask(keymap: &Keymap, mods: &[AgentMod]) -> u32 {
 }
 
 /// Where the op starts, in its own coordinates; `None` for keyboard ops.
-fn start_point(op: &AgentOp) -> Option<(f64, f64)> {
+pub(super) fn start_point(op: &AgentOp) -> Option<(f64, f64)> {
     match op {
         AgentOp::Click { x, y, .. } | AgentOp::Move { x, y } | AgentOp::Scroll { x, y, .. } => {
             Some((*x, *y))
@@ -123,24 +124,9 @@ pub fn deliver_pointer(
     let Some((x, y)) = start_point(op) else {
         return Ok(());
     };
-    let mods = match op {
-        AgentOp::Click { mods, .. } => mods.as_slice(),
-        _ => &[],
-    };
-    let (mask, group) = if mods.is_empty() {
-        (0, 0)
-    } else {
-        // Read-only: the group the owner's seat would send to this client.
-        let group = {
-            let keyboard = state.niri.seat.get_keyboard().unwrap();
-            keyboard.with_xkb_state(state, |ctx| ctx.xkb().lock().unwrap().active_layout().0)
-        };
-        (with_keymap(state, |keymap| mod_mask(keymap, mods)), group)
-    };
-
-    let niri = &mut state.niri;
     // Look the window up again: it may have closed or been replaced since the checks.
-    let window = niri
+    let window = state
+        .niri
         .find_mapped_output_by_id(target.id)
         .map(|(mapped, _)| mapped.window.clone())
         .ok_or(AgentError::WindowGone)?;
@@ -150,37 +136,76 @@ pub fn deliver_pointer(
         None => (target.toplevel.clone(), Point::default()),
     };
 
+    let to_local = |x, y| capture_to_buffer(x, y, rec) - offset;
+    deliver_window(state, target, &surface, &to_local, op)?;
+
+    let niri = &mut state.niri;
+    place_on_window(niri, target.id, buf);
+    if let AgentOp::Drag { x1, y1, .. } = op {
+        place_on_window(niri, target.id, capture_to_buffer(*x1, *y1, rec));
+    }
+    Ok(())
+}
+
+/// Sends the op to `surface` of the target window with the click's modifiers held, then does the
+/// burst bookkeeping.
+pub(super) fn deliver_window(
+    state: &mut State,
+    target: &Target,
+    surface: &WlSurface,
+    to_local: &dyn Fn(f64, f64) -> Point<f64, Logical>,
+    op: &AgentOp,
+) -> Result<(), AgentError> {
+    let enter = |niri: &mut Niri| enter_keyboards(niri, target);
+    let (result, sent_mods) =
+        deliver_with_mods(state, &target.client, surface, to_local, op, enter);
+    // The modifiers went out even if the pointer part failed: that is still a burst.
+    if result.is_ok() || sent_mods {
+        finish_burst(&mut state.niri, target);
+    }
+    result
+}
+
+/// Like `deliver_to_surface`, with a click's modifiers held on the keyboards that `enter` gives the
+/// shadow focus, and cleared after. Also returns whether modifiers went out.
+pub(super) fn deliver_with_mods(
+    state: &mut State,
+    client: &Client,
+    surface: &WlSurface,
+    to_local: &dyn Fn(f64, f64) -> Point<f64, Logical>,
+    op: &AgentOp,
+    enter: impl FnOnce(&mut Niri) -> Vec<WlKeyboard>,
+) -> (Result<(), AgentError>, bool) {
+    let mods = match op {
+        AgentOp::Click { mods, .. } => mods.as_slice(),
+        _ => &[],
+    };
+    let mut group = 0;
     let keyboards = if mods.is_empty() {
         Vec::new()
     } else {
+        // Read-only: the group the owner's seat would send to this client.
+        group = {
+            let keyboard = state.niri.seat.get_keyboard().unwrap();
+            keyboard.with_xkb_state(state, |ctx| ctx.xkb().lock().unwrap().active_layout().0)
+        };
+        let mask = with_keymap(state, |keymap| mod_mask(keymap, mods));
         // Clients drop modifiers sent to a keyboard that hasn't had `enter`.
-        let keyboards = enter_keyboards(niri, target);
-        let serial = niri.agent.next_serial().into();
+        let keyboards = enter(&mut state.niri);
+        let serial = state.niri.agent.next_serial().into();
         for keyboard in &keyboards {
             keyboard.modifiers(serial, mask, 0, 0, group);
         }
         keyboards
     };
 
-    let to_local = |x, y| capture_to_buffer(x, y, rec) - offset;
-    let result = deliver_to_surface(state, &target.client, &surface, &to_local, op);
+    let result = deliver_to_surface(state, client, surface, to_local, op);
 
-    let niri = &mut state.niri;
     for keyboard in &keyboards {
-        let serial = niri.agent.next_serial().into();
+        let serial = state.niri.agent.next_serial().into();
         keyboard.modifiers(serial, 0, 0, 0, group);
     }
-    if result.is_ok() {
-        place_on_window(niri, target.id, buf);
-        if let AgentOp::Drag { x1, y1, .. } = op {
-            place_on_window(niri, target.id, capture_to_buffer(*x1, *y1, rec));
-        }
-    }
-    // The modifiers went out even if the pointer part failed: that is still a burst.
-    if result.is_ok() || !keyboards.is_empty() {
-        finish_burst(niri, target);
-    }
-    result
+    (result, !keyboards.is_empty())
 }
 
 /// While handed over, takes the seat pointer off the client so the agent pointer can enter it: an

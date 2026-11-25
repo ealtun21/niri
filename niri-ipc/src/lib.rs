@@ -164,6 +164,16 @@ pub enum Request {
         /// The action to run.
         action: Action,
     },
+    /// Perform an agent pointer operation anywhere on an output during a hand-over.
+    ///
+    /// Coordinates are pixels of the output's last [`Request::CaptureOutput`]. Refused unless the
+    /// owner handed over the controls.
+    AgentScreen {
+        /// Name of the output. Defaults to the agent cursor's output, else the active one.
+        output: Option<String>,
+        /// The operation.
+        op: AgentOp,
+    },
 }
 
 /// Reply from niri to client.
@@ -216,6 +226,8 @@ pub enum Response {
     OutputCapture(OutputCapture),
     /// Result of an agent operation.
     AgentDone(AgentDone),
+    /// Result of an agent screen operation: what was under the point.
+    AgentScreenDone(ScreenHit),
     /// The agent status.
     AgentState(AgentStatus),
 }
@@ -464,6 +476,26 @@ pub struct AgentDone {
     pub title: Option<String>,
     /// Age of the capture the operation was based on, in milliseconds.
     pub capture_age_ms: Option<u64>,
+}
+
+/// What an agent screen operation landed on.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum ScreenHit {
+    /// A window.
+    Window {
+        /// Id of the window.
+        id: u64,
+    },
+    /// A layer-shell surface.
+    Layer {
+        /// Namespace of the layer surface.
+        namespace: String,
+    },
+    /// The overview.
+    Overview,
+    /// Nothing: an empty spot, or a hot corner.
+    Nothing,
 }
 
 /// Error from an agent operation.

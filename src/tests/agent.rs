@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use async_channel::Receiver;
 use insta::assert_snapshot;
 use niri_config::Config;
-use niri_ipc::{AgentButton, AgentDone, AgentError, AgentOp, AgentStatus, AgentWindow};
+use niri_ipc::{AgentButton, AgentDone, AgentError, AgentOp, AgentStatus, AgentWindow, ScreenHit};
 use smithay::backend::input::{InputEvent, InputTime, KeyState, Keycode};
 use smithay::desktop::Window;
 use smithay::input::keyboard::Layout;
@@ -16,10 +16,11 @@ use super::*;
 use crate::agent::capture::{capture_popups, capture_precheck, settle_time};
 use crate::agent::cursor::{cursor_location, CURSOR_GLIDE};
 use crate::agent::pointer::{self, capture_to_buffer};
-use crate::agent::screen::{describe, output_precheck};
+use crate::agent::screen::{describe, output_precheck, screen_pointer, ScreenRecord};
 use crate::agent::{
-    capture_scale, check_target, keyboard, status, CaptureRecord, OpKind, DEFAULT_SETTLE,
-    IDLE_RELEASE, MAX_DRAG_STEPS, MAX_SETTLE, TYPE_CHUNK_CHARS, TYPE_CHUNK_INTERVAL,
+    capture_scale, check_target, keyboard, status, CaptureRecord, OpKind, DEFAULT_MAX_EDGE,
+    DEFAULT_SETTLE, IDLE_RELEASE, MAX_DRAG_STEPS, MAX_SETTLE, TYPE_CHUNK_CHARS,
+    TYPE_CHUNK_INTERVAL,
 };
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::LockState;
@@ -3047,4 +3048,537 @@ fn capture_output_works_side_by_side() {
     assert!(!f.niri().agent.handed_over);
     assert!(output_precheck(f.niri(), None).is_ok());
     assert_eq!(describe(f.niri(), &output, 1568).1.len(), 1);
+}
+
+type Output = smithay::output::Output;
+
+/// Owner window `a` (focused) and `agent-b` side by side on the owner's workspace, handed over.
+fn screen_setup() -> (Fixture, ClientId, WlSurface, ClientId, WlSurface, Output) {
+    screen_setup_with(handover_config())
+}
+
+fn screen_setup_with(
+    config: Config,
+) -> (Fixture, ClientId, WlSurface, ClientId, WlSurface, Output) {
+    let (mut f, human, a, agent, b) = two_clients_with(config);
+    b_on_owner_workspace(&mut f, human);
+    f.double_roundtrip(agent);
+    f.niri_complete_animations();
+    f.niri().agent.hand_over();
+    let output = active_output(&mut f);
+    (f, human, a, agent, b, output)
+}
+
+/// Stores a look at the output, as `CaptureOutput` does after rendering.
+fn look(f: &mut Fixture, output: &Output) -> ScreenRecord {
+    let (record, ..) = describe(f.niri(), output, DEFAULT_MAX_EDGE);
+    f.niri().agent.screens.insert(output.name(), record.clone());
+    record
+}
+
+fn screen_now(f: &mut Fixture, output: Option<&str>, op: AgentOp) -> Result<ScreenHit, AgentError> {
+    let (tx, rx) = async_channel::bounded(1);
+    screen_pointer(f.niri_state(), output.map(str::to_owned), &op, tx);
+    rx.try_recv().unwrap()
+}
+
+/// Capture pixels of an output-local point.
+fn px(record: &ScreenRecord, local: Point<f64, Logical>) -> (f64, f64) {
+    (local.x * record.scale, local.y * record.scale)
+}
+
+/// Output-local center of the window's tile in the look.
+fn center(record: &ScreenRecord, id: MappedId) -> Point<f64, Logical> {
+    let (_, rect) = record.windows.iter().find(|(w, _)| *w == id).unwrap();
+    Point::from((rect.loc.x + rect.size.w / 2., rect.loc.y + rect.size.h / 2.))
+}
+
+fn screen_click(
+    f: &mut Fixture,
+    record: &ScreenRecord,
+    local: Point<f64, Logical>,
+) -> Result<ScreenHit, AgentError> {
+    let (x, y) = px(record, local);
+    screen_now(f, None, click(x, y))
+}
+
+fn pressed(events: &[PointerEvent]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            PointerEvent::Button {
+                state: ButtonState::Pressed,
+                ..
+            }
+        )
+    })
+}
+
+/// The serial of the first button press in the events.
+fn press_serial(events: &[PointerEvent]) -> u32 {
+    events
+        .iter()
+        .find_map(|e| match e {
+            PointerEvent::Button { serial, .. } => Some(*serial),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// Asserts the first event is an `Enter` at `want`.
+fn assert_entered_at(events: &[PointerEvent], want: Point<f64, Logical>) {
+    match events.first() {
+        Some(PointerEvent::Enter { x, y }) => {
+            assert!(near((*x, *y).into(), want), "{events:?} vs {want:?}")
+        }
+        _ => panic!("{events:?}"),
+    }
+}
+
+/// A mapped top-layer bar, namespace "bar", 50 px tall along the top of the output.
+fn map_bar(f: &mut Fixture) -> (ClientId, WlSurface) {
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
+
+    use crate::tests::client::LayerConfigureProps;
+
+    let id = f.add_client();
+    let layer = f.client(id).create_layer(None, Layer::Top, "bar");
+    let surface = layer.surface.clone();
+    layer.set_configure_props(LayerConfigureProps {
+        anchor: Some(Anchor::Left | Anchor::Right | Anchor::Top),
+        size: Some((0, 50)),
+        ..Default::default()
+    });
+    layer.commit();
+    f.roundtrip(id);
+    let layer = f.client(id).layer(&surface);
+    layer.attach_new_buffer();
+    layer.set_size(1920, 50);
+    layer.ack_last_and_commit();
+    f.double_roundtrip(id);
+    (id, surface)
+}
+
+#[test]
+fn screen_op_needs_handover() {
+    let (mut f, ..) = two_clients();
+    let output = active_output(&mut f);
+    let record = look(&mut f, &output);
+    let id = mapped_id(&mut f, "a");
+    let err = screen_click(&mut f, &record, center(&record, id)).unwrap_err();
+    assert_eq!(err, AgentError::NotHandedOver);
+    assert_eq!(err.to_string(), "not_handed_over");
+}
+
+#[test]
+fn screen_click_without_capture_is_no_capture() {
+    let (mut f, ..) = screen_setup();
+    assert_eq!(
+        screen_now(&mut f, None, click(10., 10.)),
+        Err(AgentError::NoCapture)
+    );
+}
+
+#[test]
+fn screen_click_reaches_window_under_point() {
+    let (mut f, human, a, agent, b, output) = screen_setup();
+    let record = look(&mut f, &output);
+    let id = mapped_id(&mut f, "a");
+    pointer_events(&mut f, human, &a);
+    pointer_events(&mut f, agent, &b);
+
+    let local = center(&record, id);
+    assert_eq!(
+        screen_click(&mut f, &record, local),
+        Ok(ScreenHit::Window { id: id.get() })
+    );
+
+    let got = pointer_events(&mut f, human, &a);
+    assert_entered_at(&got, local - drawn_point(&mut f, id, Point::default()));
+    assert!(pressed(&got), "{got:?}");
+    assert_one_pointer(&got);
+    assert_eq!(pointer_events(&mut f, agent, &b), []);
+}
+
+#[test]
+fn screen_click_reaches_layer_surface() {
+    let (mut f, .., output) = screen_setup();
+    let (bar_client, bar) = map_bar(&mut f);
+    pointer_events(&mut f, bar_client, &bar);
+    let record = look(&mut f, &output);
+
+    let hit = screen_click(&mut f, &record, Point::from((960., 25.)));
+    assert_eq!(
+        hit,
+        Ok(ScreenHit::Layer {
+            namespace: String::from("bar")
+        })
+    );
+    let got = pointer_events(&mut f, bar_client, &bar);
+    assert_entered_at(&got, Point::from((960., 25.)));
+    assert!(pressed(&got), "{got:?}");
+}
+
+#[test]
+fn screen_click_with_mods_on_layer_holds_them() {
+    let (mut f, .., output) = screen_setup();
+    let (bar_client, bar) = map_bar(&mut f);
+    events(&mut f, bar_client, &bar);
+    let record = look(&mut f, &output);
+
+    let (x, y) = px(&record, Point::from((960., 25.)));
+    let ctrl_click = AgentOp::Click {
+        x,
+        y,
+        button: AgentButton::Left,
+        count: 1,
+        mods: vec![niri_ipc::AgentMod::Ctrl],
+    };
+    screen_now(&mut f, None, ctrl_click).unwrap();
+    let keys = events(&mut f, bar_client, &bar);
+    assert!(keys.contains("depressed=4"), "{keys}");
+    assert_eq!(
+        keys.lines().rfind(|l| l.starts_with("modifiers")),
+        Some("modifiers: depressed=0, latched=0, locked=0, group=0"),
+        "{keys}"
+    );
+}
+
+#[test]
+fn screen_click_in_overview_activates_window() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+    let output = active_output(&mut f);
+    let record = look(&mut f, &output);
+    let id = mapped_id(&mut f, "agent-b");
+
+    assert_eq!(
+        screen_click(&mut f, &record, center(&record, id)),
+        Ok(ScreenHit::Overview)
+    );
+    f.niri_complete_animations();
+    assert!(!f.niri().layout.is_overview_open());
+    assert_eq!(f.niri().layout.focus().map(|m| m.id()), Some(id));
+}
+
+#[test]
+fn screen_click_in_overview_on_workspace_switches() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+    let output = active_output(&mut f);
+    let record = look(&mut f, &output);
+
+    // An empty spot of another workspace.
+    let active = f.niri().layout.active_workspace().unwrap().id();
+    let (local, ws) = (0..1080 / 10)
+        .flat_map(|j| (0..1920 / 10).map(move |i| (f64::from(i * 10 + 5), f64::from(j * 10 + 5))))
+        .find_map(|(x, y)| {
+            let niri = f.niri();
+            let p = Point::from((x, y));
+            let ws = niri.workspace_under(false, p)?.1.id();
+            (ws != active && niri.contents_under(p).window.is_none()).then_some((p, ws))
+        })
+        .expect("another workspace shows in the overview");
+
+    assert_eq!(
+        screen_click(&mut f, &record, local),
+        Ok(ScreenHit::Overview)
+    );
+    f.niri_complete_animations();
+    assert!(!f.niri().layout.is_overview_open());
+    assert_eq!(f.niri().layout.active_workspace().unwrap().id(), ws);
+}
+
+#[test]
+fn screen_scroll_in_overview_zooms() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+    let output = active_output(&mut f);
+    // Where the zoom animation ends: a second later.
+    let zoom = |f: &mut Fixture| {
+        let clock = &mut f.niri().clock;
+        let later = clock.now_unadjusted() + Duration::from_secs(1);
+        clock.set_unadjusted(later);
+        f.niri().layout.overview_zoom()
+    };
+    let start = zoom(&mut f);
+
+    // A zoomed overview is a new look.
+    for (dy, zoomed_in) in [(-1., true), (2., false)] {
+        let record = look(&mut f, &output);
+        let (x, y) = px(&record, Point::from((960., 540.)));
+        let scroll = AgentOp::Scroll { x, y, dx: 0., dy };
+        assert_eq!(screen_now(&mut f, None, scroll), Ok(ScreenHit::Overview));
+        let now = zoom(&mut f);
+        assert_eq!(now > start, zoomed_in, "{start} -> {now}");
+    }
+}
+
+#[test]
+fn screen_click_on_nothing() {
+    let (mut f, .., output) = screen_setup();
+    let record = look(&mut f, &output);
+
+    let empty = Point::from((1500., 900.));
+    let under = f.niri().contents_under(empty);
+    assert!(under.window.is_none() && under.surface.is_none() && !under.hot_corner);
+    assert_eq!(screen_click(&mut f, &record, empty), Ok(ScreenHit::Nothing));
+
+    let corner = Point::from((0., 0.));
+    assert!(f.niri().contents_under(corner).hot_corner);
+    assert_eq!(
+        screen_click(&mut f, &record, corner),
+        Ok(ScreenHit::Nothing)
+    );
+    assert!(!f.niri().layout.is_overview_open());
+}
+
+#[test]
+fn screen_click_refuses_blocked_out_window() {
+    let (mut f, id) = set_up_blocked_out("screen-capture");
+    f.niri().agent.hand_over();
+    let output = active_output(&mut f);
+    let record = look(&mut f, &output);
+    assert_eq!(
+        screen_click(&mut f, &record, center(&record, id)),
+        Err(AgentError::BlockedOut)
+    );
+}
+
+#[test]
+fn screen_click_moves_agent_cursor() {
+    let (mut f, .., output) = screen_setup();
+    let record = look(&mut f, &output);
+    let local = Point::from((1500., 900.));
+    screen_click(&mut f, &record, local).unwrap();
+    f.niri_complete_animations();
+    let got = cursor_location(f.niri(), &output).unwrap();
+    assert!(near(got, local), "{got:?} vs {local:?}");
+}
+
+#[test]
+fn screen_click_never_moves_owner_pointer() {
+    let (mut f, human, a, .., output) = screen_setup();
+    let window = window_of(&mut f, "a");
+    let (x, y) = point_over(&mut f, &window);
+    physical_motion(&mut f, x, y);
+    assert!(f.niri().agent.handed_over);
+    let mut got = pointer_events(&mut f, human, &a);
+    let location = pointer_location(&mut f);
+
+    let record = look(&mut f, &output);
+    let id = mapped_id(&mut f, "a");
+    screen_click(&mut f, &record, center(&record, id)).unwrap();
+
+    let pointer = f.niri().seat.get_pointer().unwrap();
+    assert_eq!(pointer.current_location(), location);
+    assert!(!pointer.is_grabbed());
+    got.extend(pointer_events(&mut f, human, &a));
+    assert!(pressed(&got), "{got:?}");
+    assert_one_pointer(&got);
+}
+
+#[test]
+fn screen_click_maps_to_looked_output() {
+    let (mut f, human, a, ..) = two_clients_with(handover_config());
+    // Window "a" reaches the right edge of output 1, next to output 2.
+    let window = f.client(human).window(&a);
+    window.set_size(1920, 100);
+    window.commit();
+    f.double_roundtrip(human);
+
+    f.add_output(2, (1920, 1080));
+    f.niri_focus_output(2);
+    let other = f.add_client();
+    let c = map_window(&mut f, other, "c");
+    f.niri_complete_animations();
+    f.niri().agent.hand_over();
+    let output = f.niri_output(2);
+    assert_eq!(output.name(), "headless-2");
+    // The other output is focused, so the default would be wrong.
+    f.niri_focus_output(1);
+    let record = look(&mut f, &output);
+    let id = mapped_id(&mut f, "c");
+    pointer_events(&mut f, other, &c);
+    pointer_events(&mut f, human, &a);
+
+    let (x, y) = px(&record, center(&record, id));
+    assert_eq!(
+        screen_now(&mut f, Some("headless-2"), click(x, y)),
+        Ok(ScreenHit::Window { id: id.get() })
+    );
+    assert!(pressed(&pointer_events(&mut f, other, &c)));
+
+    // Left of the image is output 1, where "a" is: not part of this look.
+    let a_edge = Point::from((1915., 50.));
+    assert!(f
+        .niri()
+        .contents_under(a_edge)
+        .window
+        .is_some_and(|(w, _)| w == window_of(&mut f, "a")));
+    assert_eq!(
+        screen_now(&mut f, Some("headless-2"), click(-4., y)),
+        Ok(ScreenHit::Nothing)
+    );
+    assert_eq!(pointer_events(&mut f, human, &a), []);
+}
+
+#[test]
+fn screen_click_at_scale_1_5() {
+    let config = format!("output \"headless-1\" {{ scale 1.5; }}\n{HANDOVER_BINDS}");
+    let (mut f, human, a, .., output) = screen_setup_with(Config::parse_mem(&config).unwrap());
+    assert_eq!(output.current_scale().fractional_scale(), 1.5);
+    let record = look(&mut f, &output);
+    assert!(record.scale > 1., "{}", record.scale);
+    let id = mapped_id(&mut f, "a");
+    pointer_events(&mut f, human, &a);
+
+    let local = center(&record, id);
+    assert_eq!(
+        screen_click(&mut f, &record, local),
+        Ok(ScreenHit::Window { id: id.get() })
+    );
+    let got = pointer_events(&mut f, human, &a);
+    assert_entered_at(&got, local - drawn_point(&mut f, id, Point::default()));
+}
+
+#[test]
+fn screen_click_after_window_moved_is_stale() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    f.niri_complete_animations();
+    let output = active_output(&mut f);
+    let record = look(&mut f, &output);
+    let a = mapped_id(&mut f, "a");
+    let local = center(&record, a);
+
+    // The view scrolls to workspace 2, where agent-b sits where "a" was.
+    f.niri().layout.switch_workspace_down();
+    f.niri_complete_animations();
+    let b = window_of(&mut f, "agent-b");
+    assert!(f
+        .niri()
+        .contents_under(local)
+        .window
+        .is_some_and(|(w, _)| w == b));
+    assert_eq!(
+        screen_click(&mut f, &record, local),
+        Err(AgentError::StaleCapture)
+    );
+}
+
+#[test]
+fn screen_click_after_overview_opened_is_stale() {
+    let (mut f, .., output) = screen_setup();
+    let record = look(&mut f, &output);
+    f.niri().layout.toggle_overview();
+    assert_eq!(
+        screen_click(&mut f, &record, Point::from((1500., 900.))),
+        Err(AgentError::StaleCapture)
+    );
+}
+
+#[test]
+fn screen_click_where_a_window_appeared_is_stale() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    f.niri_complete_animations();
+    let output = active_output(&mut f);
+    let record = look(&mut f, &output);
+
+    let human = f.add_client();
+    map_window(&mut f, human, "c");
+    f.niri_complete_animations();
+    let c = mapped_id(&mut f, "c");
+    let local = center(&describe(f.niri(), &output, DEFAULT_MAX_EDGE).0, c);
+    assert!(record.windows.iter().all(|(_, rect)| !rect.contains(local)));
+    assert_eq!(
+        screen_click(&mut f, &record, local),
+        Err(AgentError::StaleCapture)
+    );
+}
+
+#[test]
+fn screen_click_on_floating_over_tiled_hits_floating() {
+    let config =
+        format!("window-rule {{ match app-id=\"float\"; open-floating true; }}\n{HANDOVER_BINDS}");
+    let (mut f, human, a, .., output) = screen_setup_with(Config::parse_mem(&config).unwrap());
+    // "a" covers most of the output, under the floating window.
+    let window = f.client(human).window(&a);
+    window.set_size(1800, 1000);
+    window.commit();
+    f.double_roundtrip(human);
+    let other = f.add_client();
+    let float = map_window(&mut f, other, "float");
+    f.niri_complete_animations();
+    let float_id = mapped_id(&mut f, "float");
+    let a_id = mapped_id(&mut f, "a");
+    pointer_events(&mut f, other, &float);
+
+    let record = look(&mut f, &output);
+    let local = center(&record, float_id);
+    // Both rects hold the point; the look lists the floating window first.
+    let holders: Vec<MappedId> = record
+        .windows
+        .iter()
+        .filter(|(_, rect)| rect.contains(local))
+        .map(|(id, _)| *id)
+        .collect();
+    assert_eq!(holders, [float_id, a_id]);
+
+    assert_eq!(
+        screen_click(&mut f, &record, local),
+        Ok(ScreenHit::Window { id: float_id.get() })
+    );
+    assert!(pressed(&pointer_events(&mut f, other, &float)));
+}
+
+#[test]
+fn agent_serial_never_starts_seat_grabs() {
+    use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_toplevel::ResizeEdge;
+
+    let (mut f, _, _, agent, b, output) = screen_setup();
+    let (bar_client, bar) = map_bar(&mut f);
+    let location = pointer_location(&mut f);
+    let assert_no_grab = |f: &mut Fixture, what: &str| {
+        let pointer = f.niri().seat.get_pointer().unwrap();
+        assert!(!pointer.is_grabbed(), "{what} grabbed the owner pointer");
+        assert_eq!(pointer.current_location(), location, "{what}");
+        assert!(f.niri().popup_grab.is_none(), "{what}");
+    };
+    let record = look(&mut f, &output);
+    let b_id = mapped_id(&mut f, "agent-b");
+    pointer_events(&mut f, agent, &b);
+    pointer_events(&mut f, bar_client, &bar);
+
+    screen_click(&mut f, &record, center(&record, b_id)).unwrap();
+    let serial = press_serial(&pointer_events(&mut f, agent, &b));
+    let seat = f.client(agent).state.seats.keys().next().unwrap().clone();
+    f.client(agent).window(&b).xdg_toplevel._move(&seat, serial);
+    f.double_roundtrip(agent);
+    assert_no_grab(&mut f, "move");
+    let edge = ResizeEdge::BottomRight;
+    f.client(agent)
+        .window(&b)
+        .xdg_toplevel
+        .resize(&seat, serial, edge);
+    f.double_roundtrip(agent);
+    assert_no_grab(&mut f, "resize");
+    open_popup(&mut f, agent, &b, Some(serial));
+    assert_no_grab(&mut f, "window popup grab");
+
+    screen_click(&mut f, &record, Point::from((960., 25.))).unwrap();
+    let serial = press_serial(&pointer_events(&mut f, bar_client, &bar));
+    f.client(bar_client)
+        .state
+        .create_layer_popup(&bar, Some(serial));
+    f.double_roundtrip(bar_client);
+    assert_no_grab(&mut f, "layer popup grab");
 }

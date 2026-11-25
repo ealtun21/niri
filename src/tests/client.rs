@@ -467,6 +467,26 @@ impl State {
         grab_serial: Option<u32>,
         anchor: (i32, i32),
     ) -> (WlSurface, XdgPopup) {
+        self.new_popup(Some(parent), None, grab_serial, anchor)
+    }
+
+    /// Like `create_popup`, as a popup of the layer surface.
+    pub fn create_layer_popup(
+        &mut self,
+        layer: &WlSurface,
+        grab_serial: Option<u32>,
+    ) -> (WlSurface, XdgPopup) {
+        let layer = self.layer(layer).layer_surface.clone();
+        self.new_popup(None, Some(&layer), grab_serial, (0, 0))
+    }
+
+    fn new_popup(
+        &mut self,
+        parent: Option<&XdgSurface>,
+        layer: Option<&ZwlrLayerSurfaceV1>,
+        grab_serial: Option<u32>,
+        anchor: (i32, i32),
+    ) -> (WlSurface, XdgPopup) {
         let surface = self.create_surface();
 
         let xdg_wm_base = self.xdg_wm_base.as_ref().unwrap();
@@ -474,8 +494,11 @@ impl State {
         positioner.set_size(10, 10);
         positioner.set_anchor_rect(anchor.0, anchor.1, 1, 1);
         let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &self.qh, ());
-        let popup = xdg_surface.get_popup(Some(parent), &positioner, &self.qh, ());
+        let popup = xdg_surface.get_popup(parent, &positioner, &self.qh, ());
         positioner.destroy();
+        if let Some(layer) = layer {
+            layer.get_popup(&popup);
+        }
 
         if let Some(serial) = grab_serial {
             popup.grab(self.seats.keys().next().unwrap(), serial);

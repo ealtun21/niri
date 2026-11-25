@@ -3630,6 +3630,18 @@ impl State {
         pointer.frame(self);
     }
 
+    /// The overview's plain wheel: each notch down zooms out a step, each notch up zooms in.
+    pub fn overview_wheel(&mut self, notches: f64) {
+        let action = if notches < 0. {
+            Action::OverviewZoomIn
+        } else {
+            Action::OverviewZoomOut
+        };
+        for _ in 0..notches.abs().round() as u32 {
+            self.do_action(action.clone(), false, InputTime::now());
+        }
+    }
+
     fn on_pointer_axis<I: InputBackend>(&mut self, event: I::PointerAxisEvent)
     where
         I::Device: 'static,
@@ -3765,7 +3777,7 @@ impl State {
                 let ticks = self.niri.vertical_wheel_tracker.accumulate(vertical);
                 if ticks != 0 {
                     // Overview camera: the plain wheel zooms, Mod+wheel switches workspaces.
-                    let overview_wheel = |trigger, action, cooldown| {
+                    let overview_bind = |trigger, action, cooldown| {
                         Some(Bind {
                             key: Key {
                                 trigger,
@@ -3782,19 +3794,18 @@ impl State {
                     };
                     let (bind_up, bind_down) = if should_handle_in_overview && modifiers.is_empty()
                     {
-                        (
-                            overview_wheel(Trigger::WheelScrollUp, Action::OverviewZoomIn, None),
-                            overview_wheel(Trigger::WheelScrollDown, Action::OverviewZoomOut, None),
-                        )
+                        // Shared with agent screen ops, so no binds to run.
+                        self.overview_wheel(f64::from(ticks));
+                        (None, None)
                     } else if should_handle_in_overview && modifiers == mod_key.to_modifiers() {
                         let cooldown = Some(Duration::from_millis(50));
                         (
-                            overview_wheel(
+                            overview_bind(
                                 Trigger::WheelScrollUp,
                                 Action::FocusWorkspaceUpUnderMouse,
                                 cooldown,
                             ),
-                            overview_wheel(
+                            overview_bind(
                                 Trigger::WheelScrollDown,
                                 Action::FocusWorkspaceDownUnderMouse,
                                 cooldown,

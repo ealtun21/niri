@@ -19,7 +19,27 @@ use smithay::output::Output;
 use smithay::utils::{IsAlive, Logical, Point, SERIAL_COUNTER};
 
 use crate::input::AnyStartData;
+use crate::layout::Layout;
 use crate::niri::State;
+use crate::window::Mapped;
+
+/// Activates the window. In the overview, also switches to its workspace and closes the overview,
+/// with a nice synchronized workspace animation.
+pub fn overview_activate(layout: &mut Layout<Mapped>, window: &Window) {
+    if layout.is_overview_open() {
+        let res = layout.workspaces().find_map(|(mon, ws_idx, ws)| {
+            ws.windows()
+                .any(|w| w.window == *window)
+                .then(|| (mon.map(|mon| mon.output().clone()), ws_idx))
+        });
+        if let Some((Some(output), ws_idx)) = res {
+            layout.focus_output(&output);
+            layout.toggle_overview_to_workspace(ws_idx);
+        }
+    }
+
+    layout.activate_window(window);
+}
 
 pub struct MoveGrab {
     start_data: AnyStartData<State>,
@@ -84,21 +104,8 @@ impl MoveGrab {
         match self.gesture {
             GestureState::Recognizing => {
                 // Activate the window on release. This is most prominent in the overview where
-                // windows are not activated on click. In the overview, we also try to do a nice
-                // synchronized workspace animation.
-                if layout.is_overview_open() {
-                    let res = layout.workspaces().find_map(|(mon, ws_idx, ws)| {
-                        ws.windows()
-                            .any(|w| w.window == self.window)
-                            .then(|| (mon.map(|mon| mon.output().clone()), ws_idx))
-                    });
-                    if let Some((Some(output), ws_idx)) = res {
-                        layout.focus_output(&output);
-                        layout.toggle_overview_to_workspace(ws_idx);
-                    }
-                }
-
-                layout.activate_window(&self.window);
+                // windows are not activated on click.
+                overview_activate(layout, &self.window);
             }
             GestureState::Move => layout.interactive_move_end(&self.window),
             GestureState::ViewOffset => {
