@@ -41,7 +41,7 @@ Rules:
 - Launch browsers only through `launch`; it gives a fresh profile, never the owner's.
 - Close the windows you launched when you are done.
 - Coordinates are pixels of the last `look` image. After any `type` or `key`, or after `stale_capture`, `no_capture` or `stale_elements`, `look` again before clicking.
-- Element numbers expire at the next `look` or the next acting call on that window.
+- Element numbers expire at the next `look` or the next acting call on that window (with `screen: true`, at the next screen look or screen operation).
 - While a menu or popup is open, elements under it are covered: press Escape first.
 - Right after `launch`, a browser may list few page elements at first: look again after a moment.
 - Element names can be empty (GTK 4 menu items). In GTK 4 apps a box can be about 15 px off: check it against the image, and click small targets by coordinates from the image.
@@ -144,6 +144,9 @@ pub struct Server {
     /// Image width and height and element list from the last `look` of each window; dropped by
     /// any acting call on it.
     elements: HashMap<u64, (u32, u32, Vec<elements::Element>)>,
+    /// Output, image width and height and element list from the last screen `look`; dropped by
+    /// any screen operation.
+    screen_elements: Option<(String, u32, u32, Vec<elements::Element>)>,
     /// Reads a window's accessibility tree (replaced in tests).
     read_elements: fn(u32, &str, bool, &niri_ipc::WindowCapture) -> elements::Elements,
 }
@@ -172,6 +175,7 @@ impl Server {
                 apps::profile_base()
             },
             elements: HashMap::new(),
+            screen_elements: None,
             read_elements: elements::read_elements,
         }
     }

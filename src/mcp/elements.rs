@@ -207,8 +207,9 @@ fn sanitize_name(raw: &str) -> String {
     out
 }
 
-/// One line per element, `N role "name" [states] x,y wxh`, at most `max_lines` of them.
-pub fn format_elements(e: &Elements, max_lines: usize) -> String {
+/// One line per element, `N role "name" [states] x,y wxh`, numbered from `first`, at most
+/// `max_lines` of them.
+pub fn format_elements(e: &Elements, first: usize, max_lines: usize) -> String {
     let mut out = String::new();
     if let Some(note) = &e.note {
         let _ = writeln!(out, "{note}");
@@ -220,7 +221,7 @@ pub fn format_elements(e: &Elements, max_lines: usize) -> String {
         let _ = writeln!(
             out,
             "{} {} \"{}\" [{}] {},{} {}x{}",
-            i + 1,
+            first + i,
             el.role,
             el.name,
             el.states.join(","),
@@ -669,7 +670,7 @@ fn popup_fits((w, h): (i32, i32), popup: &CapturePopup) -> bool {
 
 /// The capture pixels a popup's surface can cover: from its surface origin over its geometry
 /// plus the most shadow.
-fn popup_area(p: &CapturePopup, capture: &WindowCapture) -> (f64, f64, f64, f64) {
+pub(super) fn popup_area(p: &CapturePopup, capture: &WindowCapture) -> (f64, f64, f64, f64) {
     let s = capture.scale;
     (
         (p.x - capture.origin.0) * s,
@@ -679,7 +680,7 @@ fn popup_area(p: &CapturePopup, capture: &WindowCapture) -> (f64, f64, f64, f64)
     )
 }
 
-fn contains((x, y, w, h): (f64, f64, f64, f64), (px, py): (f64, f64)) -> bool {
+pub(super) fn contains((x, y, w, h): (f64, f64, f64, f64), (px, py): (f64, f64)) -> bool {
     (x..=x + w).contains(&px) && (y..=y + h).contains(&py)
 }
 
@@ -942,7 +943,7 @@ mod tests {
             cut: false,
             note: None,
         };
-        let out = format_elements(&e, 300);
+        let out = format_elements(&e, 1, 300);
         let lines: Vec<&str> = out.lines().collect();
         let element_lines = lines
             .iter()
@@ -960,7 +961,7 @@ mod tests {
             cut: true,
             note: None,
         };
-        let out = format_elements(&e, 300);
+        let out = format_elements(&e, 1, 300);
         assert!(!out.contains("no clickable elements"), "{out}");
         assert!(out.contains("cut short"), "{out}");
     }
