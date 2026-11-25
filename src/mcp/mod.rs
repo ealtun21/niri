@@ -142,10 +142,10 @@ pub struct Server {
     /// Where profile dirs live: `$XDG_RUNTIME_DIR/niri-mcp`.
     profile_base: Option<PathBuf>,
     /// Image width and height and element list from the last `look` of each window; dropped by
-    /// any acting call on it.
+    /// the next look or acting call on that window and by any screen operation.
     elements: HashMap<u64, (u32, u32, Vec<elements::Element>)>,
     /// Output, image width and height and element list from the last screen `look`; dropped by
-    /// any screen operation.
+    /// the next screen look, any acting call (on the screen or a window) and any `action`.
     screen_elements: Option<(String, u32, u32, Vec<elements::Element>)>,
     /// Output of the last screen `look`: where screen operations go unless they name one.
     screen_output: Option<String>,
