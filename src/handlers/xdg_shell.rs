@@ -333,8 +333,6 @@ impl XdgShellHandler for State {
         // A menu that an agent click opened: keep it without a grab, so the owner's focus and
         // pointer stay put.
         if self.niri.agent.is_agent_serial(serial) {
-            // shortcut: popups of layer surfaces aren't tracked, so only their client closes them;
-            // track them like window popups if they stay open.
             crate::agent::add_popup(&mut self.niri, &root, popup.clone());
             return;
         }

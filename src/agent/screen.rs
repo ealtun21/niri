@@ -29,6 +29,9 @@ use crate::utils::{get_credentials_for_surface, write_png_rgba8};
 use crate::window::mapped::MappedId;
 use crate::window::Mapped;
 
+/// Most wheel notches an agent scroll runs in the overview: more than the whole zoom range takes.
+const MAX_WHEEL_NOTCHES: f64 = 30.;
+
 /// What an output capture looked like: the visible windows' rects, to map its pixels back to them.
 #[derive(Debug, Clone)]
 pub struct ScreenRecord {
@@ -342,8 +345,24 @@ fn screen_op(state: &mut State, name: Option<&str>, op: &AgentOp) -> Result<Scre
     let pos = to_global(x, y);
     let under = niri.contents_under(pos);
 
+    // A button press focuses like the owner's does.
+    let press = matches!(op, AgentOp::Click { .. } | AgentOp::Drag { .. });
     let hit = match (&under.surface, &under.window, &under.layer) {
         (Some((surface, surface_pos)), _, Some(layer)) => {
+            let blocked_out = state
+                .niri
+                .mapped_layer_surfaces
+                .get(layer)
+                .is_some_and(|mapped| mapped.rules().block_out_from.is_some());
+            if blocked_out {
+                return Err(AgentError::BlockedOut);
+            }
+            if press {
+                let layer = layer.clone();
+                focus_without_warp(state, |state| {
+                    state.niri.focus_layer_surface_if_on_demand(Some(layer));
+                });
+            }
             let client = surface.client().ok_or(AgentError::WindowGone)?;
             let to_local = |x, y| to_global(x, y) - *surface_pos;
             let main = layer.wl_surface().clone();
@@ -364,7 +383,7 @@ fn screen_op(state: &mut State, name: Option<&str>, op: &AgentOp) -> Result<Scre
             overview_op(state, &under, pos, op);
             ScreenHit::Overview
         }
-        (Some((surface, surface_pos)), Some((window, _)), None) => {
+        (surface, Some((window, _)), None) => {
             let id = state
                 .niri
                 .layout
@@ -373,11 +392,28 @@ fn screen_op(state: &mut State, name: Option<&str>, op: &AgentOp) -> Result<Scre
                 .map(|(_, mapped)| mapped.id())
                 .ok_or(AgentError::WindowGone)?;
             let target = check_target(&state.niri, id, OpKind::Screen)?;
-            let to_local = |x, y| to_global(x, y) - *surface_pos;
-            deliver_window(state, &target, surface, &to_local, op)?;
+            if press {
+                focus_without_warp(state, |state| {
+                    state.niri.layout.activate_window(window);
+                    state.niri.focus_layer_surface_if_on_demand(None);
+                });
+            }
+            // On the border there is no surface: the press only activates.
+            if let Some((surface, surface_pos)) = surface {
+                let to_local = |x, y| to_global(x, y) - *surface_pos;
+                deliver_window(state, &target, surface, &to_local, op)?;
+            }
             ScreenHit::Window { id: id.get() }
         }
-        _ => ScreenHit::Nothing,
+        _ => {
+            if press {
+                focus_without_warp(state, |state| {
+                    state.click_empty_spot(pos);
+                    state.niri.focus_layer_surface_if_on_demand(None);
+                });
+            }
+            ScreenHit::Nothing
+        }
     };
 
     // A drag stays on the surface it started on; the cursor shows where it ended.
@@ -400,30 +436,33 @@ fn window_at(
         .map(|(id, _)| id)
 }
 
+/// Runs `f`, then moves the keyboard focus where it says, never warping the owner's pointer.
+fn focus_without_warp(state: &mut State, f: impl FnOnce(&mut State)) {
+    state.niri.agent.suppress_warp = true;
+    f(state);
+    state.update_keyboard_focus();
+    state.niri.agent.suppress_warp = false;
+}
+
 /// Does what the owner's click or wheel at `pos` does in the overview.
 fn overview_op(state: &mut State, under: &PointContents, pos: Point<f64, Logical>, op: &AgentOp) {
     match op {
         AgentOp::Click {
             button: AgentButton::Left,
             ..
-        } => {
-            let niri = &mut state.niri;
-            if let Some((window, _)) = &under.window {
-                overview_activate(&mut niri.layout, window);
-            } else if let Some((output, ws_id)) = niri
-                .workspace_under(false, pos)
-                .map(|(output, ws)| (output, ws.id()))
-            {
-                if let Some((ws_idx, _)) = niri.layout.find_workspace_by_id(ws_id) {
-                    niri.layout.focus_output(&output);
-                    niri.layout.toggle_overview_to_workspace(ws_idx);
+        } => focus_without_warp(state, |state| {
+            match &under.window {
+                Some((window, _)) => {
+                    overview_activate(&mut state.niri.layout, window);
+                    state.niri.queue_redraw_all();
                 }
-            } else if let Some(output) = &under.output {
-                niri.layout.focus_output(output);
+                None => state.click_empty_spot(pos),
             }
-            niri.queue_redraw_all();
+            state.niri.focus_layer_surface_if_on_demand(None);
+        }),
+        AgentOp::Scroll { dy, .. } => {
+            state.overview_wheel(dy.clamp(-MAX_WHEEL_NOTCHES, MAX_WHEEL_NOTCHES));
         }
-        AgentOp::Scroll { dy, .. } => state.overview_wheel(*dy),
         _ => (),
     }
 }

@@ -3558,22 +3558,8 @@ impl State {
 
                 // FIXME: granular.
                 self.niri.queue_redraw_all();
-            } else if let Some((output, ws)) = is_overview_open
-                .then(|| self.niri.workspace_under_cursor(false))
-                .flatten()
-            {
-                let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
-
-                self.niri.layout.focus_output(&output);
-                self.niri.layout.toggle_overview_to_workspace(ws_idx);
-
-                // FIXME: granular.
-                self.niri.queue_redraw_all();
-            } else if let Some(output) = self.niri.output_under_cursor() {
-                self.niri.layout.focus_output(&output);
-
-                // FIXME: granular.
-                self.niri.queue_redraw_all();
+            } else {
+                self.click_empty_spot(pointer.current_location());
             }
         };
 
@@ -3628,6 +3614,32 @@ impl State {
             },
         );
         pointer.frame(self);
+    }
+
+    /// A button press at `pos` on no window: in the overview, switches to the workspace there and
+    /// closes the overview; otherwise focuses the output there.
+    pub fn click_empty_spot(&mut self, pos: Point<f64, Logical>) {
+        if let Some((output, ws)) = self
+            .niri
+            .layout
+            .is_overview_open()
+            .then(|| self.niri.workspace_under(false, pos))
+            .flatten()
+        {
+            let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
+
+            self.niri.layout.focus_output(&output);
+            self.niri.layout.toggle_overview_to_workspace(ws_idx);
+
+            // FIXME: granular.
+            self.niri.queue_redraw_all();
+        } else if let Some((output, _)) = self.niri.output_under(pos) {
+            let output = output.clone();
+            self.niri.layout.focus_output(&output);
+
+            // FIXME: granular.
+            self.niri.queue_redraw_all();
+        }
     }
 
     /// The overview's plain wheel: each notch down zooms out a step, each notch up zooms in.

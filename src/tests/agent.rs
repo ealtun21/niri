@@ -8,6 +8,7 @@ use smithay::backend::input::{InputEvent, InputTime, KeyState, Keycode};
 use smithay::desktop::Window;
 use smithay::input::keyboard::Layout;
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_popup::XdgPopup;
+use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::KeyboardInteractivity;
 use smithay::utils::{Logical, Point, Serial, Size};
 use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
 
@@ -3137,6 +3138,13 @@ fn assert_entered_at(events: &[PointerEvent], want: Point<f64, Logical>) {
 
 /// A mapped top-layer bar, namespace "bar", 50 px tall along the top of the output.
 fn map_bar(f: &mut Fixture) -> (ClientId, WlSurface) {
+    map_bar_with(f, None)
+}
+
+fn map_bar_with(
+    f: &mut Fixture,
+    kb_interactivity: Option<KeyboardInteractivity>,
+) -> (ClientId, WlSurface) {
     use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
     use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
 
@@ -3148,6 +3156,7 @@ fn map_bar(f: &mut Fixture) -> (ClientId, WlSurface) {
     layer.set_configure_props(LayerConfigureProps {
         anchor: Some(Anchor::Left | Anchor::Right | Anchor::Top),
         size: Some((0, 50)),
+        kb_interactivity,
         ..Default::default()
     });
     layer.commit();
@@ -3264,6 +3273,36 @@ fn screen_click_in_overview_activates_window() {
     assert_eq!(f.niri().layout.focus().map(|m| m.id()), Some(id));
 }
 
+/// An empty spot of a workspace other than the active one, in the open overview.
+fn other_workspace_spot(
+    f: &mut Fixture,
+) -> (Point<f64, Logical>, crate::layout::workspace::WorkspaceId) {
+    let active = f.niri().layout.active_workspace().unwrap().id();
+    (0..1080 / 10)
+        .flat_map(|j| (0..1920 / 10).map(move |i| (f64::from(i * 10 + 5), f64::from(j * 10 + 5))))
+        .find_map(|(x, y)| {
+            let niri = f.niri();
+            let p = Point::from((x, y));
+            let ws = niri.workspace_under(false, p)?.1.id();
+            (ws != active && niri.contents_under(p).window.is_none()).then_some((p, ws))
+        })
+        .expect("another workspace shows in the overview")
+}
+
+#[test]
+fn owner_click_in_overview_on_workspace_switches() {
+    let (mut f, ..) = two_clients();
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+    let (spot, ws) = other_workspace_spot(&mut f);
+
+    physical_motion(&mut f, spot.x, spot.y);
+    physical_click(&mut f);
+    f.niri_complete_animations();
+    assert!(!f.niri().layout.is_overview_open());
+    assert_eq!(f.niri().layout.active_workspace().unwrap().id(), ws);
+}
+
 #[test]
 fn screen_click_in_overview_on_workspace_switches() {
     let (mut f, ..) = two_clients_with(handover_config());
@@ -3272,18 +3311,7 @@ fn screen_click_in_overview_on_workspace_switches() {
     f.niri_complete_animations();
     let output = active_output(&mut f);
     let record = look(&mut f, &output);
-
-    // An empty spot of another workspace.
-    let active = f.niri().layout.active_workspace().unwrap().id();
-    let (local, ws) = (0..1080 / 10)
-        .flat_map(|j| (0..1920 / 10).map(move |i| (f64::from(i * 10 + 5), f64::from(j * 10 + 5))))
-        .find_map(|(x, y)| {
-            let niri = f.niri();
-            let p = Point::from((x, y));
-            let ws = niri.workspace_under(false, p)?.1.id();
-            (ws != active && niri.contents_under(p).window.is_none()).then_some((p, ws))
-        })
-        .expect("another workspace shows in the overview");
+    let (local, ws) = other_workspace_spot(&mut f);
 
     assert_eq!(
         screen_click(&mut f, &record, local),
@@ -3581,4 +3609,130 @@ fn agent_serial_never_starts_seat_grabs() {
         .create_layer_popup(&bar, Some(serial));
     f.double_roundtrip(bar_client);
     assert_no_grab(&mut f, "layer popup grab");
+}
+
+#[test]
+fn screen_scroll_in_overview_caps_notches() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+    let output = active_output(&mut f);
+    let record = look(&mut f, &output);
+    let (x, y) = px(&record, Point::from((960., 540.)));
+
+    // Would be a trillion zoom steps; capped, it returns at once.
+    let started = Instant::now();
+    let scroll = AgentOp::Scroll {
+        x,
+        y,
+        dx: 0.,
+        dy: 1e12,
+    };
+    assert_eq!(screen_now(&mut f, None, scroll), Ok(ScreenHit::Overview));
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn screen_click_refuses_blocked_out_layer() {
+    let config = format!(
+        "layer-rule {{ match namespace=\"^bar$\"; block-out-from \"screen-capture\"; }}\n{HANDOVER_BINDS}"
+    );
+    let (mut f, .., output) = screen_setup_with(Config::parse_mem(&config).unwrap());
+    let (bar_client, bar) = map_bar(&mut f);
+    pointer_events(&mut f, bar_client, &bar);
+    let record = look(&mut f, &output);
+
+    assert_eq!(
+        screen_click(&mut f, &record, Point::from((960., 25.))),
+        Err(AgentError::BlockedOut)
+    );
+    assert_eq!(pointer_events(&mut f, bar_client, &bar), []);
+}
+
+/// The agent clicks the bar, and the bar opens a menu that grabs with that click.
+fn agent_layer_popup(f: &mut Fixture, output: &Output) -> (ClientId, XdgPopup) {
+    let (bar_client, bar) = map_bar(f);
+    pointer_events(f, bar_client, &bar);
+    let record = look(f, output);
+    screen_click(f, &record, Point::from((960., 25.))).unwrap();
+    let serial = press_serial(&pointer_events(f, bar_client, &bar));
+    let (_, popup) = f
+        .client(bar_client)
+        .state
+        .create_layer_popup(&bar, Some(serial));
+    f.double_roundtrip(bar_client);
+    assert!(f.niri().popup_grab.is_none());
+    assert!(!popup_done(f, bar_client, &popup));
+    (bar_client, popup)
+}
+
+#[test]
+fn agent_layer_popup_dismissed_on_owner_click() {
+    let (mut f, .., output) = screen_setup();
+    let (bar_client, popup) = agent_layer_popup(&mut f, &output);
+    physical_click(&mut f);
+    assert!(popup_done(&mut f, bar_client, &popup));
+}
+
+#[test]
+fn agent_layer_popup_dismissed_when_handover_ends() {
+    let (mut f, .., output) = screen_setup();
+    let (bar_client, popup) = agent_layer_popup(&mut f, &output);
+    physical_key(&mut f);
+    assert!(!f.niri().agent.handed_over);
+    assert!(popup_done(&mut f, bar_client, &popup));
+}
+
+#[test]
+fn agent_layer_popup_dismissed_when_idle() {
+    let (mut f, .., output) = screen_setup();
+    let (bar_client, popup) = agent_layer_popup(&mut f, &output);
+    f.niri()
+        .agent
+        .release_if_idle(Instant::now() + IDLE_RELEASE);
+    assert!(popup_done(&mut f, bar_client, &popup));
+}
+
+#[test]
+fn screen_click_focuses_window() {
+    let config = format!("{WARP_CONFIG}\n{HANDOVER_BINDS}");
+    let (mut f, .., output) = screen_setup_with(Config::parse_mem(&config).unwrap());
+    let location = pointer_location(&mut f);
+    let record = look(&mut f, &output);
+    let id = mapped_id(&mut f, "agent-b");
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+
+    screen_click(&mut f, &record, center(&record, id)).unwrap();
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("agent-b"));
+    let b = server_surface(&mut f, "agent-b");
+    assert_eq!(f.niri().keyboard_focus.surface(), Some(&b));
+    assert_eq!(pointer_location(&mut f), location);
+    assert!(!f.niri().agent.suppress_warp);
+}
+
+#[test]
+fn screen_click_focuses_on_demand_layer() {
+    let (mut f, .., output) = screen_setup();
+    map_bar_with(&mut f, Some(KeyboardInteractivity::OnDemand));
+    let location = pointer_location(&mut f);
+    let record = look(&mut f, &output);
+
+    screen_click(&mut f, &record, Point::from((960., 25.))).unwrap();
+    let layer = f
+        .niri()
+        .mapped_layer_surfaces
+        .keys()
+        .find(|l| l.namespace() == "bar")
+        .unwrap()
+        .clone();
+    assert_eq!(f.niri().layer_shell_on_demand_focus.as_ref(), Some(&layer));
+    assert_eq!(f.niri().keyboard_focus.surface(), Some(layer.wl_surface()));
+    assert_eq!(pointer_location(&mut f), location);
+
+    // Clicking a window afterwards takes the focus off the layer, as the owner's click does.
+    let id = mapped_id(&mut f, "agent-b");
+    screen_click(&mut f, &record, center(&record, id)).unwrap();
+    assert_eq!(f.niri().layer_shell_on_demand_focus, None);
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("agent-b"));
 }

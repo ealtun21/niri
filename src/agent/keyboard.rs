@@ -337,6 +337,7 @@ pub(super) fn start_idle_timer(niri: &mut Niri) {
                 || agent.sticky.is_some()
                 || agent.pointer_focus.is_some()
                 || !agent.popups.is_empty()
+                || !agent.layer_popups.is_empty()
                 || !agent.active_until.is_empty()
             {
                 TimeoutAction::ToDuration(IDLE_CHECK)

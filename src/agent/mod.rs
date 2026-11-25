@@ -104,6 +104,8 @@ pub struct AgentState {
     /// Popups that agent clicks opened, kept without a grab, topmost last; with whether their
     /// window's workspace was visible at the last check.
     popups: HashMap<MappedId, Vec<(PopupKind, bool)>>,
+    /// Popups of layer surfaces that agent clicks opened, kept without a grab, topmost last.
+    layer_popups: Vec<PopupKind>,
 }
 
 /// Pauses the agent (see `AgentState::pause`) and takes its cursor off the screen.
@@ -207,9 +209,11 @@ impl AgentState {
         self.paused = false;
     }
 
-    /// Takes the controls back from the agent; it stays unpaused.
+    /// Takes the controls back from the agent; it stays unpaused. Agents reach layer surfaces only
+    /// while handed over, so their menus close.
     pub fn end_handover(&mut self) {
         self.handed_over = false;
+        self.dismiss_layer_popups();
     }
 
     /// Takes the next serial and remembers it as an agent serial.
@@ -307,6 +311,7 @@ impl AgentState {
             popups.retain(|(popup, _)| popup.alive());
             !popups.is_empty()
         });
+        self.layer_popups.retain(PopupKind::alive);
     }
 
     /// The surface of the window's topmost agent popup.
@@ -318,13 +323,13 @@ impl AgentState {
 
     /// Sends `popup_done` to the window's agent popups, topmost first, and forgets them.
     pub fn dismiss_popups(&mut self, id: MappedId) {
-        for (popup, _) in self.popups.remove(&id).into_iter().flatten().rev() {
-            if let PopupKind::Xdg(popup) = popup {
-                if popup.alive() {
-                    popup.send_popup_done();
-                }
-            }
-        }
+        let popups = self.popups.remove(&id).into_iter().flatten();
+        send_popup_done(popups.map(|(popup, _)| popup));
+    }
+
+    /// Sends `popup_done` to the layer surfaces' agent popups, topmost first, and forgets them.
+    fn dismiss_layer_popups(&mut self) {
+        send_popup_done(std::mem::take(&mut self.layer_popups).into_iter());
     }
 
     /// Dismisses every agent popup.
@@ -333,6 +338,7 @@ impl AgentState {
         for id in ids {
             self.dismiss_popups(id);
         }
+        self.dismiss_layer_popups();
     }
 
     /// Whether agents may act on the window: as the owner set it by keybind, or else whether its
@@ -342,6 +348,17 @@ impl AgentState {
             .get(&mapped.id())
             .copied()
             .unwrap_or_else(|| has_agent_app_id(mapped))
+    }
+}
+
+/// Sends `popup_done` to the popups, given topmost last, topmost first.
+fn send_popup_done(popups: impl DoubleEndedIterator<Item = PopupKind>) {
+    for popup in popups.rev() {
+        if let PopupKind::Xdg(popup) = popup {
+            if popup.alive() {
+                popup.send_popup_done();
+            }
+        }
     }
 }
 
@@ -386,22 +403,23 @@ pub fn has_agent_app_id(mapped: &Mapped) -> bool {
     })
 }
 
-/// Keeps a popup that an agent click opened, without a grab, so the owner's focus stays put.
-/// Returns false if its root isn't a layout window.
-pub fn add_popup(niri: &mut Niri, root: &WlSurface, popup: PopupKind) -> bool {
-    let Some((mapped, _)) = niri.layout.find_window_and_output(root) else {
-        return false;
-    };
-    let id = mapped.id();
-    let visible = is_visible(&niri.layout, id);
-    niri.agent
-        .popups
-        .entry(id)
-        .or_default()
-        .push((popup, visible));
+/// Keeps a popup that an agent click opened, without a grab, so the owner's focus and pointer stay
+/// put.
+pub fn add_popup(niri: &mut Niri, root: &WlSurface, popup: PopupKind) {
+    if let Some((mapped, _)) = niri.layout.find_window_and_output(root) {
+        let id = mapped.id();
+        let visible = is_visible(&niri.layout, id);
+        niri.agent
+            .popups
+            .entry(id)
+            .or_default()
+            .push((popup, visible));
+    } else {
+        // A layer surface's, which is always on screen.
+        niri.agent.layer_popups.push(popup);
+    }
     // The idle timer may have stopped between the click and this grab request.
     keyboard::start_idle_timer(niri);
-    true
 }
 
 /// Whether the window's workspace is on screen, so the owner could see its popups.
@@ -416,6 +434,7 @@ fn is_visible(layout: &Layout<Mapped>, id: MappedId) -> bool {
 pub fn dismiss_visible_popups(niri: &mut Niri) {
     let layout = &niri.layout;
     let agent = &mut niri.agent;
+    agent.dismiss_layer_popups();
     let visible: Vec<MappedId> = agent
         .popups
         .keys()
