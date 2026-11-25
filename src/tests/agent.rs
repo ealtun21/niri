@@ -988,12 +988,17 @@ fn three_clients_with(config: Config) -> (Fixture, ClientId, WlSurface, ClientId
 }
 
 fn physical_key_event(f: &mut Fixture, state: KeyState) {
+    // KEY_A.
+    key_event(f, 38, state);
+}
+
+/// A key event (evdev code + 8) from the physical keyboard.
+fn key_event(f: &mut Fixture, code: u32, state: KeyState) {
     f.niri_state()
         .process_input_event(InputEvent::<TestInputBackend>::Keyboard {
             event: TestKeyboardKeyEvent {
                 time: InputTime::from_micros(0),
-                // KEY_A.
-                code: Keycode::new(38),
+                code: Keycode::new(code),
                 state,
                 count: 1,
             },
@@ -1460,15 +1465,7 @@ fn press_keys(f: &mut Fixture, keys: &[u32]) {
         (keys.iter().rev().copied().collect(), KeyState::Released),
     ] {
         for code in keys {
-            f.niri_state()
-                .process_input_event(InputEvent::<TestInputBackend>::Keyboard {
-                    event: TestKeyboardKeyEvent {
-                        time: InputTime::from_micros(0),
-                        code: Keycode::new(code),
-                        state,
-                        count: 1,
-                    },
-                });
+            key_event(f, code, state);
         }
     }
 }
@@ -1969,6 +1966,82 @@ fn release_handover_bind_turns_it_off_once() {
     owner_bind(&mut f, KEY_D);
     assert!(!f.niri().agent.handed_over);
     assert!(f.niri().suppressed_keys.is_empty());
+}
+
+#[test]
+fn release_handover_bind_interrupted_still_ends_it() {
+    let config = "binds { Mod+Alt+D { release { toggle-agent-handover; }; }; }";
+    let (mut f, _, _, agent, _) = two_clients_with(Config::parse_mem(config).unwrap());
+    f.niri().agent.hand_over();
+
+    // Super_L, Alt_L, D; an agent scroll cancels the pending release bind; then the releases.
+    for code in [133, 64, KEY_D] {
+        key_event(&mut f, code, KeyState::Pressed);
+    }
+    let pointer = f.client(agent).state.virtual_pointer();
+    pointer.axis(0, Axis::VerticalScroll, 10.);
+    pointer.frame();
+    f.roundtrip(agent);
+    for code in [KEY_D, 64, 133] {
+        key_event(&mut f, code, KeyState::Released);
+    }
+
+    assert!(!f.niri().agent.handed_over);
+    assert!(f.niri().suppressed_keys.is_empty());
+}
+
+#[test]
+fn egl_handover_bind_with_screenshot_ui_open_ends_it() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri_state().backend.headless().add_renderer().unwrap();
+    f.niri_state().do_action(
+        niri_config::Action::Screenshot(true, None),
+        false,
+        InputTime::from_micros(0),
+    );
+    assert!(f.niri().screenshot_ui.is_open());
+    f.niri().agent.hand_over();
+
+    owner_bind(&mut f, KEY_D);
+
+    assert!(!f.niri().agent.handed_over);
+}
+
+#[test]
+fn virtual_keys_keep_handover() {
+    let (mut f, _, _, agent, _) = two_clients_with(handover_config());
+    let keyboard = f.client(agent).state.virtual_keyboard();
+    f.roundtrip(agent);
+    f.niri().agent.hand_over();
+
+    // KEY_A, then Mod+Alt+D.
+    keyboard.key(0, 30, 1);
+    keyboard.key(0, 30, 0);
+    for key in [125, 56, 32] {
+        keyboard.key(0, key, 1);
+    }
+    for key in [32, 56, 125] {
+        keyboard.key(0, key, 0);
+    }
+    f.roundtrip(agent);
+
+    assert!(f.niri().agent.handed_over);
+}
+
+#[test]
+fn virtual_click_and_scroll_keep_handover() {
+    let (mut f, _, _, agent, _) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+
+    let pointer = f.client(agent).state.virtual_pointer();
+    pointer.button(0, 0x110, ButtonState::Pressed);
+    pointer.button(0, 0x110, ButtonState::Released);
+    pointer.frame();
+    pointer.axis(0, Axis::VerticalScroll, 10.);
+    pointer.frame();
+    f.roundtrip(agent);
+
+    assert!(f.niri().agent.handed_over);
 }
 
 #[test]

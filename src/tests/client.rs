@@ -2,6 +2,7 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Write as _;
+use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -11,6 +12,8 @@ use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
 use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_manager_v1::ExtSessionLockManagerV1;
+use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
+use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_v1::ExtSessionLockV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{self, ZwpKeyboardShortcutsInhibitorV1};
@@ -70,6 +73,8 @@ pub struct State {
     pub layer_shell: Option<ZwlrLayerShellV1>,
     pub virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
     pub virtual_pointer: Option<ZwlrVirtualPointerV1>,
+    pub virtual_keyboard_manager: Option<ZwpVirtualKeyboardManagerV1>,
+    pub virtual_keyboard: Option<ZwpVirtualKeyboardV1>,
     pub spbm: Option<WpSinglePixelBufferManagerV1>,
     pub viewporter: Option<WpViewporter>,
     pub ksim: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
@@ -313,6 +318,8 @@ impl Client {
             layer_shell: None,
             virtual_pointer_manager: None,
             virtual_pointer: None,
+            virtual_keyboard_manager: None,
+            virtual_keyboard: None,
             spbm: None,
             viewporter: None,
             ksim: None,
@@ -541,6 +548,22 @@ impl State {
         let pointer = manager.create_virtual_pointer(None, &self.qh, ());
         self.virtual_pointer = Some(pointer.clone());
         pointer
+    }
+
+    /// A virtual keyboard using the seat keymap (`no_keymap`).
+    pub fn virtual_keyboard(&mut self) -> ZwpVirtualKeyboardV1 {
+        if let Some(keyboard) = &self.virtual_keyboard {
+            return keyboard.clone();
+        }
+
+        let manager = self.virtual_keyboard_manager.as_ref().unwrap();
+        let seat = self.seats.keys().next().unwrap();
+        let keyboard = manager.create_virtual_keyboard(seat, &self.qh, ());
+        // The compositor ignores the fd of a `no_keymap` keymap.
+        let fd = std::fs::File::open("/dev/null").unwrap();
+        keyboard.keymap(0, fd.as_fd(), 0);
+        self.virtual_keyboard = Some(keyboard.clone());
+        keyboard
     }
 
     /// Requests an xdg-activation token, which is set once the compositor sends `done`.
@@ -785,6 +808,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == ZwlrVirtualPointerManagerV1::interface().name {
                     let version = min(version, ZwlrVirtualPointerManagerV1::interface().version);
                     state.virtual_pointer_manager = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ZwpVirtualKeyboardManagerV1::interface().name {
+                    let version = min(version, ZwpVirtualKeyboardManagerV1::interface().version);
+                    state.virtual_keyboard_manager = Some(registry.bind(name, version, qh, ()));
                 } else if interface == WpSinglePixelBufferManagerV1::interface().name {
                     let version = min(version, WpSinglePixelBufferManagerV1::interface().version);
                     state.spbm = Some(registry.bind(name, version, qh, ()));
@@ -1374,5 +1400,31 @@ impl Dispatch<ExtSessionLockV1, ()> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         // Locked and finished.
+    }
+}
+
+impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpVirtualKeyboardManagerV1,
+        _event: <ZwpVirtualKeyboardManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<ZwpVirtualKeyboardV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpVirtualKeyboardV1,
+        _event: <ZwpVirtualKeyboardV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
     }
 }

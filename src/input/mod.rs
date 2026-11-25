@@ -515,6 +515,22 @@ impl State {
 
         let is_inhibiting_shortcuts = self.is_inhibiting_shortcuts();
 
+        // The owner's key press ends the hand-over, also when a branch below swallows it (the
+        // accessibility modifier, the exit dialog). Modifiers alone don't, so that the owner can
+        // hold them for a bind.
+        let ends_handover = pressed && !is_virtual_keyboard && self.niri.agent.handed_over && {
+            let keyboard = self.niri.seat.get_keyboard().unwrap();
+            let keysym = keyboard.with_xkb_state(self, |context| {
+                let xkb = context.xkb().lock().unwrap();
+                // SAFETY: we're not changing the ref count.
+                unsafe { xkb.state() }.key_get_one_sym(event.key_code())
+            });
+            !keysym.is_modifier_key()
+        };
+        if ends_handover {
+            self.niri.agent.end_handover();
+        }
+
         // Accessibility modifier grabs should override XKB state changes (e.g. Caps Lock), so we
         // need to process them before keyboard.input() below.
         //
@@ -628,16 +644,6 @@ impl State {
                     (Some(a), None) => &[a][..],
                     (Some(a), Some(b)) => &[a, b][..],
                 };
-
-                // The owner's key press ends the hand-over, also when a branch below swallows it.
-                // Modifiers alone don't, so that the owner can hold them for a bind.
-                let ends_handover = pressed
-                    && !is_virtual_keyboard
-                    && this.niri.agent.handed_over
-                    && !modified.is_some_and(Keysym::is_modifier_key);
-                if ends_handover {
-                    this.niri.agent.end_handover();
-                }
 
                 // After updating XKB state from accessibility-grabbed keys, return right away and
                 // don't handle them.
@@ -763,8 +769,7 @@ impl State {
                 };
 
                 // The key that ended the hand-over reaches no client, but a bind it resolves to
-                // still runs. The hand-over toggle alone decides: put the hand-over back for it
-                // to end, or the toggle would turn it right back on.
+                // still runs, except the hand-over toggle, which would turn it right back on.
                 if ends_handover {
                     let bind = match &res {
                         ShouldInterceptResult::ForwardAndHandle(bind)
@@ -780,10 +785,12 @@ impl State {
                         })
                     };
                     // A release-only toggle is in the pending release binds.
-                    if toggles(bind) || toggles(this.niri.pending_release_binds.get(&key_code)) {
-                        this.niri.agent.handed_over = true;
+                    let toggle =
+                        toggles(bind) || toggles(this.niri.pending_release_binds.get(&key_code));
+                    if toggle {
+                        this.niri.pending_release_binds.remove(&key_code);
                     }
-                    if bind.is_none() {
+                    if toggle || bind.is_none() {
                         this.niri.suppressed_keys.insert(key_code);
                         return ShouldInterceptResult::InterceptOnly;
                     }
