@@ -147,6 +147,8 @@ pub struct Server {
     /// Output, image width and height and element list from the last screen `look`; dropped by
     /// any screen operation.
     screen_elements: Option<(String, u32, u32, Vec<elements::Element>)>,
+    /// Output of the last screen `look`: where screen operations go unless they name one.
+    screen_output: Option<String>,
     /// Reads a window's accessibility tree (replaced in tests).
     read_elements: fn(u32, &str, bool, &niri_ipc::WindowCapture) -> elements::Elements,
 }
@@ -176,6 +178,7 @@ impl Server {
             },
             elements: HashMap::new(),
             screen_elements: None,
+            screen_output: None,
             read_elements: elements::read_elements,
         }
     }

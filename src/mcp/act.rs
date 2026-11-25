@@ -221,6 +221,7 @@ fn look_screen(
     } else {
         read_screen_elements(s, &cap, &mut text, &mut list);
     }
+    s.screen_output = Some(cap.output.clone());
     s.screen_elements = Some((cap.output, cap.width, cap.height, list));
     Ok(ToolOutcome {
         content: vec![Content::Image(png), Content::Text(text)],
@@ -386,8 +387,7 @@ fn act(s: &mut Server, on: On, op: AgentOp) -> ToolOutcome {
         On::Window(id) => return send(s, id, op),
         On::Screen(output) => output,
     };
-    // Coordinates and element numbers are of the last look's output.
-    let looked = s.screen_elements.take().map(|(output, ..)| output);
+    s.screen_elements = None;
     // A screen op may change any window.
     s.elements.clear();
     let (verb, keys) = match op {
@@ -398,8 +398,9 @@ fn act(s: &mut Server, on: On, op: AgentOp) -> ToolOutcome {
         AgentOp::Key { .. } => ("pressed keys in", true),
         AgentOp::Type { .. } => ("typed into", true),
     };
+    // Coordinates are of the last look's output.
     let req = Request::AgentScreen {
-        output: output.or(looked),
+        output: output.or_else(|| s.screen_output.clone()),
         op,
     };
     match (s.ipc)(req) {
@@ -1210,6 +1211,19 @@ mod tests {
             &json!({"screen": true, "element": 1})
         )));
         assert_eq!(screen_ops(&log).len(), 1);
+        let _ = std::fs::remove_dir(&dir);
+    }
+    #[test]
+    fn screen_ops_default_to_the_looked_output() {
+        let (mut s, log, dir) = screen_server(
+            json!([screen_win(7, [0., 0., 200., 300.], json!([]))]),
+            false,
+        );
+        look_tool(&mut s, &json!({"screen": true, "output": "DP-1"}));
+        key_tool(&mut s, &json!({"screen": true, "chord": "a"}));
+        click_tool(&mut s, &json!({"screen": true, "x": 1, "y": 2}));
+        let outputs: Vec<_> = screen_ops(&log).into_iter().map(|(o, _)| o).collect();
+        assert_eq!(outputs, [Some("DP-1".to_owned()), Some("DP-1".to_owned())]);
         let _ = std::fs::remove_dir(&dir);
     }
 }
