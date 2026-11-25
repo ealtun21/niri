@@ -21,11 +21,14 @@ use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::protocol::wl_keyboard::WlKeyboard;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Resource as _};
-use smithay::utils::{IsAlive as _, Logical, Physical, Point, Serial, Size, SERIAL_COUNTER};
+use smithay::utils::{
+    IsAlive as _, Logical, Physical, Point, Rectangle, Serial, Size, SERIAL_COUNTER,
+};
 use smithay::wayland::virtual_keyboard::VirtualKeyboardDevice;
 use smithay::wayland::virtual_pointer::VirtualPointerDevice;
 use smithay::wayland::xdg_activation::XdgActivationTokenData;
 
+use self::capture::capture_precheck;
 use crate::layout::workspace::WorkspaceId;
 use crate::layout::{ActivateWindow, Layout};
 use crate::niri::{KeyboardFocus, Niri};
@@ -469,12 +472,14 @@ pub fn guard_new_window(
         })
         .and_then(|id| agent.last_target.get(&id).copied());
 
-    let activate =
-        if guarded || driven.is_some() || agent.agent_acted_last() || has_agent_app_id(mapped) {
-            ActivateWindow::No
-        } else {
-            activate
-        };
+    // While handed over, the agent acts like the owner's own clicks.
+    let acted = !agent.handed_over && agent.agent_acted_last();
+    let driven = driven.filter(|_| !agent.handed_over);
+    let activate = if guarded || driven.is_some() || acted || has_agent_app_id(mapped) {
+        ActivateWindow::No
+    } else {
+        activate
+    };
     let driven_workspace = driven.and_then(|id| {
         niri.layout
             .workspaces()
@@ -510,6 +515,25 @@ fn is_x11(niri: &Niri, mapped: &Mapped) -> bool {
     !comm.is_empty() && name.starts_with(comm)
 }
 
+/// Whether the owner can see the window: its tile intersects its output on a shown workspace.
+/// In an open overview every window of a shown workspace counts.
+pub fn is_on_screen(niri: &Niri, id: MappedId) -> bool {
+    let overview = niri.layout.is_overview_open();
+    niri.layout.monitors().any(|mon| {
+        let output = Rectangle::from_size(mon.view_size());
+        mon.workspaces_with_render_geo().any(|(ws, ws_geo)| {
+            ws.tiles_with_render_positions()
+                .filter(|(tile, ..)| tile.window().id() == id)
+                .any(|(tile, pos, _)| {
+                    overview
+                        || Rectangle::new(pos + ws_geo.loc, tile.tile_size())
+                            .intersection(output)
+                            .is_some()
+                })
+        })
+    })
+}
+
 /// Runs the checks every input op passes, in order; the first failure wins.
 pub fn check_target(niri: &Niri, id: MappedId, kind: OpKind) -> Result<Target, AgentError> {
     if niri.agent.paused {
@@ -518,11 +542,22 @@ pub fn check_target(niri: &Niri, id: MappedId, kind: OpKind) -> Result<Target, A
     let (mapped, output) = niri
         .find_mapped_output_by_id(id)
         .ok_or(AgentError::WindowGone)?;
+    let handed_over = niri.agent.handed_over;
     if !niri.agent.is_granted(mapped) {
-        return Err(AgentError::NotGranted);
+        // A hand-over drives what the owner can see; side by side keeps to grants.
+        if !handed_over {
+            return Err(AgentError::NotGranted);
+        }
+        if !is_on_screen(niri, id) {
+            return Err(AgentError::NotVisible);
+        }
     }
     if is_x11(niri, mapped) {
         return Err(AgentError::X11Unsupported);
+    }
+    if handed_over {
+        // The owner gave the controls away, so their focus and hover don't count.
+        capture_precheck(niri, id)?;
     }
 
     let focused = match &niri.keyboard_focus {
@@ -543,7 +578,7 @@ pub fn check_target(niri: &Niri, id: MappedId, kind: OpKind) -> Result<Target, A
             .window
             .as_ref()
             .is_some_and(|(window, _)| *window == mapped.window);
-    if focused || hovered {
+    if !handed_over && (focused || hovered) {
         return Err(AgentError::HumanFocused);
     }
 
@@ -556,10 +591,11 @@ pub fn check_target(niri: &Niri, id: MappedId, kind: OpKind) -> Result<Target, A
             .filter(|_| !overview)
             .and_then(|p| p.current_focus()),
     ];
-    if human_clients
-        .iter()
-        .flatten()
-        .any(|s| s.client().is_some_and(|c| c.id() == client.id()))
+    if !handed_over
+        && human_clients
+            .iter()
+            .flatten()
+            .any(|s| s.client().is_some_and(|c| c.id() == client.id()))
     {
         return Err(AgentError::SameClient);
     }

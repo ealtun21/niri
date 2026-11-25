@@ -52,6 +52,7 @@ Errors start with a code:
 - stale_capture, no_capture, stale_elements: look again, recompute coordinates, retry.
 - window_gone: the window closed. Call `windows` again; do not click blind.
 - not_granted: not an agent-* window. Launch one, or ask the owner to grant it.
+- not_visible: during a hand-over the window is off screen. Ask the owner to bring it into view.
 - not_launched_here: `close` only closes windows you launched.
 - launch_timeout: no new window appeared in time. Check `windows`, then retry once or report.
 - bad_args, bad_window, bad_app: a wrong argument, the message says which. Fix the call; do not retry it unchanged.

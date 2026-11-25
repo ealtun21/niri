@@ -401,6 +401,8 @@ pub enum AgentError {
     WindowGone,
     /// The window is not granted to agents.
     NotGranted,
+    /// The window is not granted and is not on screen, so a hand-over can't drive it.
+    NotVisible,
     /// Agent input is paused.
     Paused,
     /// The owner focused the window.
@@ -436,6 +438,7 @@ impl std::fmt::Display for AgentError {
         match self {
             Self::WindowGone => f.write_str("window_gone"),
             Self::NotGranted => f.write_str("not_granted"),
+            Self::NotVisible => f.write_str("not_visible"),
             Self::Paused => f.write_str("paused"),
             Self::HumanFocused => f.write_str("human_focused"),
             Self::SameClient => f.write_str("same_client"),

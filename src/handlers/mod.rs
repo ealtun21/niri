@@ -771,13 +771,14 @@ impl XdgActivationHandler for State {
     fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
         // Agent guards, before the debug flag below, which would accept any serial. Clients such
         // as Chromium ask for several tokens per click; each of them lands here.
+        // A hand-over acts like the owner's own clicks, so none of them apply.
         let agent = &self.niri.agent;
         if let Some((serial, _)) = &data.serial {
-            if agent.is_agent_serial(*serial) {
+            if !agent.handed_over && agent.is_agent_serial(*serial) {
                 return false;
             }
         }
-        if agent.agent_acted_last() {
+        if !agent.handed_over && agent.agent_acted_last() {
             data.user_data.insert_if_missing(|| AgentGuardMarker);
             data.user_data.insert_if_missing(|| UrgentOnlyMarker);
             return true;
@@ -836,7 +837,7 @@ impl XdgActivationHandler for State {
                 // (spawn), which never pass token_created(). Agent windows never take focus by
                 // themselves; the owner focuses them by click or keybind.
                 let guarded = token_data.user_data.get::<AgentGuardMarker>().is_some()
-                    || self.niri.agent.agent_acted_last()
+                    || (!self.niri.agent.handed_over && self.niri.agent.agent_acted_last())
                     || crate::agent::has_agent_app_id(mapped);
                 let on_xdg_activate = if guarded {
                     Some(niri_config::OnXdgActivate::SetUrgent)

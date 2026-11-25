@@ -2093,3 +2093,118 @@ fn ffm_suspended_while_handed_over() {
     physical_motion(&mut f, over_c.0, over_c.1);
     assert_eq!(focused_app_id(&mut f).as_deref(), Some("c"));
 }
+
+/// Maps plain window "b" from the agent's client on the owner's workspace; "a" keeps focus.
+fn plain_b(f: &mut Fixture, human: ClientId, agent: ClientId) -> (WlSurface, MappedId) {
+    let b = map_window(f, agent, "b");
+    focus_for_owner(f, "a");
+    f.double_roundtrip(human);
+    f.double_roundtrip(agent);
+    let id = mapped_id(f, "b");
+    (b, id)
+}
+
+#[test]
+fn handover_drives_ungranted_visible_window() {
+    let (mut f, human, _, agent, _) = two_clients_with(handover_config());
+    let (_, id) = plain_b(&mut f, human, agent);
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::NotGranted)
+    );
+    f.niri().agent.hand_over();
+    assert!(check_target(f.niri(), id, OpKind::Keyboard).is_ok());
+}
+
+#[test]
+fn handover_refuses_offscreen_ungranted_window() {
+    let (mut f, human, _, agent, _) = two_clients_with(handover_config());
+    let (_, id) = plain_b(&mut f, human, agent);
+    let w = window_of(&mut f, "b");
+    f.niri()
+        .layout
+        .move_to_workspace(Some(&w), 1, ActivateWindow::No);
+    focus_for_owner(&mut f, "a");
+    f.niri().agent.hand_over();
+    let err = check_target(f.niri(), id, OpKind::Keyboard).err().unwrap();
+    assert_eq!(err, AgentError::NotVisible);
+    assert_eq!(err.to_string(), "not_visible");
+}
+
+#[test]
+fn handover_drives_focused_window() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    let id = mapped_id(&mut f, "a");
+    f.niri().agent.hand_over();
+    assert!(check_target(f.niri(), id, OpKind::Keyboard).is_ok());
+}
+
+#[test]
+fn handover_refuses_blocked_out_input() {
+    let (mut f, id) = set_up_blocked_out("screen-capture");
+    f.niri().agent.hand_over();
+    assert_eq!(
+        type_now(&mut f, id, "x").unwrap_err(),
+        AgentError::BlockedOut
+    );
+}
+
+#[test]
+fn handover_allows_paste_chord() {
+    let (mut f, _, _, agent, b) = two_clients_with(handover_config());
+    let id = agent_target(&mut f, agent, &b);
+    f.niri().agent.hand_over();
+    key_now(&mut f, id, "ctrl+v", 1).unwrap();
+    assert!(events(&mut f, agent, &b).contains("key pressed"));
+}
+
+#[test]
+fn handover_allows_middle_click() {
+    let (mut f, _, _, agent, b) = two_clients_with(handover_config());
+    let id = captured_target(&mut f, agent, &b);
+    f.niri().agent.hand_over();
+    let op = AgentOp::Click {
+        x: 10.,
+        y: 10.,
+        button: AgentButton::Middle,
+        count: 1,
+        mods: Vec::new(),
+    };
+    pointer_now(&mut f, id, op).unwrap();
+    assert!(!pointer_events(&mut f, agent, &b).is_empty());
+}
+
+#[test]
+fn handover_new_window_from_agent_click_focuses() {
+    let (mut f, agent, b, other, _) = three_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "x").unwrap();
+
+    map_window(&mut f, other, "c2");
+
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("c2"));
+}
+
+#[test]
+fn handover_agent_serial_token_activates() {
+    let (mut f, human, _, agent, _) = two_clients_with(honor_invalid_serial());
+    let (b, id) = plain_b(&mut f, human, agent);
+    f.niri().agent.granted.insert(id, true);
+    f.niri().agent.hand_over();
+    let record = record_for(&mut f, id);
+    f.niri().agent.captures.insert(id, record);
+    pointer_events(&mut f, agent, &b);
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    let serial = pointer_events(&mut f, agent, &b)
+        .into_iter()
+        .find_map(|e| match e {
+            PointerEvent::Button { serial, .. } => Some(serial),
+            _ => None,
+        })
+        .unwrap();
+
+    self_activate(&mut f, agent, Some(serial), &b);
+
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("b"));
+}

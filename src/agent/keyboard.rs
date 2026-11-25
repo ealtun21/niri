@@ -81,8 +81,12 @@ fn lookup_keysym(keymap: &Keymap, sym: Keysym) -> Option<KeyStroke> {
 }
 
 /// Parses a chord such as `ctrl+shift+Return`: `ctrl`, `shift`, `alt` and `super` modifiers,
-/// then a keysym name.
-pub fn parse_chord(keymap: &Keymap, chord: &str) -> Result<KeyStroke, AgentError> {
+/// then a keysym name. Paste chords are refused unless `allow_paste`.
+pub fn parse_chord(
+    keymap: &Keymap,
+    chord: &str,
+    allow_paste: bool,
+) -> Result<KeyStroke, AgentError> {
     let bad = || AgentError::BadChord(chord.to_owned());
     let mask = |name: &str| 1u32.checked_shl(keymap.mod_get_index(name)).ok_or_else(bad);
 
@@ -115,8 +119,9 @@ pub fn parse_chord(keymap: &Keymap, chord: &str) -> Result<KeyStroke, AgentError
     let shift = mask(xkb::MOD_NAME_SHIFT)?;
     let held = stroke.mods & (ctrl | shift | mask(xkb::MOD_NAME_ALT)? | mask(xkb::MOD_NAME_LOGO)?);
     let is_v = sym == Keysym::v || sym == Keysym::V;
-    if (is_v && (held == ctrl || held == ctrl | shift)) || (sym == Keysym::Insert && held == shift)
-    {
+    let is_paste = (is_v && (held == ctrl || held == ctrl | shift))
+        || (sym == Keysym::Insert && held == shift);
+    if is_paste && !allow_paste {
         return Err(AgentError::PasteUnsupported);
     }
 
@@ -134,7 +139,8 @@ pub fn with_keymap<T>(state: &mut State, mut f: impl FnMut(&Keymap) -> T) -> T {
 
 /// Handles the `key` op: presses the chord `repeat` times.
 pub fn key(state: &mut State, id: MappedId, chord: &str, repeat: u16, reply: Reply) {
-    match with_keymap(state, |keymap| parse_chord(keymap, chord)) {
+    let allow_paste = state.niri.agent.handed_over;
+    match with_keymap(state, |keymap| parse_chord(keymap, chord, allow_paste)) {
         Ok(stroke) => {
             let strokes = vec![stroke; usize::from(repeat.max(1))];
             deliver_chunked(state, id, strokes, 0, reply);
