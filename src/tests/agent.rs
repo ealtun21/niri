@@ -20,6 +20,7 @@ use crate::agent::{
     MAX_DRAG_STEPS, MAX_SETTLE, TYPE_CHUNK_CHARS, TYPE_CHUNK_INTERVAL,
 };
 use crate::layout::{ActivateWindow, LayoutElement as _};
+use crate::niri::LockState;
 use crate::tests::test_input_backend::{
     TestInputBackend, TestKeyboardKeyEvent, TestPointerAxisEvent, TestPointerButtonEvent,
     TestPointerMotionAbsoluteEvent,
@@ -1273,7 +1274,6 @@ fn physical_motion(f: &mut Fixture, x: f64, y: f64) {
         .process_input_event(InputEvent::<TestInputBackend>::PointerMotionAbsolute { event });
 }
 
-#[allow(dead_code)] // Used by the hand-over tests.
 fn physical_scroll(f: &mut Fixture, dy: f64) {
     let event = TestPointerAxisEvent { dy };
     f.niri_state()
@@ -1449,10 +1449,15 @@ binds {
 /// Presses and releases Mod+Alt+`key` (evdev code + 8) on the physical keyboard.
 fn owner_bind(f: &mut Fixture, key: u32) {
     // Super_L and Alt_L.
-    let keys = [133, 64, key];
+    press_keys(f, &[133, 64, key]);
+}
+
+/// Presses the keys (evdev code + 8) in order on the physical keyboard, then releases them in
+/// reverse.
+fn press_keys(f: &mut Fixture, keys: &[u32]) {
     for (keys, state) in [
         (keys.to_vec(), KeyState::Pressed),
-        (keys.into_iter().rev().collect(), KeyState::Released),
+        (keys.iter().rev().copied().collect(), KeyState::Released),
     ] {
         for code in keys {
             f.niri_state()
@@ -1490,6 +1495,8 @@ fn agent_bind_allowed_rejects_virtual() {
     use crate::input::agent_bind_allowed;
     assert!(!agent_bind_allowed(&Action::ToggleAgentInput, true));
     assert!(!agent_bind_allowed(&Action::ToggleWindowAgentInput, true));
+    assert!(!agent_bind_allowed(&Action::ToggleAgentHandover, true));
+    assert!(agent_bind_allowed(&Action::ToggleAgentHandover, false));
     assert!(agent_bind_allowed(&Action::ToggleAgentInput, false));
     assert!(agent_bind_allowed(&Action::Spawn(vec![]), true));
 }
@@ -1680,6 +1687,19 @@ fn capture_popups_reports_popup_offset() {
 }
 
 /// Opens the overview and moves the owner's pointer over `id`'s tile, found by scanning the output.
+/// A point of the 1920 × 1080 output where the window is under the pointer.
+fn point_over(f: &mut Fixture, window: &Window) -> (f64, f64) {
+    (0..1080 / 10)
+        .flat_map(|j| (0..1920 / 10).map(move |i| (f64::from(i * 10 + 5), f64::from(j * 10 + 5))))
+        .find(|&(x, y)| {
+            f.niri()
+                .contents_under((x, y).into())
+                .window
+                .is_some_and(|(w, _)| w == *window)
+        })
+        .expect("window is drawn")
+}
+
 fn hover_overview_tile(f: &mut Fixture, id: MappedId) {
     f.niri().layout.toggle_overview();
     f.niri_complete_animations();
@@ -1690,15 +1710,7 @@ fn hover_overview_tile(f: &mut Fixture, id: MappedId) {
         .0
         .window
         .clone();
-    let (x, y) = (0..1080 / 10)
-        .flat_map(|j| (0..1920 / 10).map(move |i| (f64::from(i * 10 + 5), f64::from(j * 10 + 5))))
-        .find(|&(x, y)| {
-            f.niri()
-                .contents_under((x, y).into())
-                .window
-                .is_some_and(|(w, _)| w == window)
-        })
-        .expect("tile is drawn in the overview");
+    let (x, y) = point_over(f, &window);
     physical_motion(f, x, y);
     assert!(f
         .niri()
@@ -1794,4 +1806,217 @@ fn agent_stream_sends_initial_then_changes() {
 
     f.niri_state().ipc_refresh_agent();
     assert!(rx.try_recv().is_err());
+}
+
+const HANDOVER_BINDS: &str = r#"
+binds {
+    Mod+Alt+D { toggle-agent-handover; }
+    Mod+1 { focus-workspace 1; }
+}
+"#;
+
+fn handover_config() -> Config {
+    Config::parse_mem(HANDOVER_BINDS).unwrap()
+}
+
+const KEY_D: u32 = 40;
+
+/// Asks to lock the session from a new client; the lock then waits for lock surfaces.
+fn start_lock(f: &mut Fixture) {
+    let id = f.add_client();
+    f.client(id).lock_session();
+    f.roundtrip(id);
+    assert!(matches!(
+        f.niri().lock_state,
+        LockState::WaitingForSurfaces { .. }
+    ));
+}
+
+/// Removes the only output, which lets a waiting lock go through.
+fn finish_lock(f: &mut Fixture) {
+    let output = f.niri_output(1);
+    f.niri().remove_output(&output);
+    assert!(f.niri().is_locked());
+}
+
+#[test]
+fn handover_bind_toggles() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    owner_bind(&mut f, KEY_D);
+    assert!(f.niri().agent.handed_over);
+    owner_bind(&mut f, KEY_D);
+    assert!(!f.niri().agent.handed_over);
+}
+
+#[test]
+fn handover_unpauses() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.pause();
+    owner_bind(&mut f, KEY_D);
+    assert!(f.niri().agent.handed_over);
+    assert!(!f.niri().agent.paused);
+}
+
+#[test]
+fn handover_refused_while_locked() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    start_lock(&mut f);
+    finish_lock(&mut f);
+
+    owner_bind(&mut f, KEY_D);
+    assert!(!f.niri().agent.handed_over);
+    // Even when the action is let through the lock.
+    f.niri_state().do_action(
+        niri_config::Action::ToggleAgentHandover,
+        true,
+        InputTime::from_micros(0),
+    );
+    assert!(!f.niri().agent.handed_over);
+}
+
+#[test]
+fn lock_ends_handover() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    owner_bind(&mut f, KEY_D);
+    start_lock(&mut f);
+    assert!(!f.niri().agent.handed_over);
+
+    // Handed over again while the lock waits for its surfaces: going through ends it.
+    owner_bind(&mut f, KEY_D);
+    assert!(f.niri().agent.handed_over);
+    finish_lock(&mut f);
+    assert!(!f.niri().agent.handed_over);
+}
+
+#[test]
+fn pause_ends_handover() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    // The kill switch.
+    f.niri().agent.hand_over();
+    f.niri_state().do_action(
+        niri_config::Action::ToggleAgentInput,
+        false,
+        InputTime::from_micros(0),
+    );
+    assert!(f.niri().agent.paused);
+    assert!(!f.niri().agent.handed_over);
+
+    // The IPC pause.
+    f.niri().agent.hand_over();
+    f.niri().agent.pause();
+    assert!(!f.niri().agent.handed_over);
+}
+
+#[test]
+fn owner_key_ends_handover_and_is_swallowed() {
+    let (mut f, human, a, ..) = two_clients_with(handover_config());
+    owner_bind(&mut f, KEY_D);
+    events(&mut f, human, &a);
+
+    physical_key(&mut f);
+
+    assert!(!f.niri().agent.handed_over);
+    let events = events(&mut f, human, &a);
+    assert!(!events.contains("key"), "{events}");
+    assert!(f.niri().suppressed_keys.is_empty());
+}
+
+#[test]
+fn owner_key_into_exit_dialog_ends_handover() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    assert!(f.niri().exit_confirm_dialog.show());
+    physical_key(&mut f);
+    assert!(!f.niri().agent.handed_over);
+}
+
+#[test]
+fn modifier_alone_keeps_handover() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    owner_bind(&mut f, KEY_D);
+    // Shift_L.
+    press_keys(&mut f, &[50]);
+    assert!(f.niri().agent.handed_over);
+}
+
+#[test]
+fn owner_bind_ends_handover_and_runs() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    focus_for_owner(&mut f, "agent-b");
+    owner_bind(&mut f, KEY_D);
+
+    // Mod+1.
+    press_keys(&mut f, &[133, 10]);
+
+    assert!(!f.niri().agent.handed_over);
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+}
+
+#[test]
+fn handover_bind_turns_it_off_once() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    owner_bind(&mut f, KEY_D);
+    assert!(!f.niri().agent.handed_over);
+    assert!(f.niri().suppressed_keys.is_empty());
+}
+
+#[test]
+fn release_handover_bind_turns_it_off_once() {
+    let config = "binds { Mod+Alt+D { release { toggle-agent-handover; }; }; }";
+    let (mut f, ..) = two_clients_with(Config::parse_mem(config).unwrap());
+    f.niri().agent.hand_over();
+    owner_bind(&mut f, KEY_D);
+    assert!(!f.niri().agent.handed_over);
+    assert!(f.niri().suppressed_keys.is_empty());
+}
+
+#[test]
+fn owner_click_ends_handover() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    physical_click(&mut f);
+    assert!(!f.niri().agent.handed_over);
+}
+
+#[test]
+fn owner_scroll_ends_handover() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    physical_scroll(&mut f, 10.);
+    assert!(!f.niri().agent.handed_over);
+}
+
+#[test]
+fn owner_motion_keeps_handover() {
+    let (mut f, ..) = two_clients_with(handover_config());
+    f.niri().agent.hand_over();
+    physical_motion(&mut f, 500., 500.);
+    physical_motion(&mut f, 600., 400.);
+    assert!(f.niri().agent.handed_over);
+}
+
+#[test]
+fn ffm_suspended_while_handed_over() {
+    let config = format!("input {{ focus-follows-mouse; }}\n{HANDOVER_BINDS}");
+    let mut f = Fixture::with_config(Config::parse_mem(&config).unwrap());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    map_window(&mut f, id, "a");
+    map_window(&mut f, id, "c");
+    focus_for_owner(&mut f, "a");
+    f.niri_complete_animations();
+    let (a, c) = (window_of(&mut f, "a"), window_of(&mut f, "c"));
+    let over_a = point_over(&mut f, &a);
+    let over_c = point_over(&mut f, &c);
+    physical_motion(&mut f, over_a.0, over_a.1);
+
+    f.niri().agent.hand_over();
+    physical_motion(&mut f, over_c.0, over_c.1);
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
+
+    f.niri().agent.end_handover();
+    physical_motion(&mut f, over_a.0, over_a.1);
+    physical_motion(&mut f, over_c.0, over_c.1);
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("c"));
 }

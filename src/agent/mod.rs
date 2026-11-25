@@ -13,7 +13,7 @@ use calloop::timer::{TimeoutAction, Timer};
 use niri_ipc::{AgentDone, AgentError, AgentStatus, AgentWindow};
 use smithay::backend::input::{
     ButtonState, Event as _, InputBackend, InputEvent, KeyState, KeyboardKeyEvent as _,
-    PointerButtonEvent as _,
+    PointerButtonEvent as _, TabletToolTipEvent as _, TabletToolTipState,
 };
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::output::Output;
@@ -150,6 +150,17 @@ impl AgentState {
         self.handed_over = false;
         self.release_sticky();
         self.dismiss_all();
+    }
+
+    /// Hands the controls over to the agent, unpausing it.
+    pub fn hand_over(&mut self) {
+        self.handed_over = true;
+        self.paused = false;
+    }
+
+    /// Takes the controls back from the agent; it stays unpaused.
+    pub fn end_handover(&mut self) {
+        self.handed_over = false;
     }
 
     /// Takes the next serial and remembers it as an agent serial.
@@ -393,6 +404,26 @@ where
         }
         InputEvent::PointerAxis { event } => event.device(),
         InputEvent::TouchDown { event } => event.device(),
+        _ => return false,
+    };
+    !is_virtual_device(&device)
+}
+
+/// Whether the event ends a hand-over: a button press, scroll, touch-down or tablet tip-down from a
+/// physical device. Keys are decided in `on_keyboard`, which knows the modifiers and binds.
+pub fn ends_handover<I: InputBackend>(event: &InputEvent<I>) -> bool
+where
+    I::Device: 'static,
+{
+    let device = match event {
+        InputEvent::PointerButton { event } if event.state() == ButtonState::Pressed => {
+            event.device()
+        }
+        InputEvent::PointerAxis { event } => event.device(),
+        InputEvent::TouchDown { event } => event.device(),
+        InputEvent::TabletToolTip { event } if event.tip_state() == TabletToolTipState::Down => {
+            event.device()
+        }
         _ => return false,
     };
     !is_virtual_device(&device)

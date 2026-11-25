@@ -10,6 +10,8 @@ use std::time::Duration;
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1;
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_manager_v1::ExtSessionLockManagerV1;
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::client::ext_session_lock_v1::ExtSessionLockV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
 use smithay::reexports::wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::{self, ZwpKeyboardShortcutsInhibitorV1};
 use smithay::reexports::wayland_protocols::wp::single_pixel_buffer;
@@ -72,6 +74,7 @@ pub struct State {
     pub viewporter: Option<WpViewporter>,
     pub ksim: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     pub activation: Option<XdgActivationV1>,
+    pub session_lock_manager: Option<ExtSessionLockManagerV1>,
 
     pub windows: Vec<Window>,
     pub layers: Vec<LayerSurface>,
@@ -314,6 +317,7 @@ impl Client {
             viewporter: None,
             ksim: None,
             activation: None,
+            session_lock_manager: None,
             windows: Vec::new(),
             layers: Vec::new(),
             popups_done: Vec::new(),
@@ -366,6 +370,12 @@ impl Client {
 
     pub fn layer(&mut self, surface: &WlSurface) -> &mut LayerSurface {
         self.state.layer(surface)
+    }
+
+    /// Asks to lock the session, without making lock surfaces.
+    pub fn lock_session(&mut self) {
+        let manager = self.state.session_lock_manager.as_ref().unwrap();
+        manager.lock(&self.qh, ());
     }
 
     pub fn output(&mut self, name: &str) -> WlOutput {
@@ -799,6 +809,9 @@ impl Dispatch<WlRegistry, ()> for State {
                 } else if interface == XdgActivationV1::interface().name {
                     let version = min(version, XdgActivationV1::interface().version);
                     state.activation = Some(registry.bind(name, version, qh, ()));
+                } else if interface == ExtSessionLockManagerV1::interface().name {
+                    let version = min(version, ExtSessionLockManagerV1::interface().version);
+                    state.session_lock_manager = Some(registry.bind(name, version, qh, ()));
                 }
 
                 let global = Global {
@@ -1335,5 +1348,31 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for State {
             zwp_keyboard_shortcuts_inhibitor_v1::Event::Inactive => (),
             _ => unreachable!(),
         }
+    }
+}
+
+impl Dispatch<ExtSessionLockManagerV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtSessionLockManagerV1,
+        _event: <ExtSessionLockManagerV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        unreachable!()
+    }
+}
+
+impl Dispatch<ExtSessionLockV1, ()> for State {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtSessionLockV1,
+        _event: <ExtSessionLockV1 as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        // Locked and finished.
     }
 }

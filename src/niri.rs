@@ -6962,6 +6962,8 @@ impl Niri {
     }
 
     pub fn lock(&mut self, confirmation: SessionLocker) {
+        self.agent.end_handover();
+
         // Check if another client is in the process of locking.
         if matches!(
             self.lock_state,
@@ -7051,6 +7053,8 @@ impl Niri {
             } => {
                 self.event_loop.remove(deadline_token);
 
+                // The owner could hand over while the lock waited for its surfaces.
+                self.agent.end_handover();
                 self.screenshot_ui.close();
                 self.cursor_manager
                     .set_cursor_image(CursorImageStatus::default_named());
@@ -7342,6 +7346,11 @@ impl Niri {
         let Some(ffm) = self.config.borrow().input.focus_follows_mouse else {
             return;
         };
+
+        // While handed over, the agent drives; the owner's resting pointer must not move focus.
+        if self.agent.handed_over {
+            return;
+        }
 
         let pointer = &self.seat.get_pointer().unwrap();
         if pointer.is_grabbed() {

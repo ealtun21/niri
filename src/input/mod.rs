@@ -205,6 +205,9 @@ impl State {
                 crate::agent::dismiss_visible_popups(&mut self.niri);
             }
         }
+        if crate::agent::ends_handover(&event) {
+            self.niri.agent.end_handover();
+        }
 
         if should_reset_pointer_inactivity_timer(&event) {
             self.niri.reset_pointer_inactivity_timer();
@@ -626,6 +629,16 @@ impl State {
                     (Some(a), Some(b)) => &[a, b][..],
                 };
 
+                // The owner's key press ends the hand-over, also when a branch below swallows it.
+                // Modifiers alone don't, so that the owner can hold them for a bind.
+                let ends_handover = pressed
+                    && !is_virtual_keyboard
+                    && this.niri.agent.handed_over
+                    && !modified.is_some_and(Keysym::is_modifier_key);
+                if ends_handover {
+                    this.niri.agent.end_handover();
+                }
+
                 // After updating XKB state from accessibility-grabbed keys, return right away and
                 // don't handle them.
                 #[cfg(feature = "dbus")]
@@ -748,6 +761,33 @@ impl State {
                         is_in_screenshot,
                     )
                 };
+
+                // The key that ended the hand-over reaches no client, but a bind it resolves to
+                // still runs. The hand-over toggle alone decides: put the hand-over back for it
+                // to end, or the toggle would turn it right back on.
+                if ends_handover {
+                    let bind = match &res {
+                        ShouldInterceptResult::ForwardAndHandle(bind)
+                        | ShouldInterceptResult::InterceptAndHandle(bind) => Some(bind),
+                        ShouldInterceptResult::Forward | ShouldInterceptResult::InterceptOnly => {
+                            None
+                        }
+                    };
+                    let toggles = |bind: Option<&Bind>| {
+                        bind.is_some_and(|bind| {
+                            [bind.press_action(), bind.release_action()]
+                                .contains(&Some(&Action::ToggleAgentHandover))
+                        })
+                    };
+                    // A release-only toggle is in the pending release binds.
+                    if toggles(bind) || toggles(this.niri.pending_release_binds.get(&key_code)) {
+                        this.niri.agent.handed_over = true;
+                    }
+                    if bind.is_none() {
+                        this.niri.suppressed_keys.insert(key_code);
+                        return ShouldInterceptResult::InterceptOnly;
+                    }
+                }
 
                 if res.should_forward() {
                     if pressed && this.handle_focus_on_type_in_overview(modified) {
@@ -1086,6 +1126,13 @@ impl State {
                     agent.paused = false;
                 } else {
                     agent.pause();
+                }
+            }
+            Action::ToggleAgentHandover => {
+                if self.niri.agent.handed_over {
+                    self.niri.agent.end_handover();
+                } else if !self.niri.is_locked() {
+                    self.niri.agent.hand_over();
                 }
             }
             Action::ToggleWindowAgentInput => {
@@ -6028,7 +6075,7 @@ pub fn agent_bind_allowed(action: &Action, from_virtual_device: bool) -> bool {
     !(from_virtual_device
         && matches!(
             action,
-            Action::ToggleAgentInput | Action::ToggleWindowAgentInput
+            Action::ToggleAgentInput | Action::ToggleWindowAgentInput | Action::ToggleAgentHandover
         ))
 }
 

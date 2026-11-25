@@ -236,9 +236,10 @@ pub struct SwitchAction {
 
 // Remember to add new actions to the CLI enum too.
 //
-// Except `ToggleAgentInput` and `ToggleWindowAgentInput`: they are deliberately omitted from
-// `niri_ipc::Action` and the CLI, so that agents can't call them. `From<niri_ipc::Action>` is the
-// only conversion and no test enforces parity, so config-only variants need nothing else.
+// Except `ToggleAgentInput`, `ToggleWindowAgentInput` and `ToggleAgentHandover`: they are
+// deliberately omitted from `niri_ipc::Action` and the CLI, so that agents can't call them.
+// `From<niri_ipc::Action>` is the only conversion and no test enforces parity, so config-only
+// variants need nothing else.
 #[derive(knuffel::Decode, Debug, Clone, PartialEq)]
 pub enum Action {
     Quit(#[knuffel(property(name = "skip-confirmation"), default)] bool),
@@ -513,6 +514,7 @@ pub enum Action {
     ToggleWindowRuleOpacityById(u64),
     ToggleAgentInput,
     ToggleWindowAgentInput,
+    ToggleAgentHandover,
     SetDynamicCastWindow,
     #[knuffel(skip)]
     SetDynamicCastWindowById(u64),
@@ -1257,7 +1259,11 @@ where
         // A held agent toggle would flip at key-repeat rate.
         let is_agent_toggle = matches!(
             press_action,
-            Some(Action::ToggleAgentInput | Action::ToggleWindowAgentInput)
+            Some(
+                Action::ToggleAgentInput
+                    | Action::ToggleWindowAgentInput
+                    | Action::ToggleAgentHandover
+            )
         );
         let repeat = match repeat {
             Some(value) => value,
@@ -1710,15 +1716,16 @@ mod tests {
                 Mod+Alt+A { toggle-agent-input; }
                 Mod+Alt+G { toggle-window-agent-input; }
                 Mod+Alt+H repeat=true allow-inhibiting=true { toggle-agent-input; }
+                Mod+Alt+D { toggle-agent-handover; }
             }
             "#,
         )
         .unwrap();
-        let [a, g, h] = &config.binds.0[..] else {
-            panic!("expected three binds");
+        let [a, g, h, d] = &config.binds.0[..] else {
+            panic!("expected four binds");
         };
         // A held key doesn't flip the toggles at key-repeat rate.
-        assert!(!a.repeat && !g.repeat);
+        assert!(!a.repeat && !g.repeat && !d.repeat);
         // An explicit repeat still applies.
         assert!(h.repeat);
         // The kill switch works under a shortcut-inhibiting app, whatever the config says.
