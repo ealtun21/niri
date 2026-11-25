@@ -18,6 +18,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Resource as _};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
+use super::cursor::place_on_window;
 use super::keyboard::{enter_keyboards, finish_burst, with_keymap};
 use super::{
     agent_done, check_target, CaptureRecord, OpKind, PointerFocus, Target, MAX_DRAG_STEPS,
@@ -168,6 +169,12 @@ pub fn deliver_pointer(
     for keyboard in &keyboards {
         let serial = niri.agent.next_serial().into();
         keyboard.modifiers(serial, 0, 0, 0, group);
+    }
+    if result.is_ok() {
+        place_on_window(niri, target.id, buf);
+        if let AgentOp::Drag { x1, y1, .. } = op {
+            place_on_window(niri, target.id, capture_to_buffer(*x1, *y1, rec));
+        }
     }
     // The modifiers went out even if the pointer part failed: that is still a burst.
     if result.is_ok() || !keyboards.is_empty() {

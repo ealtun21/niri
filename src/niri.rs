@@ -4200,6 +4200,55 @@ impl Niri {
         }
     }
 
+    /// Draws the agent's cursor: the default pointer image plus a small amber mark.
+    pub fn render_agent_cursor<R: NiriRenderer>(
+        &self,
+        renderer: &mut R,
+        output: &Output,
+        push: &mut dyn FnMut(OutputRenderElements<R>),
+    ) {
+        let Some(at) = crate::agent::cursor::cursor_location(self, output) else {
+            return;
+        };
+        let scale = output.current_scale();
+        let cursor_scale = scale.integer_scale();
+        let output_scale = Scale::from(scale.fractional_scale());
+
+        // shortcut: the mark is a fresh buffer each frame, so it damages whenever it shows; keep
+        // one around if that ever shows up in a profile.
+        let amber = Color32F::new(0.878, 0.627, 0.188, 1.);
+        let mark = SolidColorBuffer::new((6., 6.), amber);
+        push(
+            SolidColorRenderElement::from_buffer(
+                &mark,
+                at + Point::from((12., 12.)),
+                1.,
+                Kind::Cursor,
+            )
+            .into(),
+        );
+
+        let cursor = self.cursor_manager.get_default_cursor(cursor_scale);
+        let (idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
+        let hotspot = XCursor::hotspot(frame).to_logical(cursor_scale);
+        let pos = (at - hotspot.to_f64()).to_physical_precise_round(output_scale);
+        let texture = self
+            .cursor_texture_cache
+            .get(Default::default(), cursor_scale, &cursor, idx);
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            pos,
+            &texture,
+            None,
+            None,
+            None,
+            Kind::Cursor,
+        ) {
+            Ok(element) => push(PointerRenderElements::from(element).into()),
+            Err(err) => warn!("error importing a cursor texture: {err:?}"),
+        }
+    }
+
     pub fn render_pointer<R: NiriRenderer>(
         &self,
         renderer: &mut R,
@@ -4626,6 +4675,10 @@ impl Niri {
         self.screenshot_ui.advance_animations();
         self.window_mru_ui.advance_animations();
 
+        if let Some(cursor) = &mut self.agent.cursor {
+            cursor.settle();
+        }
+
         for state in self.output_state.values_mut() {
             if let Some(transition) = &mut state.screen_transition {
                 if transition.is_done() {
@@ -4779,6 +4832,8 @@ impl Niri {
         // The pointer goes on the top.
         if include_pointer && self.pointer_visibility.is_visible() {
             self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
+            // Under the owner's pointer.
+            self.render_agent_cursor(ctx.renderer, output, push);
         }
 
         // Next, the screen transition texture.
@@ -5168,6 +5223,11 @@ impl Niri {
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= state.screen_transition.is_some();
+            state.unfinished_animations_remain |= self
+                .agent
+                .cursor
+                .as_ref()
+                .is_some_and(|c| c.output == *output && !c.glide.is_done());
 
             // Also keep redrawing if the current cursor is animated.
             state.unfinished_animations_remain |= self

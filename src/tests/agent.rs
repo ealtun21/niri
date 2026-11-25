@@ -8,16 +8,17 @@ use smithay::backend::input::{InputEvent, InputTime, KeyState, Keycode};
 use smithay::desktop::Window;
 use smithay::input::keyboard::Layout;
 use smithay::reexports::wayland_protocols::xdg::shell::client::xdg_popup::XdgPopup;
-use smithay::utils::{Point, Serial, Size};
+use smithay::utils::{Logical, Point, Serial, Size};
 use wayland_client::protocol::wl_pointer::{Axis, ButtonState};
 
 use super::client::{ClientId, PointerEvent};
 use super::*;
 use crate::agent::capture::{capture_popups, capture_precheck, settle_time};
+use crate::agent::cursor::{cursor_location, CURSOR_GLIDE};
 use crate::agent::pointer::{self, capture_to_buffer};
 use crate::agent::{
     capture_scale, check_target, keyboard, status, CaptureRecord, OpKind, DEFAULT_SETTLE,
-    MAX_DRAG_STEPS, MAX_SETTLE, TYPE_CHUNK_CHARS, TYPE_CHUNK_INTERVAL,
+    IDLE_RELEASE, MAX_DRAG_STEPS, MAX_SETTLE, TYPE_CHUNK_CHARS, TYPE_CHUNK_INTERVAL,
 };
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::niri::LockState;
@@ -2787,4 +2788,108 @@ layout {
         1,
         "{b_left:?}"
     );
+}
+
+/// Two clients with the agent's `agent-b` on the owner's active workspace, so it is on screen.
+fn on_screen_b() -> (Fixture, MappedId, smithay::output::Output) {
+    let (mut f, human, _, agent, b) = two_clients();
+    let w = window_of(&mut f, "agent-b");
+    f.niri()
+        .layout
+        .move_to_workspace(Some(&w), 0, ActivateWindow::No);
+    focus_for_owner(&mut f, "a");
+    f.double_roundtrip(human);
+    f.double_roundtrip(agent);
+    f.niri_complete_animations();
+    let id = captured_target(&mut f, agent, &b);
+    let output = f.niri().output_state.keys().next().unwrap().clone();
+    (f, id, output)
+}
+
+/// Where the tile of `id` is drawn on the output, plus the surface-local point.
+fn drawn_point(f: &mut Fixture, id: MappedId, local: Point<f64, Logical>) -> Point<f64, Logical> {
+    let niri = f.niri();
+    let mon = niri.layout.monitors().next().unwrap();
+    mon.workspaces_with_render_geo()
+        .find_map(|(ws, geo)| {
+            ws.tiles_with_render_positions()
+                .find(|(tile, ..)| tile.window().id() == id)
+                .map(|(tile, pos, _)| geo.loc + pos + tile.buf_loc() + local)
+        })
+        .unwrap()
+}
+
+fn near(a: Point<f64, Logical>, b: Point<f64, Logical>) -> bool {
+    (a.x - b.x).abs() < 0.5 && (a.y - b.y).abs() < 0.5
+}
+
+#[test]
+fn cursor_appears_at_click_point() {
+    let (mut f, id, output) = on_screen_b();
+    assert_eq!(cursor_location(f.niri(), &output), None);
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    f.niri_complete_animations();
+    let rec = record_for(&mut f, id);
+    let want = drawn_point(&mut f, id, capture_to_buffer(10., 10., &rec));
+    let got = cursor_location(f.niri(), &output).unwrap();
+    assert!(near(got, want), "{got:?} vs {want:?}");
+}
+
+#[test]
+fn cursor_hidden_after_idle() {
+    let (mut f, id, output) = on_screen_b();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    assert!(cursor_location(f.niri(), &output).is_some());
+    let cursor = f.niri().agent.cursor.as_mut().unwrap();
+    cursor.last_op = Instant::now() - IDLE_RELEASE - Duration::from_secs(1);
+    assert_eq!(cursor_location(f.niri(), &output), None);
+}
+
+#[test]
+fn cursor_hidden_when_paused() {
+    let (mut f, id, output) = on_screen_b();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    f.niri().agent.paused = true;
+    assert_eq!(cursor_location(f.niri(), &output), None);
+}
+
+#[test]
+fn cursor_hidden_for_offscreen_window() {
+    // `agent-b` is on the other workspace.
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+    let output = f.niri().output_state.keys().next().unwrap().clone();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    assert_eq!(cursor_location(f.niri(), &output), None);
+}
+
+#[test]
+fn cursor_hidden_in_overview_side_by_side() {
+    let (mut f, id, output) = on_screen_b();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    assert!(cursor_location(f.niri(), &output).is_some());
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+    assert_eq!(cursor_location(f.niri(), &output), None);
+}
+
+#[test]
+fn cursor_glides() {
+    let (mut f, id, output) = on_screen_b();
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    f.niri_complete_animations();
+    let first = cursor_location(f.niri(), &output).unwrap();
+
+    pointer_now(&mut f, id, click(60., 40.)).unwrap();
+    // Let part of the glide pass.
+    let niri = f.niri();
+    let now = niri.clock.now_unadjusted();
+    niri.clock.set_unadjusted(now + CURSOR_GLIDE / 3);
+    let mid = cursor_location(f.niri(), &output).unwrap();
+    assert!(mid.x > first.x && mid.y > first.y, "{first:?} {mid:?}");
+
+    f.niri_complete_animations();
+    let last = cursor_location(f.niri(), &output).unwrap();
+    assert!(last.x > mid.x && last.y > mid.y, "{mid:?} {last:?}");
+    assert!(near(last, first + Point::from((50., 30.))), "{last:?}");
 }

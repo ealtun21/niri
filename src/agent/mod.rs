@@ -1,6 +1,7 @@
 //! Agent desktop control: window capture and input for AI agents.
 
 pub mod capture;
+pub mod cursor;
 pub mod keyboard;
 pub mod pointer;
 
@@ -81,6 +82,8 @@ pub struct AgentState {
     /// Whether a hand-over took the seat pointer focus off a client for the agent pointer; the
     /// owner's next motion, or the end of the hand-over, gives it back.
     pub owner_pointer_parked: bool,
+    /// The agent's drawn cursor.
+    pub cursor: Option<cursor::AgentCursor>,
     /// Whether the idle release timer is running.
     idle_timer: bool,
     // ponytail: the per-client and per-window maps below are never pruned (a few bytes per
