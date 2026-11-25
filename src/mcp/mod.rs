@@ -41,7 +41,7 @@ Rules:
 - Launch browsers only through `launch`; it gives a fresh profile, never the owner's.
 - Close the windows you launched when you are done.
 - Coordinates are pixels of the last `look` image. After any `type` or `key`, or after `stale_capture`, `no_capture` or `stale_elements`, `look` again before clicking.
-- Element numbers expire at the next `look` or the next acting call on that window (with `screen: true`, at the next screen look or screen operation).
+- Element numbers expire at the next `look` or acting call on that window and at any `screen: true` operation. Screen element numbers expire at the next screen look, any acting call and any `action`.
 - While a menu or popup is open, elements under it are covered: press Escape first.
 - Right after `launch`, a browser may list few page elements at first: look again after a moment.
 - Element names can be empty (GTK 4 menu items). In GTK 4 apps a box can be about 15 px off: check it against the image, and click small targets by coordinates from the image.

@@ -364,9 +364,10 @@ fn point(
     }
 }
 
-/// Expires the window's elements, then sends the operation.
+/// Expires the window's elements and the screen's, then sends the operation.
 fn send(s: &mut Server, id: u64, op: AgentOp) -> ToolOutcome {
     s.elements.remove(&id);
+    s.screen_elements = None;
     match (s.ipc)(Request::Agent { id, op }) {
         Ok(Ok(Response::AgentDone(d))) => ToolOutcome::text(match d.capture_age_ms {
             Some(ms) => format!("ok (capture_age_ms={ms})"),
@@ -387,6 +388,8 @@ fn act(s: &mut Server, on: On, op: AgentOp) -> ToolOutcome {
     };
     // Coordinates and element numbers are of the last look's output.
     let looked = s.screen_elements.take().map(|(output, ..)| output);
+    // A screen op may change any window.
+    s.elements.clear();
     let (verb, keys) = match op {
         AgentOp::Click { .. } => ("clicked", false),
         AgentOp::Move { .. } => ("hovered over", false),
@@ -736,6 +739,11 @@ mod tests {
                 titled(7, 42, "T7"),
                 titled(8, 43, "T8"),
             ])),
+            Request::CaptureWindow { id, path, .. } => {
+                std::fs::write(path, b"\x89PNGfake").unwrap();
+                Ok(Response::WindowCapture(cap(*id, path)))
+            }
+            Request::Agent { .. } | Request::AgentAction { .. } => done(),
             _ => Ok(Response::AgentScreenDone(ScreenHit::Window { id: 8 })),
         });
         s.read_elements = screen_elements;
@@ -1167,5 +1175,41 @@ mod tests {
             &screen_ops(&log)[0],
             (None, AgentOp::Click { x, y, .. }) if *x == 1. && *y == 2.
         ));
+    }
+
+    #[test]
+    fn window_and_screen_elements_expire_each_other() {
+        let (mut s, log, dir) = screen_server(
+            json!([screen_win(7, [0., 0., 200., 300.], json!([]))]),
+            false,
+        );
+        let stale = |o: ToolOutcome| text(&o).starts_with("stale_elements");
+        // A screen op may change any window.
+        look_tool(&mut s, &json!({"window": 7}));
+        look_tool(&mut s, &json!({"screen": true}));
+        key_tool(&mut s, &json!({"screen": true, "chord": "a"}));
+        assert!(stale(click_tool(
+            &mut s,
+            &json!({"window": 7, "element": 1})
+        )));
+        // A window op or a niri action changes the screen.
+        look_tool(&mut s, &json!({"window": 7}));
+        look_tool(&mut s, &json!({"screen": true}));
+        assert!(!click_tool(&mut s, &json!({"window": 7, "element": 1})).is_error);
+        assert!(stale(click_tool(
+            &mut s,
+            &json!({"screen": true, "element": 1})
+        )));
+        look_tool(&mut s, &json!({"screen": true}));
+        let o = s
+            .call_tool("action", &json!({"args": ["focus-workspace", "2"]}))
+            .unwrap();
+        assert!(!o.is_error, "{}", text(&o));
+        assert!(stale(click_tool(
+            &mut s,
+            &json!({"screen": true, "element": 1})
+        )));
+        assert_eq!(screen_ops(&log).len(), 1);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

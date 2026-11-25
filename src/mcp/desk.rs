@@ -29,6 +29,8 @@ fn action_tool(s: &mut Server, args: &Value) -> ToolOutcome {
             return bad(msg.lines().next().unwrap_or_default());
         }
     };
+    // An action may change anything on screen.
+    s.screen_elements = None;
     match (s.ipc)(Request::AgentAction {
         action: parsed.action,
     }) {
