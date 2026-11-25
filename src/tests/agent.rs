@@ -1786,6 +1786,24 @@ fn overview_keyboard_focus_still_blocks() {
 }
 
 #[test]
+fn overview_owner_pointer_on_agent_client_layer_is_same_client() {
+    let (mut f, _, _, agent, _) = two_clients();
+    map_layer_of(&mut f, agent, Layer::Top, "bar", None);
+    let id = mapped_id(&mut f, "agent-b");
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+    physical_motion(&mut f, 960., 25.);
+    let niri = f.niri();
+    assert!(niri.seat.get_pointer().unwrap().current_focus().is_some());
+    let on_bar = niri.pointer_contents.layer.as_ref();
+    assert!(on_bar.is_some_and(|layer| layer.namespace() == "bar"));
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::SameClient)
+    );
+}
+
+#[test]
 fn status_lists_granted_and_acting() {
     let (mut f, _, _, agent, b) = two_clients();
     let id = agent_target(&mut f, agent, &b);
@@ -3245,11 +3263,23 @@ fn map_layer(
     namespace: &str,
     kb_interactivity: Option<KeyboardInteractivity>,
 ) -> (ClientId, WlSurface) {
+    let id = f.add_client();
+    let surface = map_layer_of(f, id, layer, namespace, kb_interactivity);
+    (id, surface)
+}
+
+/// Like `map_layer`, from client `id`.
+fn map_layer_of(
+    f: &mut Fixture,
+    id: ClientId,
+    layer: Layer,
+    namespace: &str,
+    kb_interactivity: Option<KeyboardInteractivity>,
+) -> WlSurface {
     use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Anchor;
 
     use crate::tests::client::LayerConfigureProps;
 
-    let id = f.add_client();
     let layer = f.client(id).create_layer(None, layer, namespace);
     let surface = layer.surface.clone();
     layer.set_configure_props(LayerConfigureProps {
@@ -3265,7 +3295,7 @@ fn map_layer(
     layer.set_size(1920, 50);
     layer.ack_last_and_commit();
     f.double_roundtrip(id);
-    (id, surface)
+    surface
 }
 
 #[test]
