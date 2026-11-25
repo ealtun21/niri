@@ -1290,7 +1290,7 @@ impl State {
             return;
         }
         // A hand-over parked the owner's pointer off a client for the agent pointer.
-        if self.niri.agent.owner_pointer_parked {
+        if self.niri.agent.owner_pointer_parked && self.niri.agent.handed_over {
             return;
         }
 
@@ -1342,8 +1342,10 @@ impl State {
         };
 
         // We're not changing the global cursor location here, so if the contents did not change,
-        // then nothing changed.
-        if self.niri.pointer_contents == under {
+        // then nothing changed. Unless a hand-over ended with the owner's pointer parked: it enters
+        // again, so the click or scroll that ended the hand-over lands where the owner aimed.
+        let unpark = self.niri.agent.owner_pointer_parked && !self.niri.agent.handed_over;
+        if self.niri.pointer_contents == under && !unpark {
             return false;
         }
 

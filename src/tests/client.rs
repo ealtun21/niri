@@ -87,6 +87,8 @@ pub struct State {
     pub popups_done: Vec<XdgPopup>,
     /// Configures received by popup xdg-surfaces, not acked automatically.
     pub popup_configures: Vec<(XdgSurface, u32)>,
+    /// Pointer events of every surface, in the order they came.
+    pub pointer_events_received: Vec<PointerEvent>,
 }
 
 pub struct Window {
@@ -136,7 +138,7 @@ pub struct Pointer {
     pub surface: Option<WlSurface>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PointerEvent {
     Enter {
         x: f64,
@@ -329,6 +331,7 @@ impl Client {
             layers: Vec::new(),
             popups_done: Vec::new(),
             popup_configures: Vec::new(),
+            pointer_events_received: Vec::new(),
         };
 
         Self {
@@ -995,6 +998,7 @@ impl Dispatch<WlPointer, WlSeat> for State {
             wl_pointer::Event::Frame => (pointer.surface.clone().unwrap(), PointerEvent::Frame),
             _ => return,
         };
+        state.pointer_events_received.push(event.clone());
         state
             .surfaces
             .get_mut(&surface)

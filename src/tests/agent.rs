@@ -2489,24 +2489,31 @@ fn owner_entering_client_releases_agent_pointer_first() {
     assert_one_pointer(&got);
 }
 
-#[test]
-fn handover_parks_owner_pointer() {
-    let (mut f, human, a, ..) = two_clients_with(handover_config());
+/// The owner's pointer rests on "a", the owner hands over, and the agent clicks "a". Returns the
+/// events "a" got from the owner's first enter, and where the owner's pointer is.
+fn park_over_a(f: &mut Fixture, human: ClientId, a: &WlSurface) -> (Vec<PointerEvent>, (f64, f64)) {
     f.niri_complete_animations();
-    let window = window_of(&mut f, "a");
-    let (x, y) = point_over(&mut f, &window);
-    physical_motion(&mut f, x, y);
-    let mut got = pointer_events(&mut f, human, &a);
+    let window = window_of(f, "a");
+    let (x, y) = point_over(f, &window);
+    physical_motion(f, x, y);
+    let got = pointer_events(f, human, a);
     assert!(
         matches!(got.first(), Some(PointerEvent::Enter { .. })),
         "{got:?}"
     );
 
     f.niri().agent.hand_over();
-    let id = mapped_id(&mut f, "a");
-    let record = record_for(&mut f, id);
+    let id = mapped_id(f, "a");
+    let record = record_for(f, id);
     f.niri().agent.captures.insert(id, record);
-    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    pointer_now(f, id, click(10., 10.)).unwrap();
+    (got, (x, y))
+}
+
+#[test]
+fn handover_parks_owner_pointer() {
+    let (mut f, human, a, ..) = two_clients_with(handover_config());
+    let (mut got, (x, y)) = park_over_a(&mut f, human, &a);
 
     // The owner's pointer leaves before the agent's enters.
     let parked = pointer_events(&mut f, human, &a);
@@ -2602,4 +2609,182 @@ fn owner_pointer_refresh_onto_agent_client_releases_agent_pointer_first() {
     );
     got.extend(after);
     assert_one_pointer(&got);
+}
+
+/// Positions of the first `Leave`, the first `Enter` and the first event matching `then`.
+fn leave_enter_then(
+    events: &[PointerEvent],
+    then: impl Fn(&PointerEvent) -> bool,
+) -> (Option<usize>, Option<usize>, Option<usize>) {
+    (
+        events.iter().position(|e| *e == PointerEvent::Leave),
+        events
+            .iter()
+            .position(|e| matches!(e, PointerEvent::Enter { .. })),
+        events.iter().position(then),
+    )
+}
+
+#[test]
+fn owner_click_while_parked_lands_on_the_window() {
+    let (mut f, human, a, ..) = two_clients_with(handover_config());
+    let (mut got, _) = park_over_a(&mut f, human, &a);
+    got.extend(pointer_events(&mut f, human, &a));
+
+    // No motion: the click that ends the hand-over must still reach "a".
+    physical_click(&mut f);
+
+    assert!(!f.niri().agent.handed_over);
+    let after = pointer_events(&mut f, human, &a);
+    let (leave, enter, button) = leave_enter_then(&after, |e| {
+        matches!(
+            e,
+            PointerEvent::Button {
+                state: ButtonState::Pressed,
+                ..
+            }
+        )
+    });
+    assert!(
+        leave.is_some() && leave < enter && enter < button,
+        "{after:?}"
+    );
+    got.extend(after);
+    assert_one_pointer(&got);
+}
+
+#[test]
+fn owner_scroll_while_parked_lands_on_the_window() {
+    let (mut f, human, a, ..) = two_clients_with(handover_config());
+    let (mut got, _) = park_over_a(&mut f, human, &a);
+    got.extend(pointer_events(&mut f, human, &a));
+
+    physical_scroll(&mut f, 10.);
+
+    assert!(!f.niri().agent.handed_over);
+    let after = pointer_events(&mut f, human, &a);
+    let (leave, enter, axis) = leave_enter_then(&after, |e| matches!(e, PointerEvent::Axis { .. }));
+    assert!(
+        leave.is_some() && leave < enter && enter < axis,
+        "{after:?}"
+    );
+    got.extend(after);
+    assert_one_pointer(&got);
+}
+
+#[test]
+fn pause_while_parked_gives_the_owner_pointer_back() {
+    let (mut f, human, a, ..) = two_clients_with(handover_config());
+    let (mut got, _) = park_over_a(&mut f, human, &a);
+    got.extend(pointer_events(&mut f, human, &a));
+
+    // No motion: the next refresh enters the owner's pointer again.
+    f.niri().agent.pause();
+
+    let after = pointer_events(&mut f, human, &a);
+    let (leave, enter, _) = leave_enter_then(&after, |_| false);
+    assert!(leave.is_some() && leave < enter, "{after:?}");
+    let a_surface = server_surface(&mut f, "a");
+    assert_eq!(
+        f.niri().seat.get_pointer().unwrap().current_focus(),
+        Some(a_surface)
+    );
+    assert!(!f.niri().agent.owner_pointer_parked);
+    got.extend(after);
+    assert_one_pointer(&got);
+}
+
+#[test]
+fn park_refused_while_a_grab_holds_the_owner_pointer() {
+    let (mut f, human, a, agent, _) = two_clients_with(handover_config());
+    events(&mut f, human, &a);
+    f.niri_complete_animations();
+    let window = window_of(&mut f, "a");
+    let (x, y) = point_over(&mut f, &window);
+    physical_motion(&mut f, x, y);
+    let mut got = pointer_events(&mut f, human, &a);
+
+    f.niri().agent.hand_over();
+    // A held button (virtual, so the hand-over stays) grabs the seat pointer on "a".
+    let pointer = f.client(agent).state.virtual_pointer();
+    pointer.button(0, 0x110, ButtonState::Pressed);
+    pointer.frame();
+    f.roundtrip(agent);
+    assert!(f.niri().agent.handed_over);
+
+    let id = mapped_id(&mut f, "a");
+    let record = record_for(&mut f, id);
+    f.niri().agent.captures.insert(id, record);
+    let ctrl_click = AgentOp::Click {
+        x: 10.,
+        y: 10.,
+        button: AgentButton::Left,
+        count: 1,
+        mods: vec![niri_ipc::AgentMod::Ctrl],
+    };
+    assert_eq!(
+        pointer_now(&mut f, id, ctrl_click).unwrap_err(),
+        AgentError::SameClient
+    );
+
+    // The modifiers sent before the refusal are cleared.
+    let keys = events(&mut f, human, &a);
+    assert_eq!(
+        keys.lines().rfind(|l| l.starts_with("modifiers")),
+        Some("modifiers: depressed=0, latched=0, locked=0, group=0"),
+        "{keys}"
+    );
+    let after = pointer_events(&mut f, human, &a);
+    assert!(!after.contains(&PointerEvent::Leave), "{after:?}");
+    assert!(!f.niri().agent.owner_pointer_parked);
+    got.extend(after);
+    assert_one_pointer(&got);
+}
+
+/// Pointer events every surface of the client got since the last call, in order.
+fn client_pointer_events(f: &mut Fixture, client: ClientId) -> Vec<PointerEvent> {
+    f.double_roundtrip(client);
+    std::mem::take(&mut f.client(client).state.pointer_events_received)
+}
+
+#[test]
+fn owner_entering_other_surface_of_agent_client_releases_agent_pointer_first() {
+    let config = Config::parse_mem(
+        r#"
+layout {
+    default-column-width { proportion 0.25; }
+}
+"#,
+    )
+    .unwrap();
+    let (mut f, human, _, agent, b) = two_clients_with(config);
+    b_on_owner_workspace(&mut f, human);
+    map_window(&mut f, agent, "agent-c");
+    focus_for_owner(&mut f, "a");
+    f.niri_complete_animations();
+    client_pointer_events(&mut f, agent);
+    agent_click_b(&mut f, agent, &b);
+
+    let window = window_of(&mut f, "agent-c");
+    let (x, y) = point_over(&mut f, &window);
+    physical_motion(&mut f, x, y);
+
+    // Client-wide: B's Leave comes before C's Enter.
+    let got = client_pointer_events(&mut f, agent);
+    assert_one_pointer(&got);
+    assert!(
+        got.contains(&PointerEvent::Leave)
+            && got
+                .iter()
+                .filter(|e| matches!(e, PointerEvent::Enter { .. }))
+                .count()
+                == 2,
+        "{got:?}"
+    );
+    let b_left = pointer_events(&mut f, agent, &b);
+    assert_eq!(
+        b_left.iter().filter(|e| **e == PointerEvent::Leave).count(),
+        1,
+        "{b_left:?}"
+    );
 }

@@ -162,27 +162,33 @@ pub fn deliver_pointer(
     };
 
     let to_local = |x, y| capture_to_buffer(x, y, rec) - offset;
-    deliver_to_surface(state, &target.client, &surface, &to_local, op)?;
+    let result = deliver_to_surface(state, &target.client, &surface, &to_local, op);
 
     let niri = &mut state.niri;
     for keyboard in &keyboards {
         let serial = niri.agent.next_serial().into();
         keyboard.modifiers(serial, 0, 0, 0, group);
     }
-    finish_burst(niri, target);
-    Ok(())
+    // The modifiers went out even if the pointer part failed: that is still a burst.
+    if result.is_ok() || !keyboards.is_empty() {
+        finish_burst(niri, target);
+    }
+    result
 }
 
 /// While handed over, takes the seat pointer off the client so the agent pointer can enter it: an
-/// app never has both entered. The owner's next motion brings it back.
-fn park_owner_pointer(state: &mut State, client: &Client) {
+/// app never has both entered. The owner's next motion, or the end of the hand-over, brings it
+/// back. Fails with `SameClient` when a grab (a held button, a drag) keeps the seat pointer there.
+fn park_owner_pointer(state: &mut State, client: &Client) -> Result<(), AgentError> {
     let pointer = state.niri.seat.get_pointer().unwrap();
-    let on_client = pointer
-        .current_focus()
-        .and_then(|s| s.client())
-        .is_some_and(|c| c.id() == client.id());
-    if !state.niri.agent.handed_over || !on_client {
-        return;
+    let on_client = || {
+        pointer
+            .current_focus()
+            .and_then(|s| s.client())
+            .is_some_and(|c| c.id() == client.id())
+    };
+    if !state.niri.agent.handed_over || !on_client() {
+        return Ok(());
     }
     let event = MotionEvent {
         location: pointer.current_location(),
@@ -191,7 +197,11 @@ fn park_owner_pointer(state: &mut State, client: &Client) {
     };
     pointer.motion(state, None, &event);
     pointer.frame(state);
+    if on_client() {
+        return Err(AgentError::SameClient);
+    }
     state.niri.agent.owner_pointer_parked = true;
+    Ok(())
 }
 
 /// Sends the pointer op to `surface` of `client`; `to_local` maps op coordinates to the surface.
@@ -208,7 +218,7 @@ pub fn deliver_to_surface(
         return Ok(());
     };
     let local = to_local(x, y);
-    park_owner_pointer(state, client);
+    park_owner_pointer(state, client)?;
 
     let niri = &mut state.niri;
     let pointers: Vec<WlPointer> = niri

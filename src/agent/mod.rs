@@ -79,7 +79,7 @@ pub struct AgentState {
     /// The surface the agent pointer is entered on.
     pub pointer_focus: Option<PointerFocus>,
     /// Whether a hand-over took the seat pointer focus off a client for the agent pointer; the
-    /// owner's next motion gives it back.
+    /// owner's next motion, or the end of the hand-over, gives it back.
     pub owner_pointer_parked: bool,
     /// Whether the idle release timer is running.
     idle_timer: bool,
