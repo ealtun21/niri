@@ -64,8 +64,6 @@ pub struct AgentState {
     pub paused: bool,
     /// Whether the owner handed the controls over to the agent.
     pub handed_over: bool,
-    /// Set while an agent action runs: the cursor warps that follow focus changes are skipped.
-    pub suppress_warp: bool,
     /// Last capture of each window.
     // ponytail: records of closed windows are never pruned (ids are never reused); prune on
     // window close if agents ever capture enough windows for this to matter.
@@ -132,7 +130,7 @@ pub fn end_handover(niri: &mut Niri) {
     }
 }
 
-/// Runs a niri action for the agent during a hand-over, without warping the owner's pointer.
+/// Runs a niri action for the agent during a hand-over, which never warps the owner's pointer.
 pub fn run_action(state: &mut State, action: niri_ipc::Action) -> Result<(), AgentError> {
     if !state.niri.agent.handed_over {
         return Err(AgentError::NotHandedOver);
@@ -141,10 +139,8 @@ pub fn run_action(state: &mut State, action: niri_ipc::Action) -> Result<(), Age
         return Err(AgentError::ActionRefused(String::from("quit")));
     }
 
-    state.niri.agent.suppress_warp = true;
     state.do_action(action.into(), false, InputTime::now());
     state.update_keyboard_focus();
-    state.niri.agent.suppress_warp = false;
     Ok(())
 }
 

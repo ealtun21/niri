@@ -1254,7 +1254,8 @@ impl State {
     }
 
     pub fn maybe_warp_cursor_to_focus(&mut self) -> bool {
-        if self.niri.agent.suppress_warp {
+        // A hand-over never moves the owner's pointer; the owner's own input ends it first.
+        if self.niri.agent.handed_over {
             return false;
         }
         let focused = match self.niri.config.borrow().input.warp_mouse_to_focus {
@@ -1269,7 +1270,7 @@ impl State {
     }
 
     pub fn maybe_warp_cursor_to_focus_centered(&mut self) -> bool {
-        if self.niri.agent.suppress_warp {
+        if self.niri.agent.handed_over {
             return false;
         }
         let focused = match self.niri.config.borrow().input.warp_mouse_to_focus {
@@ -1383,8 +1384,7 @@ impl State {
     }
 
     pub fn move_cursor_to_output(&mut self, output: &Output) {
-        // Agent actions never move the owner's pointer.
-        if self.niri.agent.suppress_warp {
+        if self.niri.agent.handed_over {
             return;
         }
         let geo = self.niri.global_space.output_geometry(output).unwrap();

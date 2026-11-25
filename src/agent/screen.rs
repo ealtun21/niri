@@ -567,12 +567,11 @@ fn window_at(
         .map(|(id, _)| id)
 }
 
-/// Runs `f`, then moves the keyboard focus where it says, never warping the owner's pointer.
+/// Runs `f`, then moves the keyboard focus where it says. The hand-over keeps the owner's pointer
+/// from warping.
 fn focus_without_warp(state: &mut State, f: impl FnOnce(&mut State)) {
-    state.niri.agent.suppress_warp = true;
     f(state);
     state.update_keyboard_focus();
-    state.niri.agent.suppress_warp = false;
 }
 
 /// Does what the owner's click or wheel at `pos` does in the overview.

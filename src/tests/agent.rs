@@ -2328,13 +2328,32 @@ fn agent_action_focus_does_not_warp() {
     crate::agent::run_action(f.niri_state(), focus_left()).unwrap();
     assert_eq!(focused_app_id(&mut f).as_deref(), Some("a"));
     assert_eq!(pointer_location(&mut f), before);
-    assert!(!f.niri().agent.suppress_warp);
 }
 
 #[test]
 fn owner_action_still_warps() {
     let mut f = warp_setup();
     let before = pointer_location(&mut f);
+    f.niri_state().do_action(
+        niri_config::Action::FocusColumnLeft,
+        false,
+        InputTime::from_micros(0),
+    );
+    assert_ne!(pointer_location(&mut f), before);
+}
+
+#[test]
+fn window_taking_focus_during_handover_does_not_warp() {
+    let mut f = warp_setup();
+    f.niri().agent.hand_over();
+    let before = pointer_location(&mut f);
+    let id = f.add_client();
+    map_window(&mut f, id, "c");
+    assert_eq!(focused_app_id(&mut f).as_deref(), Some("c"));
+    assert_eq!(pointer_location(&mut f), before);
+
+    // The owner's own focus action warps again once the hand-over ended.
+    crate::agent::end_handover(f.niri());
     f.niri_state().do_action(
         niri_config::Action::FocusColumnLeft,
         false,
@@ -3747,7 +3766,6 @@ fn screen_click_focuses_window() {
     let b = server_surface(&mut f, "agent-b");
     assert_eq!(f.niri().keyboard_focus.surface(), Some(&b));
     assert_eq!(pointer_location(&mut f), location);
-    assert!(!f.niri().agent.suppress_warp);
 }
 
 #[test]
