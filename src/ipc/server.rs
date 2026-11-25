@@ -55,7 +55,7 @@ pub struct IpcServer {
     /// Clients of `Request::AgentStateStream`, kept apart from the event streams.
     agent_streams: Vec<EventStreamSender<AgentStatus>>,
     /// The status last sent to `agent_streams`.
-    agent_last: Option<AgentStatus>,
+    pub(crate) agent_last: Option<AgentStatus>,
 }
 
 struct ClientCtx {
@@ -946,8 +946,13 @@ impl State {
         server.send_event(event);
     }
 
-    /// Sends the agent status to the agent stream clients if it changed.
+    /// Sends the agent status to the agent stream clients if it changed. Without clients it builds
+    /// nothing, and `agent_last` goes stale until the next client comes.
     pub fn ipc_refresh_agent(&mut self) {
+        let no_clients = |server: &IpcServer| server.agent_streams.is_empty();
+        if self.niri.ipc_server.as_ref().is_none_or(no_clients) {
+            return;
+        }
         let status = crate::agent::status(&self.niri);
         let Some(server) = &mut self.niri.ipc_server else {
             return;
@@ -961,15 +966,16 @@ impl State {
 
     /// Registers an agent stream client and sends it the current status.
     pub fn ipc_add_agent_stream(&mut self, events: Sender<AgentStatus>, disconnect: Sender<()>) {
-        // Existing clients get any pending change first, so that `agent_last` is current.
+        // Existing clients get any pending change first.
         self.ipc_refresh_agent();
+        let current = crate::agent::status(&self.niri);
         let Some(server) = &mut self.niri.ipc_server else {
             return;
         };
-        let current = server.agent_last.clone().unwrap_or_default();
         events
-            .try_send(current)
+            .try_send(current.clone())
             .expect("initial status had more lines than buffer size");
+        server.agent_last = Some(current);
         server
             .agent_streams
             .push(EventStreamSender { events, disconnect });

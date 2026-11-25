@@ -1867,6 +1867,22 @@ fn agent_stream_sends_initial_then_changes() {
     assert!(rx.try_recv().is_err());
 }
 
+#[test]
+fn agent_status_waits_for_a_stream_client() {
+    let (mut f, ..) = two_clients();
+    f.niri_state().ipc_refresh_agent();
+    assert_eq!(f.niri().ipc_server.as_ref().unwrap().agent_last, None);
+
+    // A new client gets the status as it is now.
+    f.niri().agent.hand_over();
+    let (tx, rx) = async_channel::bounded::<AgentStatus>(64);
+    let (disconnect, _keep) = async_channel::bounded(1);
+    f.niri_state().ipc_add_agent_stream(tx, disconnect);
+    let initial = rx.try_recv().unwrap();
+    assert!(initial.handed_over);
+    assert_eq!(initial, status(f.niri()));
+}
+
 const HANDOVER_BINDS: &str = r#"
 binds {
     Mod+Alt+D { toggle-agent-handover; }
