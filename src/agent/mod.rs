@@ -19,6 +19,7 @@ use smithay::desktop::{PopupKind, PopupManager};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::protocol::wl_keyboard::WlKeyboard;
+use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, Resource as _};
 use smithay::utils::{
@@ -75,6 +76,11 @@ pub struct AgentState {
     serials: VecDeque<Serial>,
     /// The agent's shadow keyboard focus.
     sticky: Option<Sticky>,
+    /// The surface the agent pointer is entered on.
+    pub pointer_focus: Option<PointerFocus>,
+    /// Whether a hand-over took the seat pointer focus off a client for the agent pointer; the
+    /// owner's next motion gives it back.
+    pub owner_pointer_parked: bool,
     /// Whether the idle release timer is running.
     idle_timer: bool,
     // ponytail: the per-client and per-window maps below are never pruned (a few bytes per
@@ -119,6 +125,13 @@ pub struct AgentGuardMarker;
 pub struct Sticky {
     pub surface: WlSurface,
     pub keyboards: Vec<WlKeyboard>,
+}
+
+/// A surface the agent pointer is entered on, and the pointers that got its `enter`.
+#[derive(Debug)]
+pub struct PointerFocus {
+    pub surface: WlSurface,
+    pub pointers: Vec<WlPointer>,
 }
 
 /// What a capture looked like, to map its pixels back to the window and to detect staleness.
@@ -170,6 +183,7 @@ impl AgentState {
         self.paused = true;
         self.handed_over = false;
         self.release_sticky();
+        self.release_pointer();
         self.dismiss_all();
     }
 
@@ -231,13 +245,44 @@ impl AgentState {
         }
     }
 
-    /// Releases the shadow keyboard focus once agents have been idle for `IDLE_RELEASE`.
+    /// Sends `leave` for the agent pointer and drops it.
+    pub fn release_pointer(&mut self) {
+        let Some(focus) = self.pointer_focus.take() else {
+            return;
+        };
+        if !focus.surface.is_alive() {
+            return;
+        }
+        let serial = self.next_serial().into();
+        for pointer in &focus.pointers {
+            pointer.leave(serial, &focus.surface);
+            if pointer.version() >= pointer::FRAME_SINCE {
+                pointer.frame();
+            }
+        }
+    }
+
+    /// Runs before the seat pointer enters `surface`: the agent pointer leaves that client first,
+    /// so an app never has both entered, and a parked owner pointer is back.
+    pub fn yield_pointer_to(&mut self, surface: Option<&WlSurface>) {
+        self.owner_pointer_parked = false;
+        let same_client = |focus: &PointerFocus| {
+            surface.is_some_and(|s| focus.surface.id().same_client_as(&s.id()))
+        };
+        if self.pointer_focus.as_ref().is_some_and(same_client) {
+            self.release_pointer();
+        }
+    }
+
+    /// Releases the shadow keyboard focus and the agent pointer once agents have been idle for
+    /// `IDLE_RELEASE`.
     pub fn release_if_idle(&mut self, now: Instant) {
         if self
             .last_agent_burst
             .is_some_and(|burst| now.saturating_duration_since(burst) >= IDLE_RELEASE)
         {
             self.release_sticky();
+            self.release_pointer();
             self.dismiss_all();
         }
     }

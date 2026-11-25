@@ -1,26 +1,33 @@
 //! Shadow pointer delivery: `click`, `move`, `scroll` and `drag`.
 //!
-//! Events go straight to the target client's `wl_pointer` resources, so the seat's pointer focus,
-//! location and grabs never change. Each op is one burst: `enter` ... `leave`.
+//! Events go straight to the target client's `wl_pointer` resources, so the seat's location and
+//! grabs never change. The agent pointer stays entered on the surface it last used, so hover
+//! state persists; see `AgentState::pointer_focus`. A hand-over takes the seat pointer focus off
+//! the client first, so an app never has both pointers entered.
 
 use async_channel::Sender;
 use niri_ipc::{AgentButton, AgentDone, AgentError, AgentMod, AgentOp};
+use smithay::backend::input::InputTime;
 use smithay::desktop::WindowSurfaceType;
 use smithay::input::keyboard::xkb::{self, Keymap};
+use smithay::input::pointer::MotionEvent;
 use smithay::reexports::wayland_server::protocol::wl_pointer::{
     Axis, AxisSource, ButtonState, WlPointer,
 };
-use smithay::reexports::wayland_server::Resource as _;
-use smithay::utils::{Logical, Point};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::{Client, Resource as _};
+use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use super::keyboard::{enter_keyboards, finish_burst, with_keymap};
-use super::{agent_done, check_target, CaptureRecord, OpKind, Target, MAX_DRAG_STEPS};
+use super::{
+    agent_done, check_target, CaptureRecord, OpKind, PointerFocus, Target, MAX_DRAG_STEPS,
+};
 use crate::niri::State;
 use crate::utils::get_monotonic_time;
 use crate::window::mapped::MappedId;
 
 /// `frame` exists since wl_pointer v5.
-const FRAME_SINCE: u32 = 5;
+pub const FRAME_SINCE: u32 = 5;
 /// `axis_value120` exists since wl_pointer v8.
 const VALUE120_SINCE: u32 = 8;
 /// Axis value (surface-local px) of one wheel notch.
@@ -94,6 +101,17 @@ fn mod_mask(keymap: &Keymap, mods: &[AgentMod]) -> u32 {
         .fold(0, |a, b| a | b)
 }
 
+/// Where the op starts, in its own coordinates; `None` for keyboard ops.
+fn start_point(op: &AgentOp) -> Option<(f64, f64)> {
+    match op {
+        AgentOp::Click { x, y, .. } | AgentOp::Move { x, y } | AgentOp::Scroll { x, y, .. } => {
+            Some((*x, *y))
+        }
+        AgentOp::Drag { x0, y0, .. } => Some((*x0, *y0)),
+        AgentOp::Key { .. } | AgentOp::Type { .. } => None,
+    }
+}
+
 /// Sends the pointer op to the target. The caller has run `check_target` for a pointer op.
 pub fn deliver_pointer(
     state: &mut State,
@@ -101,11 +119,12 @@ pub fn deliver_pointer(
     op: &AgentOp,
     rec: &CaptureRecord,
 ) -> Result<(), AgentError> {
-    let (x, y, mods) = match op {
-        AgentOp::Click { x, y, mods, .. } => (*x, *y, mods.as_slice()),
-        AgentOp::Move { x, y } | AgentOp::Scroll { x, y, .. } => (*x, *y, &[][..]),
-        AgentOp::Drag { x0, y0, .. } => (*x0, *y0, &[][..]),
-        AgentOp::Key { .. } | AgentOp::Type { .. } => return Ok(()),
+    let Some((x, y)) = start_point(op) else {
+        return Ok(());
+    };
+    let mods = match op {
+        AgentOp::Click { mods, .. } => mods.as_slice(),
+        _ => &[],
     };
     let (mask, group) = if mods.is_empty() {
         (0, 0)
@@ -125,17 +144,11 @@ pub fn deliver_pointer(
         .map(|(mapped, _)| mapped.window.clone())
         .ok_or(AgentError::WindowGone)?;
     let buf = capture_to_buffer(x, y, rec);
-    let (surface, local) = match window.surface_under(buf, WindowSurfaceType::ALL) {
-        Some((surface, offset)) => (surface, buf - offset.to_f64()),
-        None => (target.toplevel.clone(), buf),
+    let (surface, offset) = match window.surface_under(buf, WindowSurfaceType::ALL) {
+        Some((surface, offset)) => (surface, offset.to_f64()),
+        None => (target.toplevel.clone(), Point::default()),
     };
 
-    let pointers: Vec<WlPointer> = niri
-        .seat
-        .get_pointer()
-        .unwrap()
-        .client_pointers(&target.client)
-        .collect();
     let keyboards = if mods.is_empty() {
         Vec::new()
     } else {
@@ -148,8 +161,92 @@ pub fn deliver_pointer(
         keyboards
     };
 
+    let to_local = |x, y| capture_to_buffer(x, y, rec) - offset;
+    deliver_to_surface(state, &target.client, &surface, &to_local, op)?;
+
+    let niri = &mut state.niri;
+    for keyboard in &keyboards {
+        let serial = niri.agent.next_serial().into();
+        keyboard.modifiers(serial, 0, 0, 0, group);
+    }
+    finish_burst(niri, target);
+    Ok(())
+}
+
+/// While handed over, takes the seat pointer off the client so the agent pointer can enter it: an
+/// app never has both entered. The owner's next motion brings it back.
+fn park_owner_pointer(state: &mut State, client: &Client) {
+    let pointer = state.niri.seat.get_pointer().unwrap();
+    let on_client = pointer
+        .current_focus()
+        .and_then(|s| s.client())
+        .is_some_and(|c| c.id() == client.id());
+    if !state.niri.agent.handed_over || !on_client {
+        return;
+    }
+    let event = MotionEvent {
+        location: pointer.current_location(),
+        serial: SERIAL_COUNTER.next_serial(),
+        time: InputTime::now(),
+    };
+    pointer.motion(state, None, &event);
+    pointer.frame(state);
+    state.niri.agent.owner_pointer_parked = true;
+}
+
+/// Sends the pointer op to `surface` of `client`; `to_local` maps op coordinates to the surface.
+/// Enters the surface unless the agent pointer is already on it, leaving any other surface first,
+/// and stays entered. Window callers run `finish_burst` after it.
+pub fn deliver_to_surface(
+    state: &mut State,
+    client: &Client,
+    surface: &WlSurface,
+    to_local: &dyn Fn(f64, f64) -> Point<f64, Logical>,
+    op: &AgentOp,
+) -> Result<(), AgentError> {
+    let Some((x, y)) = start_point(op) else {
+        return Ok(());
+    };
+    let local = to_local(x, y);
+    park_owner_pointer(state, client);
+
+    let niri = &mut state.niri;
+    let pointers: Vec<WlPointer> = niri
+        .seat
+        .get_pointer()
+        .unwrap()
+        .client_pointers(client)
+        .collect();
+
     let time = get_monotonic_time().as_millis() as u32;
     let agent = &mut niri.agent;
+    if agent
+        .pointer_focus
+        .as_ref()
+        .is_some_and(|focus| focus.surface != *surface)
+    {
+        agent.release_pointer();
+    }
+    let entered = agent
+        .pointer_focus
+        .take()
+        .map_or_else(Vec::new, |focus| focus.pointers);
+    // Also catches pointers the client made after the first enter.
+    let new: Vec<&WlPointer> = pointers.iter().filter(|p| !entered.contains(p)).collect();
+    if !new.is_empty() {
+        let serial = agent.next_serial().into();
+        for pointer in new {
+            pointer.enter(serial, surface, local.x, local.y);
+            if pointer.version() >= FRAME_SINCE {
+                pointer.frame();
+            }
+        }
+    }
+    agent.pointer_focus = Some(PointerFocus {
+        surface: surface.clone(),
+        pointers: pointers.clone(),
+    });
+
     // Only `enter`, `leave` and `button` carry a serial; the others don't use up the serial ring.
     let mut send = |event: &dyn Fn(&WlPointer, u32)| {
         let serial = agent.next_serial().into();
@@ -174,8 +271,6 @@ pub fn deliver_pointer(
         frame();
     };
 
-    send(&|p, serial| p.enter(serial, &surface, local.x, local.y));
-    frame();
     motion(local);
 
     let button = |send: &mut Emit, code: u32, state| {
@@ -208,37 +303,20 @@ pub fn deliver_pointer(
                 frame();
             }
         }
-        AgentOp::Drag {
-            x0,
-            y0,
-            x1,
-            y1,
-            steps,
-            ..
-        } => {
-            let start = capture_to_buffer(*x0, *y0, rec);
-            let end = capture_to_buffer(*x1, *y1, rec);
+        AgentOp::Drag { x1, y1, steps, .. } => {
+            let end = to_local(*x1, *y1);
             let code = button_code(AgentButton::Left);
             button(&mut send, code, ButtonState::Pressed);
             // Bounds what one dispatch writes to the client.
             let steps = (*steps).clamp(1, MAX_DRAG_STEPS);
+            let delta = end - local;
             for i in 1..=steps {
                 let t = f64::from(i) / f64::from(steps);
-                let delta = end - start;
                 motion((local.x + delta.x * t, local.y + delta.y * t).into());
             }
             button(&mut send, code, ButtonState::Released);
         }
         AgentOp::Move { .. } | AgentOp::Key { .. } | AgentOp::Type { .. } => (),
     }
-
-    send(&|p, serial| p.leave(serial, &surface));
-    frame();
-
-    for keyboard in &keyboards {
-        let serial = niri.agent.next_serial().into();
-        keyboard.modifiers(serial, 0, 0, 0, group);
-    }
-    finish_burst(niri, target);
     Ok(())
 }

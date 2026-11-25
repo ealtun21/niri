@@ -3068,6 +3068,9 @@ impl State {
 
         self.niri.pointer_contents.clone_from(&under);
 
+        self.niri
+            .agent
+            .yield_pointer_to(under.surface.as_ref().map(|(s, _)| s));
         pointer.motion(
             self,
             under.surface.clone(),
@@ -3170,6 +3173,9 @@ impl State {
 
         self.niri.pointer_contents.clone_from(&under);
 
+        self.niri
+            .agent
+            .yield_pointer_to(under.surface.as_ref().map(|(s, _)| s));
         pointer.motion(
             self,
             under.surface,

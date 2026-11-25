@@ -311,8 +311,8 @@ pub fn finish_burst(niri: &mut Niri, target: &Target) {
     start_idle_timer(niri);
 }
 
-/// Checks every `IDLE_CHECK` whether to release the shadow focus and agent popups, while there
-/// are any.
+/// Checks every `IDLE_CHECK` whether to release the shadow focus, the agent pointer and agent
+/// popups, while there are any.
 pub(super) fn start_idle_timer(niri: &mut Niri) {
     if niri.agent.idle_timer {
         return;
@@ -322,7 +322,10 @@ pub(super) fn start_idle_timer(niri: &mut Niri) {
         .insert_source(Timer::from_duration(IDLE_CHECK), |_, _, state| {
             let agent = &mut state.niri.agent;
             agent.release_if_idle(Instant::now());
-            if agent.sticky.is_some() || !agent.popups.is_empty() || !agent.active_until.is_empty()
+            if agent.sticky.is_some()
+                || agent.pointer_focus.is_some()
+                || !agent.popups.is_empty()
+                || !agent.active_until.is_empty()
             {
                 TimeoutAction::ToDuration(IDLE_CHECK)
             } else {

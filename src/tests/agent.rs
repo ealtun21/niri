@@ -749,8 +749,6 @@ fn click_reaches_target_only() {
             Frame,
             button(ButtonState::Released),
             Frame,
-            Leave,
-            Frame,
         ]
     );
     assert_eq!(pointer_events(&mut f, human, &a), []);
@@ -2348,4 +2346,260 @@ fn agent_action_focus_monitor_does_not_move_pointer() {
     let before = pointer_location(&mut f);
     crate::agent::run_action(f.niri_state(), niri_ipc::Action::FocusMonitorRight {}).unwrap();
     assert_eq!(pointer_location(&mut f), before);
+}
+
+/// Fails on an `Enter` while the pointer is already entered: an app never sees two pointers.
+fn assert_one_pointer(events: &[PointerEvent]) {
+    let mut entered = false;
+    for (i, event) in events.iter().enumerate() {
+        match event {
+            PointerEvent::Enter { .. } => {
+                assert!(!entered, "enter #{i} while entered: {events:?}");
+                entered = true;
+            }
+            PointerEvent::Leave => entered = false,
+            _ => (),
+        }
+    }
+}
+
+/// The agent clicks B; returns B's pointer events.
+fn agent_click_b(f: &mut Fixture, agent: ClientId, b: &WlSurface) -> Vec<PointerEvent> {
+    let id = captured_target(f, agent, b);
+    pointer_now(f, id, click(10., 10.)).unwrap();
+    pointer_events(f, agent, b)
+}
+
+#[test]
+fn agent_pointer_stays_entered_after_click() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let got = agent_click_b(&mut f, agent, &b);
+    assert_one_pointer(&got);
+    assert!(
+        matches!(
+            got[..],
+            [
+                ..,
+                PointerEvent::Button {
+                    state: ButtonState::Released,
+                    ..
+                },
+                PointerEvent::Frame
+            ]
+        ),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn agent_pointer_second_click_sends_no_second_enter() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+    pointer_now(&mut f, id, click(20., 20.)).unwrap();
+
+    let got = pointer_events(&mut f, agent, &b);
+    assert_one_pointer(&got);
+    let enters = got
+        .iter()
+        .filter(|e| matches!(e, PointerEvent::Enter { .. }))
+        .count();
+    assert_eq!(enters, 1, "{got:?}");
+    assert!(
+        got.contains(&PointerEvent::Motion { x: 20., y: 20. }),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn agent_pointer_leaves_for_another_surface() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let c = map_window(&mut f, agent, "agent-c");
+    let c_id = mapped_id(&mut f, "agent-c");
+    let record = record_for(&mut f, c_id);
+    f.niri().agent.captures.insert(c_id, record);
+    pointer_events(&mut f, agent, &c);
+    let mut on_b = agent_click_b(&mut f, agent, &b);
+    assert!(!on_b.contains(&PointerEvent::Leave), "{on_b:?}");
+
+    pointer_now(&mut f, c_id, click(10., 10.)).unwrap();
+
+    let left = pointer_events(&mut f, agent, &b);
+    assert_eq!(left, [PointerEvent::Leave, PointerEvent::Frame]);
+    on_b.extend(left);
+    assert_one_pointer(&on_b);
+    let on_c = pointer_events(&mut f, agent, &c);
+    assert_one_pointer(&on_c);
+    assert!(
+        matches!(on_c.first(), Some(PointerEvent::Enter { .. })),
+        "{on_c:?}"
+    );
+}
+
+#[test]
+fn agent_pointer_leaves_after_idle() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let mut got = agent_click_b(&mut f, agent, &b);
+
+    f.niri()
+        .agent
+        .release_if_idle(Instant::now() + Duration::from_secs(9));
+    assert_eq!(pointer_events(&mut f, agent, &b), []);
+
+    f.niri()
+        .agent
+        .release_if_idle(Instant::now() + Duration::from_secs(11));
+    let left = pointer_events(&mut f, agent, &b);
+    assert_eq!(left, [PointerEvent::Leave, PointerEvent::Frame]);
+    got.extend(left);
+    assert_one_pointer(&got);
+}
+
+#[test]
+fn agent_pointer_leaves_on_pause() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let mut got = agent_click_b(&mut f, agent, &b);
+
+    f.niri().agent.pause();
+
+    let left = pointer_events(&mut f, agent, &b);
+    assert_eq!(left, [PointerEvent::Leave, PointerEvent::Frame]);
+    got.extend(left);
+    assert_one_pointer(&got);
+}
+
+#[test]
+fn owner_entering_client_releases_agent_pointer_first() {
+    let (mut f, human, _, agent, b) = two_clients();
+    b_on_owner_workspace(&mut f, human);
+    f.niri_complete_animations();
+    let mut got = agent_click_b(&mut f, agent, &b);
+
+    let window = window_of(&mut f, "agent-b");
+    let (x, y) = point_over(&mut f, &window);
+    physical_motion(&mut f, x, y);
+
+    let after = pointer_events(&mut f, agent, &b);
+    let leave = after.iter().position(|e| *e == PointerEvent::Leave);
+    let enter = after
+        .iter()
+        .position(|e| matches!(e, PointerEvent::Enter { .. }));
+    assert!(leave.is_some() && leave < enter, "{after:?}");
+    got.extend(after);
+    assert_one_pointer(&got);
+}
+
+#[test]
+fn handover_parks_owner_pointer() {
+    let (mut f, human, a, ..) = two_clients_with(handover_config());
+    f.niri_complete_animations();
+    let window = window_of(&mut f, "a");
+    let (x, y) = point_over(&mut f, &window);
+    physical_motion(&mut f, x, y);
+    let mut got = pointer_events(&mut f, human, &a);
+    assert!(
+        matches!(got.first(), Some(PointerEvent::Enter { .. })),
+        "{got:?}"
+    );
+
+    f.niri().agent.hand_over();
+    let id = mapped_id(&mut f, "a");
+    let record = record_for(&mut f, id);
+    f.niri().agent.captures.insert(id, record);
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+
+    // The owner's pointer leaves before the agent's enters.
+    let parked = pointer_events(&mut f, human, &a);
+    assert!(
+        matches!(
+            parked[..],
+            [
+                PointerEvent::Leave,
+                PointerEvent::Frame,
+                PointerEvent::Enter { .. },
+                ..
+            ]
+        ),
+        "{parked:?}"
+    );
+    assert_eq!(f.niri().seat.get_pointer().unwrap().current_focus(), None);
+    got.extend(parked);
+
+    // While parked, a refresh doesn't bring the owner's pointer back.
+    f.niri().pointer_contents = Default::default();
+    f.niri_state().refresh_pointer_contents();
+    let refreshed = pointer_events(&mut f, human, &a);
+    assert_eq!(refreshed, []);
+
+    // The owner's next motion: the agent's pointer leaves, then the owner's enters.
+    physical_motion(&mut f, x + 1., y);
+    let back = pointer_events(&mut f, human, &a);
+    assert!(
+        matches!(
+            back[..],
+            [
+                PointerEvent::Leave,
+                PointerEvent::Frame,
+                PointerEvent::Enter { .. },
+                ..
+            ]
+        ),
+        "{back:?}"
+    );
+    let a_surface = server_surface(&mut f, "a");
+    assert_eq!(
+        f.niri().seat.get_pointer().unwrap().current_focus(),
+        Some(a_surface)
+    );
+    got.extend(back);
+    assert_one_pointer(&got);
+}
+
+#[test]
+fn owner_warp_onto_agent_client_releases_agent_pointer_first() {
+    let (mut f, human, _, agent, b) = two_clients();
+    b_on_owner_workspace(&mut f, human);
+    f.niri_complete_animations();
+    let mut got = agent_click_b(&mut f, agent, &b);
+
+    let window = window_of(&mut f, "agent-b");
+    let (x, y) = point_over(&mut f, &window);
+    f.niri_state().move_cursor((x, y).into());
+
+    let after = pointer_events(&mut f, agent, &b);
+    assert!(
+        matches!(after.first(), Some(PointerEvent::Leave)),
+        "{after:?}"
+    );
+    got.extend(after);
+    assert_one_pointer(&got);
+}
+
+#[test]
+fn owner_pointer_refresh_onto_agent_client_releases_agent_pointer_first() {
+    let (mut f, human, a, agent, b) = two_clients();
+    f.niri_complete_animations();
+    let window = window_of(&mut f, "a");
+    let (x, y) = point_over(&mut f, &window);
+    physical_motion(&mut f, x, y);
+    pointer_events(&mut f, human, &a);
+    let mut got = agent_click_b(&mut f, agent, &b);
+
+    // B shows up under the owner's still pointer.
+    f.niri().layout.switch_workspace_down();
+    f.niri_complete_animations();
+
+    let after = pointer_events(&mut f, agent, &b);
+    assert!(
+        matches!(after.first(), Some(PointerEvent::Leave)),
+        "{after:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .any(|e| matches!(e, PointerEvent::Enter { .. })),
+        "{after:?}"
+    );
+    got.extend(after);
+    assert_one_pointer(&got);
 }

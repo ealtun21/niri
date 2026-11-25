@@ -1077,6 +1077,9 @@ impl State {
 
         self.niri.pointer_contents.clone_from(&under);
 
+        self.niri
+            .agent
+            .yield_pointer_to(under.surface.as_ref().map(|(s, _)| s));
         let pointer = &self.niri.seat.get_pointer().unwrap();
         pointer.motion(
             self,
@@ -1286,6 +1289,10 @@ impl State {
         if self.niri.tablet_cursor_location.is_some() {
             return;
         }
+        // A hand-over parked the owner's pointer off a client for the agent pointer.
+        if self.niri.agent.owner_pointer_parked {
+            return;
+        }
 
         let _span = tracy_client::span!("Niri::refresh_pointer_contents");
 
@@ -1355,6 +1362,9 @@ impl State {
 
         self.niri.pointer_contents.clone_from(&under);
 
+        self.niri
+            .agent
+            .yield_pointer_to(under.surface.as_ref().map(|(s, _)| s));
         pointer.motion(
             self,
             under.surface,
