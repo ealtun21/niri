@@ -166,7 +166,7 @@ pub struct PointerFocus {
 }
 
 /// What a capture looked like, to map its pixels back to the window and to detect staleness.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CaptureRecord {
     /// Top-left corner of the image in physical pixels at `scale`, relative to the main surface's
     /// buffer origin. Image pixel `p` is at surface-local logical `(p + origin) / scale`.
@@ -179,18 +179,42 @@ pub struct CaptureRecord {
     pub window_size: Size<i32, Logical>,
     /// Scale of the window's output at capture time.
     pub output_scale: f64,
-    /// Number of popups of the window at capture time.
-    pub popup_count: usize,
+    /// Geometry rects of the window's popups at capture time, in the main surface's logical
+    /// coordinates.
+    pub popups: Vec<Rectangle<i32, Logical>>,
     pub at: Instant,
 }
 
-/// Window size, output scale and popup count: what a capture records and `StaleCapture` compares.
-pub fn window_view(mapped: &Mapped, output: Option<&Output>) -> (Size<i32, Logical>, f64, usize) {
+/// Window size, output scale and popup rects: what a capture records and `StaleCapture` compares.
+pub fn window_view(
+    mapped: &Mapped,
+    output: Option<&Output>,
+) -> (Size<i32, Logical>, f64, Vec<Rectangle<i32, Logical>>) {
     (
         mapped.window.geometry().size,
         output.map_or(1., |o| o.current_scale().fractional_scale()),
-        PopupManager::popups_for_surface(mapped.toplevel().wl_surface()).count(),
+        popup_rects(mapped),
     )
+}
+
+/// Geometry rects of the window's popups, in the main surface's logical coordinates.
+fn popup_rects(mapped: &Mapped) -> Vec<Rectangle<i32, Logical>> {
+    // The offsets are relative to the window geometry.
+    let geo_loc = mapped.window.geometry().loc;
+    PopupManager::popups_for_surface(mapped.toplevel().wl_surface())
+        .map(|(popup, offset)| Rectangle::new(geo_loc + offset, popup.geometry().size))
+        .collect()
+}
+
+/// Whether the popups at `at`, in the main surface's logical coordinates, changed since the
+/// capture: a popup is there that the capture didn't have, or one it had is gone. Popups elsewhere,
+/// such as a tooltip that came up after the look, leave the click where the agent saw it.
+pub fn popups_changed_at(mapped: &Mapped, record: &CaptureRecord, at: Point<f64, Logical>) -> bool {
+    let now = popup_rects(mapped);
+    let only_in = |a: &[Rectangle<i32, Logical>], b: &[Rectangle<i32, Logical>]| {
+        a.iter().any(|r| !b.contains(r) && r.to_f64().contains(at))
+    };
+    only_in(&now, &record.popups) || only_in(&record.popups, &now)
 }
 
 /// A window or layer surface an agent may act on.
@@ -750,11 +774,9 @@ pub fn check_target(niri: &Niri, id: MappedId, kind: OpKind) -> Result<Target, A
 
     if kind == OpKind::Pointer {
         let record = niri.agent.captures.get(&id).ok_or(AgentError::NoCapture)?;
-        let (window_size, output_scale, popup_count) = window_view(mapped, output);
-        if window_size != record.window_size
-            || output_scale != record.output_scale
-            || popup_count != record.popup_count
-        {
+        let (window_size, output_scale, _) = window_view(mapped, output);
+        // Popups are checked at the op's point, in `deliver_pointer`.
+        if window_size != record.window_size || output_scale != record.output_scale {
             return Err(AgentError::StaleCapture);
         }
     }

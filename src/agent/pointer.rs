@@ -22,7 +22,8 @@ use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use super::cursor::place_on_window;
 use super::keyboard::{enter_keyboards, finish_burst, rest_modifiers, with_keymap};
 use super::{
-    agent_done, check_target, CaptureRecord, OpKind, PointerFocus, Target, MAX_DRAG_STEPS,
+    agent_done, check_target, popups_changed_at, CaptureRecord, OpKind, PointerFocus, Target,
+    MAX_DRAG_STEPS,
 };
 use crate::niri::{Niri, State};
 use crate::utils::get_monotonic_time;
@@ -70,11 +71,12 @@ pub fn pointer(
         {
             return Err(AgentError::PasteUnsupported);
         }
-        let rec = *state
+        let rec = state
             .niri
             .agent
             .captures
             .get(&id)
+            .cloned()
             .ok_or(AgentError::NoCapture)?;
         deliver_pointer(state, &target, op, &rec)
     });
@@ -114,7 +116,8 @@ pub(super) fn start_point(op: &AgentOp) -> Option<(f64, f64)> {
     }
 }
 
-/// Sends the pointer op to the target. The caller has run `check_target` for a pointer op.
+/// Sends the pointer op to the target, unless the popups at its point changed since the capture.
+/// The caller has run `check_target` for a pointer op.
 pub fn deliver_pointer(
     state: &mut State,
     target: &Target,
@@ -126,12 +129,15 @@ pub fn deliver_pointer(
     };
     let id = target.id.ok_or(AgentError::WindowGone)?;
     // Look the window up again: it may have closed or been replaced since the checks.
-    let window = state
+    let (mapped, _) = state
         .niri
         .find_mapped_output_by_id(id)
-        .map(|(mapped, _)| mapped.window.clone())
         .ok_or(AgentError::WindowGone)?;
     let buf = capture_to_buffer(x, y, rec);
+    if popups_changed_at(mapped, rec, buf) {
+        return Err(AgentError::StaleCapture);
+    }
+    let window = mapped.window.clone();
     let (surface, offset) = match window.surface_under(buf, WindowSurfaceType::ALL) {
         Some((surface, offset)) => (surface, offset.to_f64()),
         None => (target.surface.clone(), Point::default()),

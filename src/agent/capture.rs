@@ -123,7 +123,7 @@ fn render(
         .find_mapped_output_by_id(id)
         .ok_or(AgentError::WindowGone)?;
 
-    let (window_size, output_scale, popup_count) = window_view(mapped, output);
+    let (window_size, output_scale, popups) = window_view(mapped, output);
     let bbox = mapped.window.bbox_with_popups().size.to_f64();
     let scale = capture_scale(output_scale, bbox, max_edge);
     let (size, pixels, origin) = state
@@ -147,7 +147,7 @@ fn render(
         size,
         window_size,
         output_scale,
-        popup_count,
+        popups,
         at: Instant::now(),
     };
     let capture = WindowCapture {

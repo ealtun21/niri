@@ -282,14 +282,14 @@ fn pointer_without_capture_is_no_capture() {
 
 fn record_for(f: &mut Fixture, id: MappedId) -> CaptureRecord {
     let (mapped, output) = f.niri().find_mapped_output_by_id(id).unwrap();
-    let (window_size, output_scale, popup_count) = crate::agent::window_view(mapped, output);
+    let (window_size, output_scale, popups) = crate::agent::window_view(mapped, output);
     CaptureRecord {
         origin: (0, 0).into(),
         scale: 1.,
         size: (100, 100).into(),
         window_size,
         output_scale,
-        popup_count,
+        popups,
         at: Instant::now(),
     }
 }
@@ -653,7 +653,7 @@ fn rec(origin: (i32, i32), scale: f64) -> CaptureRecord {
         size: (100, 100).into(),
         window_size: (100, 100).into(),
         output_scale: scale,
-        popup_count: 0,
+        popups: Vec::new(),
         at: Instant::now(),
     }
 }
@@ -1651,14 +1651,15 @@ fn matcher_is_agent_active_expires() {
     assert_eq!(opacity_of(&mut f, "agent-b"), None);
 }
 
-#[test]
-fn capture_popups_reports_popup_offset() {
-    let (mut f, _, _, agent, b) = two_clients();
-    let parent = f.client(agent).window(&b).xdg_surface.clone();
-    let (surface, _popup) = f
-        .client(agent)
-        .state
-        .create_popup_at(&parent, None, (20, 30));
+/// Maps a 10 × 10 popup of `b` without a grab, like a tooltip, centred on `at` in its geometry.
+fn map_popup_at(
+    f: &mut Fixture,
+    agent: ClientId,
+    b: &WlSurface,
+    at: (i32, i32),
+) -> (WlSurface, XdgPopup) {
+    let parent = f.client(agent).window(b).xdg_surface.clone();
+    let (surface, popup) = f.client(agent).state.create_popup_at(&parent, None, at);
     f.double_roundtrip(agent);
     // Commit the popup's position and size.
     let (xdg_surface, serial) = f.client(agent).state.popup_configures.pop().unwrap();
@@ -1674,6 +1675,13 @@ fn capture_popups_reports_popup_offset() {
     surface.attach(Some(&buffer), 0, 0);
     surface.commit();
     f.double_roundtrip(agent);
+    (surface, popup)
+}
+
+#[test]
+fn capture_popups_reports_popup_offset() {
+    let (mut f, _, _, agent, b) = two_clients();
+    map_popup_at(&mut f, agent, &b, (20, 30));
 
     let id = mapped_id(&mut f, "agent-b");
     let (mapped, _) = f.niri().find_mapped_output_by_id(id).unwrap();
@@ -1684,6 +1692,39 @@ fn capture_popups_reports_popup_offset() {
     assert_eq!(popups[0].x, f64::from(geo.loc.x + 15));
     assert_eq!(popups[0].y, f64::from(geo.loc.y + 25));
     assert_eq!((popups[0].width, popups[0].height), (10., 10.));
+}
+
+#[test]
+fn popup_away_from_the_click_keeps_the_capture() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+    // A tooltip comes up after the look, away from the click.
+    map_popup_at(&mut f, agent, &b, (20, 30));
+    pointer_now(&mut f, id, click(80., 80.)).unwrap();
+}
+
+#[test]
+fn new_popup_under_the_click_is_stale() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+    map_popup_at(&mut f, agent, &b, (20, 30));
+    assert_eq!(
+        pointer_now(&mut f, id, click(20., 30.)).err(),
+        Some(AgentError::StaleCapture)
+    );
+}
+
+#[test]
+fn closed_popup_under_the_click_is_stale() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let (_, popup) = map_popup_at(&mut f, agent, &b, (20, 30));
+    let id = captured_target(&mut f, agent, &b);
+    popup.destroy();
+    f.double_roundtrip(agent);
+    assert_eq!(
+        pointer_now(&mut f, id, click(20., 30.)).err(),
+        Some(AgentError::StaleCapture)
+    );
 }
 
 /// Opens the overview and moves the owner's pointer over `id`'s tile, found by scanning the output.
