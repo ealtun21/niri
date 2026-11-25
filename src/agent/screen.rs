@@ -27,6 +27,7 @@ use super::keyboard::{
 use super::pointer::{deliver_window, deliver_with_mods, start_point};
 use super::{boost_frames, capture_scale, check_target, OpKind, Target, DEFAULT_MAX_EDGE};
 use crate::input::move_grab::overview_activate;
+use crate::layout::LayoutElement as _;
 use crate::niri::{KeyboardFocus, Niri, PointContents, State};
 use crate::render_helpers::{render_to_vec, RenderCtx, RenderTarget};
 use crate::utils::{get_credentials_for_surface, write_png_rgba8};
@@ -35,6 +36,10 @@ use crate::window::Mapped;
 
 /// Most wheel notches an agent scroll runs in the overview: more than the whole zoom range takes.
 const MAX_WHEEL_NOTCHES: f64 = 30.;
+
+/// What output captures render as: the target that blacks out both kinds of `block-out-from`, as
+/// window captures refuse both.
+const CAPTURE_TARGET: RenderTarget = RenderTarget::Screencast;
 
 /// What an output capture looked like: the visible windows' rects, to map its pixels back to them.
 #[derive(Debug, Clone)]
@@ -164,7 +169,8 @@ fn visible_tiles<'a>(niri: &'a Niri, output: &Output) -> Vec<VisibleTile<'a>> {
 }
 
 /// The record and the IPC lists of what is on `output` at the capture scale for `max_edge`.
-/// Windows are the `visible_tiles`.
+/// Windows are the `visible_tiles`. The lists leave out blocked-out windows and layer surfaces, so
+/// nothing reads their contents; the record keeps every window, for the staleness check.
 pub fn describe(
     niri: &Niri,
     output: &Output,
@@ -195,6 +201,9 @@ pub fn describe(
         let geometry = mapped.window.geometry();
         let popup_scale = scale * tile.zoom;
         rects.push((mapped.id(), tile.rect));
+        if mapped.rules().block_out_from.is_some() {
+            continue;
+        }
         windows.push(ScreenWindow {
             id: mapped.id().get(),
             rect: px_rect(tile.rect),
@@ -217,7 +226,11 @@ pub fn describe(
     let layers = [Layer::Overlay, Layer::Top, Layer::Bottom, Layer::Background]
         .into_iter()
         .flat_map(|layer| map.layers_on(layer).rev())
-        .filter(|surface| niri.mapped_layer_surfaces.contains_key(*surface))
+        .filter(|surface| {
+            niri.mapped_layer_surfaces
+                .get(*surface)
+                .is_some_and(|mapped| mapped.rules().block_out_from.is_none())
+        })
         .filter_map(|surface| {
             let geo = map.layer_geometry(surface)?.to_f64();
             Some(ScreenLayer {
@@ -260,7 +273,7 @@ fn render(
         .with_primary_renderer(|renderer| {
             let ctx = RenderCtx {
                 renderer,
-                target: RenderTarget::ScreenCapture,
+                target: CAPTURE_TARGET,
                 xray: None,
             };
             // No pointer: neither the owner's nor the agent's cursor is in the image.
@@ -599,6 +612,19 @@ mod tests {
     use smithay::backend::renderer::utils::CommitCounter;
 
     use super::*;
+
+    #[test]
+    fn capture_blacks_out_both_block_out_kinds() {
+        use niri_config::{BlockOutFrom, BlockOutKind, BlockOutTarget};
+
+        for target in [BlockOutTarget::Screencast, BlockOutTarget::ScreenCapture] {
+            let rule = BlockOutFrom {
+                target,
+                kind: BlockOutKind::Fill,
+            };
+            assert!(CAPTURE_TARGET.should_block_out(Some(rule)), "{target:?}");
+        }
+    }
 
     #[test]
     fn scaled_capture_moves_elements_with_their_size() {

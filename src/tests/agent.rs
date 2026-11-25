@@ -3029,6 +3029,35 @@ fn capture_output_lists_visible_windows() {
 }
 
 #[test]
+fn capture_output_lists_no_blocked_out_windows_or_layers() {
+    let config = r#"
+window-rule { match app-id="^cast$"; block-out-from "screencast"; }
+window-rule { match app-id="^capture$"; block-out-from "screen-capture"; }
+layer-rule { match namespace="^cast$"; block-out-from "screencast"; }
+layer-rule { match namespace="^capture$"; block-out-from "screen-capture"; }
+"#;
+    let mut f = Fixture::with_config(Config::parse_mem(config).unwrap());
+    f.add_output(1, (1920, 1080));
+    let id = f.add_client();
+    for app_id in ["cast", "capture", "plain"] {
+        map_window(&mut f, id, app_id);
+    }
+    for namespace in ["cast", "capture", "bar"] {
+        map_layer(&mut f, Layer::Top, namespace, None);
+    }
+    let output = active_output(&mut f);
+
+    let (record, windows, layers) = describe(f.niri(), &output, DEFAULT_MAX_EDGE);
+
+    let ids: Vec<_> = windows.iter().map(|w| w.id).collect();
+    assert_eq!(ids, [mapped_id(&mut f, "plain").get()]);
+    let namespaces: Vec<_> = layers.iter().map(|l| l.namespace.as_str()).collect();
+    assert_eq!(namespaces, ["bar"]);
+    // The look still knows where they are, for the staleness check.
+    assert_eq!(record.windows.len(), 3);
+}
+
+#[test]
 fn capture_output_reports_overview() {
     let (mut f, _) = set_up(Config::default());
     let output = active_output(&mut f);
