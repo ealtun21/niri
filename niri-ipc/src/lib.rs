@@ -130,6 +130,15 @@ pub enum Request {
         /// Milliseconds to wait for the window to settle before capturing.
         settle_ms: Option<u32>,
     },
+    /// Request the agent status: pause state, granted windows and windows being acted on.
+    AgentState,
+    /// Like [`Request::AgentState`], then keep sending the status as it changes.
+    ///
+    /// The reply is [`Response::Handled`], followed by one [`AgentStatus`] JSON per line, the
+    /// current one first.
+    AgentStateStream,
+    /// Pause agent input. There is no request to unpause: the owner does that by keybind.
+    AgentPause,
     /// Perform an agent input operation on a window.
     Agent {
         /// Id of the window.
@@ -187,6 +196,34 @@ pub enum Response {
     WindowCapture(WindowCapture),
     /// Result of an agent operation.
     AgentDone(AgentDone),
+    /// The agent status.
+    AgentState(AgentStatus),
+}
+
+/// Agent status.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct AgentStatus {
+    /// Whether agent input is paused.
+    pub paused: bool,
+    /// Whether the owner has handed the controls over to the agent.
+    pub handed_over: bool,
+    /// Windows agents may act on, sorted by id. Empty while paused.
+    pub granted: Vec<AgentWindow>,
+    /// Ids of the windows agents are acting on right now, sorted.
+    pub acting: Vec<u64>,
+}
+
+/// A window agents may act on.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct AgentWindow {
+    /// Id of the window.
+    pub id: u64,
+    /// App id of the window.
+    pub app_id: Option<String>,
+    /// Title of the window.
+    pub title: Option<String>,
 }
 
 /// Overview information.
@@ -2491,6 +2528,27 @@ mod tests {
         };
         assert!(e.to_string().starts_with("paused: "));
         assert!(e.to_string().contains("1000"));
+    }
+
+    #[test]
+    fn agent_status_roundtrip() {
+        let s = AgentStatus {
+            paused: true,
+            handed_over: false,
+            granted: vec![AgentWindow {
+                id: 3,
+                app_id: Some("agent-x".into()),
+                title: None,
+            }],
+            acting: vec![3],
+        };
+        let json = serde_json::to_string(&Response::AgentState(s.clone())).unwrap();
+        let Response::AgentState(back) = serde_json::from_str(&json).unwrap() else {
+            panic!("expected AgentState");
+        };
+        assert_eq!(back, s);
+        assert!(serde_json::from_str::<Request>("\"AgentPause\"").is_ok());
+        assert!(serde_json::from_str::<Request>("\"AgentStateStream\"").is_ok());
     }
 
     #[test]

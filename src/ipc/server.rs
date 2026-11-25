@@ -17,9 +17,10 @@ use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, Fu
 use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
-    Action, AgentOp, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request,
-    Response, Timestamp, WindowLayout, Workspace,
+    Action, AgentOp, AgentStatus, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply,
+    Request, Response, Timestamp, WindowLayout, Workspace,
 };
+use serde::Serialize;
 use smithay::backend::input::InputTime;
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
@@ -51,6 +52,10 @@ pub struct IpcServer {
     pub socket_path: Option<PathBuf>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    /// Clients of `Request::AgentStateStream`, kept apart from the event streams.
+    agent_streams: Vec<EventStreamSender<AgentStatus>>,
+    /// The status last sent to `agent_streams`.
+    agent_last: Option<AgentStatus>,
 }
 
 struct ClientCtx {
@@ -61,14 +66,14 @@ struct ClientCtx {
     event_stream_state: Rc<RefCell<EventStreamState>>,
 }
 
-struct EventStreamClient {
-    events: Receiver<Event>,
+struct EventStreamClient<T = Event> {
+    events: Receiver<T>,
     disconnect: Receiver<()>,
     write: Box<dyn AsyncWrite + Unpin>,
 }
 
-struct EventStreamSender {
-    events: Sender<Event>,
+struct EventStreamSender<T = Event> {
+    events: Sender<T>,
     disconnect: Sender<()>,
 }
 
@@ -112,30 +117,36 @@ impl IpcServer {
             socket_path,
             event_streams: Rc::new(RefCell::new(Vec::new())),
             event_stream_state: Rc::new(RefCell::new(EventStreamState::default())),
+            agent_streams: Vec::new(),
+            agent_last: None,
         })
     }
 
     fn send_event(&self, event: Event) {
-        let mut streams = self.event_streams.borrow_mut();
-        let mut to_remove = Vec::new();
-        for (idx, stream) in streams.iter_mut().enumerate() {
-            match stream.events.try_send(event.clone()) {
-                Ok(()) => (),
-                Err(TrySendError::Closed(_)) => to_remove.push(idx),
-                Err(TrySendError::Full(_)) => {
-                    warn!(
-                        "disconnecting IPC event stream client \
-                         because it is reading events too slowly"
-                    );
-                    to_remove.push(idx);
-                }
+        send_to_streams(&mut self.event_streams.borrow_mut(), &event);
+    }
+}
+
+/// Sends the item to every stream, dropping the ones that closed or fell behind.
+fn send_to_streams<T: Clone>(streams: &mut Vec<EventStreamSender<T>>, item: &T) {
+    let mut to_remove = Vec::new();
+    for (idx, stream) in streams.iter_mut().enumerate() {
+        match stream.events.try_send(item.clone()) {
+            Ok(()) => (),
+            Err(TrySendError::Closed(_)) => to_remove.push(idx),
+            Err(TrySendError::Full(_)) => {
+                warn!(
+                    "disconnecting IPC event stream client \
+                     because it is reading events too slowly"
+                );
+                to_remove.push(idx);
             }
         }
+    }
 
-        for idx in to_remove.into_iter().rev() {
-            let stream = streams.swap_remove(idx);
-            let _ = stream.disconnect.send_blocking(());
-        }
+    for idx in to_remove.into_iter().rev() {
+        let stream = streams.swap_remove(idx);
+        let _ = stream.disconnect.send_blocking(());
     }
 }
 
@@ -210,6 +221,7 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
             .map_err(|err| err.to_string());
         let requested_error = matches!(request, Ok(Request::ReturnError));
         let requested_event_stream = matches!(request, Ok(Request::EventStream));
+        let requested_agent_stream = matches!(request, Ok(Request::AgentStateStream));
 
         let reply = match request {
             Ok(request) => process(&ctx, request).await,
@@ -226,6 +238,31 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
         serde_json::to_writer(&mut buf, &reply).context("error formatting reply")?;
         buf.push(b'\n');
         write.write_all(&buf).await.context("error writing reply")?;
+
+        if requested_agent_stream {
+            let (status_tx, status_rx) = async_channel::bounded(EVENT_STREAM_BUFFER_SIZE);
+            let (disconnect_tx, disconnect_rx) = async_channel::bounded(1);
+
+            let client = EventStreamClient {
+                events: status_rx,
+                disconnect: disconnect_rx,
+                write: Box::new(write) as _,
+            };
+            let future = async move {
+                if let Err(err) = handle_event_stream_client(client).await {
+                    warn!("error handling IPC agent stream client: {err:?}");
+                }
+            };
+            if let Err(err) = ctx.scheduler.schedule(future) {
+                warn!("error scheduling IPC agent stream future: {err:?}");
+            }
+
+            // The compositor registers it, which also sends the current status.
+            ctx.event_loop.insert_idle(move |state| {
+                state.ipc_add_agent_stream(status_tx, disconnect_tx);
+            });
+            return Ok(());
+        }
 
         if requested_event_stream {
             let (events_tx, events_rx) = async_channel::bounded(EVENT_STREAM_BUFFER_SIZE);
@@ -449,7 +486,19 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let output = result.map_err(|_| String::from("error getting active output info"))?;
             Response::FocusedOutput(output)
         }
-        Request::EventStream => Response::Handled,
+        Request::EventStream | Request::AgentStateStream => Response::Handled,
+        Request::AgentState => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let _ = tx.send_blocking(crate::agent::status(&state.niri));
+            });
+            let status = rx.recv().await;
+            Response::AgentState(status.map_err(|_| String::from("error getting agent status"))?)
+        }
+        Request::AgentPause => {
+            ctx.event_loop.insert_idle(|state| state.niri.agent.pause());
+            Response::Handled
+        }
         Request::OverviewState => {
             let state = ctx.event_stream_state.borrow();
             let is_open = state.overview.is_open;
@@ -530,7 +579,9 @@ fn validate_action(action: &Action) -> Result<(), String> {
     Ok(())
 }
 
-async fn handle_event_stream_client(client: EventStreamClient) -> anyhow::Result<()> {
+async fn handle_event_stream_client<T: Serialize>(
+    client: EventStreamClient<T>,
+) -> anyhow::Result<()> {
     let EventStreamClient {
         events,
         disconnect,
@@ -849,6 +900,35 @@ impl State {
         let event = Event::OverviewOpenedOrClosed { is_open };
         state.apply(event.clone());
         server.send_event(event);
+    }
+
+    /// Sends the agent status to the agent stream clients if it changed.
+    pub fn ipc_refresh_agent(&mut self) {
+        let status = crate::agent::status(&self.niri);
+        let Some(server) = &mut self.niri.ipc_server else {
+            return;
+        };
+        if server.agent_last.as_ref() == Some(&status) {
+            return;
+        }
+        send_to_streams(&mut server.agent_streams, &status);
+        server.agent_last = Some(status);
+    }
+
+    /// Registers an agent stream client and sends it the current status.
+    pub fn ipc_add_agent_stream(&mut self, events: Sender<AgentStatus>, disconnect: Sender<()>) {
+        // Existing clients get any pending change first, so that `agent_last` is current.
+        self.ipc_refresh_agent();
+        let Some(server) = &mut self.niri.ipc_server else {
+            return;
+        };
+        let current = server.agent_last.clone().unwrap_or_default();
+        events
+            .try_send(current)
+            .expect("initial status had more lines than buffer size");
+        server
+            .agent_streams
+            .push(EventStreamSender { events, disconnect });
     }
 
     pub fn ipc_refresh_casts(&mut self) {

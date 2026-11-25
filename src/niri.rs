@@ -910,6 +910,7 @@ impl State {
         // screencasts.
         self.niri.refresh_mapped_cast_window_rules();
         crate::agent::refresh_flags(&mut self.niri);
+        self.ipc_refresh_agent();
         self.ipc_refresh_casts();
 
         self.niri.refresh_window_rules();

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use calloop::timer::{TimeoutAction, Timer};
-use niri_ipc::{AgentDone, AgentError};
+use niri_ipc::{AgentDone, AgentError, AgentStatus, AgentWindow};
 use smithay::backend::input::{
     ButtonState, Event as _, InputBackend, InputEvent, KeyState, KeyboardKeyEvent as _,
     PointerButtonEvent as _,
@@ -55,6 +55,8 @@ const BOOST_INTERVAL: Duration = Duration::from_millis(16);
 pub struct AgentState {
     /// Kill switch: agent input and captures return `paused`.
     pub paused: bool,
+    /// Whether the owner handed the controls over to the agent.
+    pub handed_over: bool,
     /// Last capture of each window.
     // ponytail: records of closed windows are never pruned (ids are never reused); prune on
     // window close if agents ever capture enough windows for this to matter.
@@ -142,6 +144,14 @@ pub enum OpKind {
 }
 
 impl AgentState {
+    /// Pauses agent input and ends any hand-over. One-way: only the owner's keybind unpauses.
+    pub fn pause(&mut self) {
+        self.paused = true;
+        self.handed_over = false;
+        self.release_sticky();
+        self.dismiss_all();
+    }
+
     /// Takes the next serial and remembers it as an agent serial.
     pub fn next_serial(&mut self) -> Serial {
         let serial = SERIAL_COUNTER.next_serial();
@@ -241,6 +251,38 @@ impl AgentState {
             .get(&mapped.id())
             .copied()
             .unwrap_or_else(|| has_agent_app_id(mapped))
+    }
+}
+
+/// The agent status as IPC reports it.
+pub fn status(niri: &Niri) -> AgentStatus {
+    let agent = &niri.agent;
+    let now = Instant::now();
+    let mut granted: Vec<_> = niri
+        .layout
+        .windows()
+        .filter(|(_, mapped)| !agent.paused && agent.is_granted(mapped))
+        .map(|(_, mapped)| {
+            with_toplevel_role(mapped.toplevel(), |role| AgentWindow {
+                id: mapped.id().get(),
+                app_id: role.app_id.clone(),
+                title: role.title.clone(),
+            })
+        })
+        .collect();
+    granted.sort_by_key(|w| w.id);
+    let mut acting: Vec<_> = agent
+        .active_until
+        .iter()
+        .filter(|(_, until)| **until > now)
+        .map(|(id, _)| id.get())
+        .collect();
+    acting.sort_unstable();
+    AgentStatus {
+        paused: agent.paused,
+        handed_over: agent.handed_over,
+        granted,
+        acting,
     }
 }
 

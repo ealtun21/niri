@@ -1082,10 +1082,10 @@ impl State {
             }
             Action::ToggleAgentInput => {
                 let agent = &mut self.niri.agent;
-                agent.paused = !agent.paused;
                 if agent.paused {
-                    agent.release_sticky();
-                    agent.dismiss_all();
+                    agent.paused = false;
+                } else {
+                    agent.pause();
                 }
             }
             Action::ToggleWindowAgentInput => {

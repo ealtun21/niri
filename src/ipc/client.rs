@@ -15,6 +15,14 @@ use serde_json::json;
 use crate::cli::{AgentCmd, Msg};
 use crate::utils::version;
 
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
 pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Result<()> {
     // For actions taking paths, prepend the niri CLI's working directory.
     if let Msg::Action {
@@ -64,6 +72,9 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
             max_edge: *max_edge,
             settle_ms: *settle_ms,
         },
+        Msg::AgentState { watch: false } => Request::AgentState,
+        Msg::AgentState { watch: true } => Request::AgentStateStream,
+        Msg::AgentPause => Request::AgentPause,
         Msg::Agent { id, op } => Request::Agent {
             id: *id,
             op: match op {
@@ -643,6 +654,49 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                 "Captured window {}: {} ({}x{})",
                 capture.id, capture.path, capture.width, capture.height
             );
+        }
+        Msg::AgentPause => {
+            let Response::Handled = response else {
+                bail!("unexpected response: expected Handled, got {response:?}");
+            };
+        }
+        Msg::AgentState { watch: true } => {
+            let Response::Handled = response else {
+                bail!("unexpected response: expected Handled, got {response:?}");
+            };
+
+            let mut read_status = socket.read_agent_status();
+            loop {
+                let status = read_status().context("error reading agent status from niri")?;
+                if json {
+                    println!("{}", serde_json::to_string(&status)?);
+                } else {
+                    println!(
+                        "paused: {}, handed over: {}, granted: {}, acting: {}",
+                        yes_no(status.paused),
+                        yes_no(status.handed_over),
+                        status.granted.len(),
+                        status.acting.len(),
+                    );
+                }
+            }
+        }
+        Msg::AgentState { watch: false } => {
+            let Response::AgentState(status) = response else {
+                bail!("unexpected response: expected AgentState, got {response:?}");
+            };
+
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+                return Ok(());
+            }
+
+            println!("paused: {}", yes_no(status.paused));
+            println!("handed over: {}", yes_no(status.handed_over));
+            println!("granted: {}", status.granted.len());
+            for window in &status.granted {
+                println!("  {} {}", window.id, window.title.as_deref().unwrap_or(""));
+            }
         }
         Msg::Agent { .. } => {
             let Response::AgentDone(done) = response else {

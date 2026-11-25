@@ -130,6 +130,14 @@ pub enum Msg {
         #[arg(long)]
         settle_ms: Option<u32>,
     },
+    /// Print the agent status.
+    AgentState {
+        /// Keep printing the status as it changes.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Pause agent input. Only the owner can unpause, by keybind.
+    AgentPause,
     /// Perform an agent input operation on a window.
     Agent {
         /// Id of the window.
@@ -222,6 +230,33 @@ impl TryFrom<CompletionShell> for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_agent_state_watch() {
+        let Some(Sub::Msg {
+            msg: Msg::AgentState { watch },
+            ..
+        }) = Cli::try_parse_from(["niri", "msg", "agent-state", "--watch"])
+            .unwrap()
+            .subcommand
+        else {
+            panic!("expected Msg::AgentState");
+        };
+        assert!(watch);
+    }
+
+    #[test]
+    fn parses_agent_pause() {
+        assert!(matches!(
+            Cli::try_parse_from(["niri", "msg", "agent-pause"])
+                .unwrap()
+                .subcommand,
+            Some(Sub::Msg {
+                msg: Msg::AgentPause,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn parse_agent_click() {

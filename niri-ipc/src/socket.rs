@@ -6,7 +6,9 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use crate::{Event, Reply, Request};
+use serde::de::DeserializeOwned;
+
+use crate::{AgentStatus, Event, Reply, Request};
 
 /// Name of the environment variable containing the niri IPC socket path.
 pub const SOCKET_PATH_ENV: &str = "NIRI_SOCKET";
@@ -87,6 +89,17 @@ impl Socket {
     /// }
     /// ```
     pub fn read_events(self) -> impl FnMut() -> io::Result<Event> {
+        self.read_lines()
+    }
+
+    /// Starts reading [`AgentStatus`] lines from the socket.
+    ///
+    /// Use this only after requesting an [`AgentStateStream`][Request::AgentStateStream].
+    pub fn read_agent_status(self) -> impl FnMut() -> io::Result<AgentStatus> {
+        self.read_lines()
+    }
+
+    fn read_lines<T: DeserializeOwned>(self) -> impl FnMut() -> io::Result<T> {
         let Self { mut stream } = self;
         let _ = stream.get_mut().shutdown(Shutdown::Write);
 
@@ -94,8 +107,7 @@ impl Socket {
         move || {
             buf.clear();
             stream.read_line(&mut buf)?;
-            let event = serde_json::from_str(&buf)?;
-            Ok(event)
+            Ok(serde_json::from_str(&buf)?)
         }
     }
 }

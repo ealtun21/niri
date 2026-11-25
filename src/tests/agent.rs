@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use async_channel::Receiver;
 use insta::assert_snapshot;
 use niri_config::Config;
-use niri_ipc::{AgentButton, AgentDone, AgentError, AgentOp};
+use niri_ipc::{AgentButton, AgentDone, AgentError, AgentOp, AgentStatus, AgentWindow};
 use smithay::backend::input::{InputEvent, InputTime, KeyState, Keycode};
 use smithay::desktop::Window;
 use smithay::input::keyboard::Layout;
@@ -16,8 +16,8 @@ use super::*;
 use crate::agent::capture::{capture_popups, capture_precheck, settle_time};
 use crate::agent::pointer::{self, capture_to_buffer};
 use crate::agent::{
-    capture_scale, check_target, keyboard, CaptureRecord, OpKind, DEFAULT_SETTLE, MAX_DRAG_STEPS,
-    MAX_SETTLE, TYPE_CHUNK_CHARS, TYPE_CHUNK_INTERVAL,
+    capture_scale, check_target, keyboard, status, CaptureRecord, OpKind, DEFAULT_SETTLE,
+    MAX_DRAG_STEPS, MAX_SETTLE, TYPE_CHUNK_CHARS, TYPE_CHUNK_INTERVAL,
 };
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::tests::test_input_backend::{
@@ -1730,4 +1730,68 @@ fn overview_keyboard_focus_still_blocks() {
         check_target(f.niri(), id, OpKind::Keyboard).err(),
         Some(AgentError::HumanFocused)
     );
+}
+
+#[test]
+fn status_lists_granted_and_acting() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+    let s = status(f.niri());
+    assert_eq!(s.granted.len(), 1);
+    assert_eq!(s.granted[0].id, id.get());
+    assert_eq!(s.granted[0].app_id.as_deref(), Some("agent-b"));
+    assert!(s.acting.is_empty());
+
+    type_now(&mut f, id, "a").unwrap();
+    assert_eq!(status(f.niri()).acting, [id.get()]);
+}
+
+#[test]
+fn status_while_paused_grants_nothing() {
+    let (mut f, ..) = two_clients();
+    f.niri().agent.pause();
+    let s = status(f.niri());
+    assert!(s.paused);
+    assert!(s.granted.is_empty());
+}
+
+#[test]
+fn ipc_pause_pauses_and_releases_sticky() {
+    let (mut f, _, _, agent, b) = two_clients();
+    let id = agent_target(&mut f, agent, &b);
+    type_now(&mut f, id, "a").unwrap();
+    events(&mut f, agent, &b);
+
+    f.niri().agent.pause();
+
+    assert!(f.niri().agent.paused);
+    assert!(events(&mut f, agent, &b).contains("leave"));
+}
+
+#[test]
+fn ipc_pause_never_unpauses() {
+    let (mut f, ..) = two_clients();
+    f.niri().agent.pause();
+    f.niri().agent.pause();
+    assert!(f.niri().agent.paused);
+}
+
+#[test]
+fn agent_stream_sends_initial_then_changes() {
+    let (mut f, ..) = two_clients();
+    let (tx, rx) = async_channel::bounded::<AgentStatus>(64);
+    let (disconnect, _keep) = async_channel::bounded(1);
+    f.niri_state().ipc_add_agent_stream(tx, disconnect);
+    assert_eq!(rx.try_recv().unwrap(), status(f.niri()));
+    assert!(rx.try_recv().is_err());
+
+    let id = mapped_id(&mut f, "a");
+    f.niri().agent.granted.insert(id, true);
+    f.niri_state().ipc_refresh_agent();
+    let line = rx.try_recv().unwrap();
+    assert!(line.granted.iter().any(|w: &AgentWindow| w.id == id.get()));
+    assert!(rx.try_recv().is_err());
+
+    f.niri_state().ipc_refresh_agent();
+    assert!(rx.try_recv().is_err());
 }
