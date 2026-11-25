@@ -21,7 +21,8 @@ use crate::agent::{
 };
 use crate::layout::{ActivateWindow, LayoutElement as _};
 use crate::tests::test_input_backend::{
-    TestInputBackend, TestKeyboardKeyEvent, TestPointerButtonEvent,
+    TestInputBackend, TestKeyboardKeyEvent, TestPointerAxisEvent, TestPointerButtonEvent,
+    TestPointerMotionAbsoluteEvent,
 };
 use crate::window::mapped::MappedId;
 
@@ -1266,6 +1267,19 @@ fn physical_click(f: &mut Fixture) {
     }
 }
 
+fn physical_motion(f: &mut Fixture, x: f64, y: f64) {
+    let event = TestPointerMotionAbsoluteEvent { x, y };
+    f.niri_state()
+        .process_input_event(InputEvent::<TestInputBackend>::PointerMotionAbsolute { event });
+}
+
+#[allow(dead_code)] // Used by the hand-over tests.
+fn physical_scroll(f: &mut Fixture, dy: f64) {
+    let event = TestPointerAxisEvent { dy };
+    f.niri_state()
+        .process_input_event(InputEvent::<TestInputBackend>::PointerAxis { event });
+}
+
 /// The compositor side of the window's surface.
 fn server_surface(
     f: &mut Fixture,
@@ -1663,4 +1677,57 @@ fn capture_popups_reports_popup_offset() {
     assert_eq!(popups[0].x, f64::from(geo.loc.x + 15));
     assert_eq!(popups[0].y, f64::from(geo.loc.y + 25));
     assert_eq!((popups[0].width, popups[0].height), (10., 10.));
+}
+
+/// Opens the overview and moves the owner's pointer over `id`'s tile, found by scanning the output.
+fn hover_overview_tile(f: &mut Fixture, id: MappedId) {
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+    let window = f
+        .niri()
+        .find_mapped_output_by_id(id)
+        .unwrap()
+        .0
+        .window
+        .clone();
+    let (x, y) = (0..1080 / 10)
+        .flat_map(|j| (0..1920 / 10).map(move |i| (f64::from(i * 10 + 5), f64::from(j * 10 + 5))))
+        .find(|&(x, y)| {
+            f.niri()
+                .contents_under((x, y).into())
+                .window
+                .is_some_and(|(w, _)| w == window)
+        })
+        .expect("tile is drawn in the overview");
+    physical_motion(f, x, y);
+    assert!(f
+        .niri()
+        .pointer_contents
+        .window
+        .as_ref()
+        .is_some_and(|(w, _)| *w == window));
+}
+
+#[test]
+fn overview_hover_does_not_block_agent() {
+    let (mut f, _human, _a, agent, b) = two_clients();
+    let id = captured_target(&mut f, agent, &b);
+    hover_overview_tile(&mut f, id);
+    pointer_now(&mut f, id, click(10., 10.)).unwrap();
+}
+
+#[test]
+fn overview_keyboard_focus_still_blocks() {
+    let (mut f, ..) = two_clients();
+    let id = mapped_id(&mut f, "agent-b");
+    f.niri().agent.granted.insert(id, true);
+    let window = window_of(&mut f, "agent-b");
+    f.niri().layout.activate_window(&window);
+    f.niri_state().update_keyboard_focus();
+    f.niri().layout.toggle_overview();
+    f.niri_complete_animations();
+    assert_eq!(
+        check_target(f.niri(), id, OpKind::Keyboard).err(),
+        Some(AgentError::HumanFocused)
+    );
 }

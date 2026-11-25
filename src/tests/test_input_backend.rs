@@ -1,6 +1,7 @@
 use smithay::backend::input::{
-    ButtonState, Device, DeviceCapability, Event, InputBackend, InputTime, KeyState,
-    KeyboardKeyEvent, Keycode, PointerButtonEvent, UnusedEvent,
+    AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Device,
+    DeviceCapability, Event, InputBackend, InputTime, KeyState, KeyboardKeyEvent, Keycode,
+    PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent, UnusedEvent,
 };
 use smithay::output::Output;
 
@@ -23,14 +24,25 @@ pub struct TestPointerButtonEvent {
     pub state: ButtonState,
 }
 
+/// Absolute pointer motion; `x` and `y` are logical pixels in the global space.
+pub struct TestPointerMotionAbsoluteEvent {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// A vertical wheel scroll of `dy` pixels.
+pub struct TestPointerAxisEvent {
+    pub dy: f64,
+}
+
 impl InputBackend for TestInputBackend {
     type Device = TestInputDevice;
 
     type KeyboardKeyEvent = TestKeyboardKeyEvent;
-    type PointerAxisEvent = UnusedEvent;
+    type PointerAxisEvent = TestPointerAxisEvent;
     type PointerButtonEvent = TestPointerButtonEvent;
     type PointerMotionEvent = UnusedEvent;
-    type PointerMotionAbsoluteEvent = UnusedEvent;
+    type PointerMotionAbsoluteEvent = TestPointerMotionAbsoluteEvent;
 
     type GestureSwipeBeginEvent = UnusedEvent;
     type GestureSwipeUpdateEvent = UnusedEvent;
@@ -125,5 +137,63 @@ impl PointerButtonEvent<TestInputBackend> for TestPointerButtonEvent {
 
     fn state(&self) -> ButtonState {
         self.state
+    }
+}
+
+impl Event<TestInputBackend> for TestPointerMotionAbsoluteEvent {
+    fn time(&self) -> InputTime {
+        InputTime::from_micros(0)
+    }
+
+    fn device(&self) -> <TestInputBackend as InputBackend>::Device {
+        TestInputDevice
+    }
+}
+
+impl AbsolutePositionEvent<TestInputBackend> for TestPointerMotionAbsoluteEvent {
+    fn x(&self) -> f64 {
+        self.x
+    }
+
+    fn y(&self) -> f64 {
+        self.y
+    }
+
+    fn x_transformed(&self, _width: i32) -> f64 {
+        self.x
+    }
+
+    fn y_transformed(&self, _height: i32) -> f64 {
+        self.y
+    }
+}
+
+impl PointerMotionAbsoluteEvent<TestInputBackend> for TestPointerMotionAbsoluteEvent {}
+
+impl Event<TestInputBackend> for TestPointerAxisEvent {
+    fn time(&self) -> InputTime {
+        InputTime::from_micros(0)
+    }
+
+    fn device(&self) -> <TestInputBackend as InputBackend>::Device {
+        TestInputDevice
+    }
+}
+
+impl PointerAxisEvent<TestInputBackend> for TestPointerAxisEvent {
+    fn amount(&self, axis: Axis) -> Option<f64> {
+        (axis == Axis::Vertical).then_some(self.dy)
+    }
+
+    fn amount_v120(&self, axis: Axis) -> Option<f64> {
+        (axis == Axis::Vertical).then_some(self.dy / 15. * 120.)
+    }
+
+    fn source(&self) -> AxisSource {
+        AxisSource::Wheel
+    }
+
+    fn relative_direction(&self, _axis: Axis) -> AxisRelativeDirection {
+        AxisRelativeDirection::Identical
     }
 }

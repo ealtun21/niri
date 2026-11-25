@@ -461,11 +461,15 @@ pub fn check_target(niri: &Niri, id: MappedId, kind: OpKind) -> Result<Target, A
             .is_some_and(|(m, _)| m.id() == id),
         _ => false,
     };
-    let hovered = niri
-        .pointer_contents
-        .window
-        .as_ref()
-        .is_some_and(|(window, _)| *window == mapped.window);
+    // In the overview the pointer only picks a tile to zoom to; it isn't the owner using the
+    // window.
+    let overview = niri.layout.is_overview_open();
+    let hovered = !overview
+        && niri
+            .pointer_contents
+            .window
+            .as_ref()
+            .is_some_and(|(window, _)| *window == mapped.window);
     if focused || hovered {
         return Err(AgentError::HumanFocused);
     }
@@ -474,7 +478,10 @@ pub fn check_target(niri: &Niri, id: MappedId, kind: OpKind) -> Result<Target, A
     let client = toplevel.client().ok_or(AgentError::WindowGone)?;
     let human_clients = [
         niri.seat.get_keyboard().and_then(|k| k.current_focus()),
-        niri.seat.get_pointer().and_then(|p| p.current_focus()),
+        niri.seat
+            .get_pointer()
+            .filter(|_| !overview)
+            .and_then(|p| p.current_focus()),
     ];
     if human_clients
         .iter()
